@@ -15,9 +15,10 @@
 
 import json
 from datetime import datetime
-from typing import Any, Optional
+from typing import Any, Optional, Set
 from uuid import UUID
 
+from sqlalchemy import TEXT, Column
 from sqlmodel import Field, SQLModel
 
 from zenml.models import (
@@ -27,6 +28,7 @@ from zenml.models import (
     ServerSettingsResponseResources,
     ServerSettingsUpdate,
 )
+from zenml.utils.time_utils import utc_now
 
 
 class ServerSettingsSchema(SQLModel, table=True):
@@ -41,8 +43,11 @@ class ServerSettingsSchema(SQLModel, table=True):
     enable_analytics: bool = Field(default=False)
     display_announcements: Optional[bool] = Field(nullable=True)
     display_updates: Optional[bool] = Field(nullable=True)
-    onboarding_state: Optional[str] = Field(nullable=True)
-    updated: datetime = Field(default_factory=datetime.utcnow)
+    onboarding_state: Optional[str] = Field(
+        sa_column=Column(TEXT, nullable=True)
+    )
+    last_user_activity: datetime = Field(default_factory=utc_now)
+    updated: datetime = Field(default_factory=utc_now)
 
     def update(
         self, settings_update: ServerSettingsUpdate
@@ -59,13 +64,30 @@ class ServerSettingsSchema(SQLModel, table=True):
         for field, value in settings_update.model_dump(
             exclude_unset=True
         ).items():
-            if field == "onboarding_state":
-                if value is not None:
-                    self.onboarding_state = json.dumps(value)
-            elif hasattr(self, field):
+            if hasattr(self, field):
                 setattr(self, field, value)
 
-        self.updated = datetime.utcnow()
+        self.updated = utc_now()
+
+        return self
+
+    def update_onboarding_state(
+        self, completed_steps: Set[str]
+    ) -> "ServerSettingsSchema":
+        """Update the onboarding state.
+
+        Args:
+            completed_steps: Newly completed onboarding steps.
+
+        Returns:
+            The updated schema.
+        """
+        old_state = set(
+            json.loads(self.onboarding_state) if self.onboarding_state else []
+        )
+        new_state = old_state.union(completed_steps)
+        self.onboarding_state = json.dumps(list(new_state))
+        self.updated = utc_now()
 
         return self
 
@@ -82,7 +104,6 @@ class ServerSettingsSchema(SQLModel, table=True):
             include_resources: Whether the resources will be filled.
             **kwargs: Keyword arguments to allow schema specific logic
 
-
         Returns:
             The created `SettingsResponse`.
         """
@@ -95,17 +116,14 @@ class ServerSettingsSchema(SQLModel, table=True):
             display_updates=self.display_updates,
             active=self.active,
             updated=self.updated,
+            last_user_activity=self.last_user_activity,
         )
 
         metadata = None
         resources = None
 
         if include_metadata:
-            metadata = ServerSettingsResponseMetadata(
-                onboarding_state=json.loads(self.onboarding_state)
-                if self.onboarding_state
-                else {},
-            )
+            metadata = ServerSettingsResponseMetadata()
 
         if include_resources:
             resources = ServerSettingsResponseResources()

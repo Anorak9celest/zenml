@@ -34,6 +34,7 @@ from tests.harness.harness import TestHarness
 from zenml.client import Client
 from zenml.config.global_config import GlobalConfiguration
 from zenml.constants import ENV_ZENML_CONFIG_PATH, ENV_ZENML_DEBUG
+from zenml.login.credentials_store import CredentialsStore
 from zenml.stack.stack import Stack
 
 
@@ -56,9 +57,6 @@ def cleanup_folder(path: str) -> None:
                 "Skipping deletion of temp dir at teardown, due to "
                 "Windows Permission error"
             )
-            # TODO[HIGH]: Implement fixture cleanup for Windows where
-            #  shutil.rmtree fails on files that are in use on python 3.7 and
-            #  3.8
     else:
         shutil.rmtree(path)
 
@@ -179,45 +177,43 @@ def clean_repo_session(
 
 
 @contextmanager
-def clean_workspace_session(
+def clean_project_session(
     tmp_path_factory: pytest.TempPathFactory,
     clean_repo: bool = False,
 ) -> Generator[Client, None, None]:
-    """Context manager to create, activate and use a separate ZenML workspace.
+    """Context manager to create, activate and use a separate ZenML project.
 
     Args:
         tmp_path_factory: A pytest fixture that provides a temporary directory.
         clean_repo: Whether to create and use a clean repository for the
-            workspace.
+            project.
 
     Yields:
-        A ZenML client configured to use the workspace.
+        A ZenML client configured to use the project.
     """
     from zenml.utils.string_utils import random_str
 
     client = Client()
-    original_workspace = client.active_workspace.id
+    original_project = client.active_project.id
 
-    workspace_name = f"pytest_{random_str(8)}"
-    client.create_workspace(
-        name=workspace_name, description="pytest test workspace"
-    )
+    project_name = f"pytest_{random_str(8).lower()}"
+    client.create_project(name=project_name, description="pytest test project")
 
     if clean_repo:
         with clean_repo_session(tmp_path_factory) as repo_client:
-            repo_client.set_active_workspace(workspace_name)
+            repo_client.set_active_project(project_name)
 
-            logging.info(f"Tests are running in workspace: '{workspace_name}'")
+            logging.info(f"Tests are running in project: '{project_name}'")
             yield repo_client
     else:
-        client.set_active_workspace(workspace_name)
+        client.set_active_project(project_name)
 
-        logging.info(f"Tests are running in workspace: '{workspace_name}'")
+        logging.info(f"Tests are running in project: '{project_name}'")
         yield client
 
-    # change the active workspace back to what it was
-    client.set_active_workspace(original_workspace)
-    client.delete_workspace(workspace_name)
+    # change the active project back to what it was
+    client.set_active_project(original_project)
+    client.delete_project(project_name)
 
 
 @contextmanager
@@ -241,7 +237,9 @@ def clean_default_client_session(
     original_config = GlobalConfiguration.get_instance()
     original_client = Client.get_instance()
     orig_config_path = os.getenv(ENV_ZENML_CONFIG_PATH)
+    original_credentials = CredentialsStore.get_instance()
 
+    CredentialsStore.reset_instance()
     GlobalConfiguration._reset_instance()
     Client._reset_instance()
 
@@ -268,9 +266,10 @@ def clean_default_client_session(
     else:
         del os.environ[ENV_ZENML_CONFIG_PATH]
 
-    # restore the global configuration and the client
+    # restore the global configuration, the client and the credentials store
     GlobalConfiguration._reset_instance(original_config)
     Client._reset_instance(original_client)
+    CredentialsStore.reset_instance(original_credentials)
 
     # remove all traces, and change working directory back to base path
     os.chdir(orig_cwd)

@@ -14,14 +14,16 @@
 """Utility functions for the CLI."""
 
 import contextlib
-import datetime
+import functools
 import json
 import os
 import platform
 import re
+import shutil
 import subprocess
 import sys
 from typing import (
+    IO,
     TYPE_CHECKING,
     AbstractSet,
     Any,
@@ -37,10 +39,10 @@ from typing import (
     Type,
     TypeVar,
     Union,
+    cast,
 )
 
 import click
-import pkg_resources
 import yaml
 from pydantic import BaseModel, SecretStr
 from rich import box, table
@@ -57,10 +59,18 @@ from zenml.console import console, zenml_style_defaults
 from zenml.constants import (
     FILTERING_DATETIME_FORMAT,
     IS_DEBUG_ENV,
-    NOT_INSTALLED_MESSAGE,
-    TERRAFORM_NOT_INSTALLED_MESSAGE,
 )
-from zenml.enums import GenericFilterOps, StackComponentType
+from zenml.deployers.utils import (
+    get_deployment_input_schema,
+    get_deployment_invocation_example,
+    get_deployment_output_schema,
+)
+from zenml.enums import (
+    DeploymentStatus,
+    GenericFilterOps,
+    ServiceState,
+    StackComponentType,
+)
 from zenml.logger import get_logger
 from zenml.model_registries.base_model_registry import (
     RegisteredModel,
@@ -76,11 +86,16 @@ from zenml.models import (
     StrFilter,
     UUIDFilter,
 )
-from zenml.services import BaseService, ServiceState
+from zenml.models.v2.base.filter import FilterGenerator
+from zenml.services import BaseService
 from zenml.stack import StackComponent
+from zenml.stack.flavor import Flavor
 from zenml.stack.stack_component import StackComponentConfig
-from zenml.utils import secret_utils
-from zenml.zen_server.deploy import ServerDeployment
+from zenml.utils import dict_utils, secret_utils
+from zenml.utils.package_utils import requirement_installed
+from zenml.utils.time_utils import expires_in
+from zenml.utils.typing_utils import get_origin, is_union
+from zenml.utils.uuid_utils import is_valid_uuid
 
 if TYPE_CHECKING:
     from uuid import UUID
@@ -93,8 +108,10 @@ if TYPE_CHECKING:
     from zenml.models import (
         AuthenticationMethodModel,
         ComponentResponse,
+        DeploymentResponse,
         FlavorResponse,
         PipelineRunResponse,
+        PipelineSnapshotResponse,
         ResourceTypeModel,
         ServiceConnectorRequest,
         ServiceConnectorResourcesModel,
@@ -161,9 +178,45 @@ def error(text: str) -> NoReturn:
         text: Input text string.
 
     Raises:
-        ClickException: when called.
+        StyledClickException: when called.
     """
-    raise click.ClickException(message=click.style(text, fg="red", bold=True))
+    error_prefix = click.style("Error: ", fg="red", bold=True)
+    error_message = click.style(text, fg="red", bold=False)
+
+    # Create a custom ClickException that bypasses Click's default "Error: " prefix
+    class StyledClickException(click.ClickException):
+        def show(self, file: Optional[IO[Any]] = None) -> None:
+            if file is None:
+                file = click.get_text_stream("stderr")
+            # Print our custom styled message directly without Click's prefix
+            click.echo(self.message, file=file)
+
+    raise StyledClickException(message=error_prefix + error_message)
+
+
+def exception(exception: Exception) -> NoReturn:
+    """Echo an exception string on the CLI.
+
+    Args:
+        exception: Input exception.
+    """
+    # KeyError add quotes around their error message to handle the case when
+    # someone tried to fetch something with the key '' (empty string). In all
+    # other cases where the key is not empty however, this adds unnecessary
+    # quotes around the error message, which this function removes.
+    if (
+        isinstance(exception, KeyError)
+        and len(exception.args) == 1
+        # If the exception is a KeyError with an empty string as the argument,
+        # we use the default string representation which will print ''
+        and exception.args[0]
+        and isinstance(exception.args[0], str)
+    ):
+        error_message = exception.args[0]
+    else:
+        error_message = str(exception)
+
+    error(error_message)
 
 
 def warning(
@@ -181,6 +234,25 @@ def warning(
         **kwargs: Optional kwargs to be passed to console.print().
     """
     base_style = zenml_style_defaults["warning"]
+    style = Style.chain(base_style, Style(bold=bold, italic=italic))
+    console.print(text, style=style, **kwargs)
+
+
+def success(
+    text: str,
+    bold: Optional[bool] = None,
+    italic: Optional[bool] = None,
+    **kwargs: Any,
+) -> None:
+    """Echo a success string on the CLI.
+
+    Args:
+        text: Input text string.
+        bold: Optional boolean to bold the text.
+        italic: Optional boolean to italicize the text.
+        **kwargs: Optional kwargs to be passed to console.print().
+    """
+    base_style = zenml_style_defaults["success"]
     style = Style.chain(base_style, Style(bold=bold, italic=italic))
     console.print(text, style=style, **kwargs)
 
@@ -224,10 +296,16 @@ def print_table(
         caption: Caption of the table.
         columns: Optional column configurations to be used in the table.
     """
+    from rich.text import Text
+
     column_keys = {key: None for dict_ in obj for key in dict_}
     column_names = [columns.get(key, key.upper()) for key in column_keys]
     rich_table = table.Table(
-        box=box.HEAVY_EDGE, show_lines=True, title=title, caption=caption
+        box=box.ROUNDED,
+        show_lines=True,
+        title=title,
+        caption=caption,
+        border_style="dim",
     )
     for col_name in column_names:
         if isinstance(col_name, str):
@@ -242,10 +320,19 @@ def print_table(
             if key is None:
                 values.append(None)
             else:
-                value = str(dict_.get(key) or " ")
-                # escape text when square brackets are used
-                if "[" in value:
-                    value = escape(value)
+                v = dict_.get(key) or " "
+                if isinstance(v, str) and (
+                    v.startswith("http://") or v.startswith("https://")
+                ):
+                    # Display the URL as a hyperlink in a way that doesn't break
+                    # the URL when it needs to be wrapped over multiple lines
+                    value: Union[str, Text] = Text(v, style=f"link {v}")
+                else:
+                    value = str(v)
+                    # Escape text when square brackets are used, but allow
+                    # links to be decorated as rich style links
+                    if "[" in value and "[link=" not in value:
+                        value = escape(value)
                 values.append(value)
         rich_table.add_row(*values)
     if len(rich_table.columns) > 1:
@@ -259,6 +346,7 @@ def print_pydantic_models(
     exclude_columns: Optional[List[str]] = None,
     active_models: Optional[List[T]] = None,
     show_active: bool = False,
+    rename_columns: Dict[str, str] = {},
 ) -> None:
     """Prints the list of Pydantic models in a table.
 
@@ -271,6 +359,7 @@ def print_pydantic_models(
         active_models: Optional list of active models of the given type T.
         show_active: Flag to decide whether to append the active model on the
             top of the list.
+        rename_columns: Optional dictionary to rename columns.
     """
     if exclude_columns is None:
         exclude_columns = list()
@@ -294,13 +383,13 @@ def print_pydantic_models(
             if isinstance(model, BaseIdentifiedResponse):
                 include_columns = ["id"]
 
-                if "name" in model.model_fields:
+                if "name" in type(model).model_fields:
                     include_columns.append("name")
 
                 include_columns.extend(
                     [
                         k
-                        for k in model.get_body().model_fields.keys()
+                        for k in type(model.get_body()).model_fields.keys()
                         if k not in exclude_columns
                     ]
                 )
@@ -309,7 +398,9 @@ def print_pydantic_models(
                     include_columns.extend(
                         [
                             k
-                            for k in model.get_metadata().model_fields.keys()
+                            for k in type(
+                                model.get_metadata()
+                            ).model_fields.keys()
                             if k not in exclude_columns
                         ]
                     )
@@ -327,11 +418,13 @@ def print_pydantic_models(
 
         for k in include_columns:
             value = getattr(model, k)
+            if k in rename_columns:
+                k = rename_columns[k]
             # In case the response model contains nested `BaseResponse`s
             #  we want to attempt to represent them by name, if they contain
             #  such a field, else the id is used
             if isinstance(value, BaseIdentifiedResponse):
-                if "name" in value.model_fields:
+                if "name" in type(value).model_fields:
                     items[k] = str(getattr(value, "name"))
                 else:
                     items[k] = str(value.id)
@@ -341,7 +434,7 @@ def print_pydantic_models(
             elif isinstance(value, list):
                 for v in value:
                     if isinstance(v, BaseIdentifiedResponse):
-                        if "name" in v.model_fields:
+                        if "name" in type(v).model_fields:
                             items.setdefault(k, []).append(
                                 str(getattr(v, "name"))
                             )
@@ -351,6 +444,7 @@ def print_pydantic_models(
                 items[k] = [str(v) for v in value]
             else:
                 items[k] = str(value)
+
         # prepend an active marker if a function to mark active was passed
         if not active_models and not show_active:
             return items
@@ -415,9 +509,10 @@ def print_pydantic_model(
         columns: Optionally specify subset and order of columns to display.
     """
     rich_table = table.Table(
-        box=box.HEAVY_EDGE,
+        box=box.ROUNDED,
         title=title,
         show_lines=True,
+        border_style="dim",
     )
     rich_table.add_column("PROPERTY", overflow="fold")
     rich_table.add_column("VALUE", overflow="fold")
@@ -431,13 +526,13 @@ def print_pydantic_model(
         if isinstance(model, BaseIdentifiedResponse):
             include_columns = ["id"]
 
-            if "name" in model.model_fields:
+            if "name" in type(model).model_fields:
                 include_columns.append("name")
 
             include_columns.extend(
                 [
                     k
-                    for k in model.get_body().model_fields.keys()
+                    for k in type(model.get_body()).model_fields.keys()
                     if k not in exclude_columns
                 ]
             )
@@ -446,7 +541,7 @@ def print_pydantic_model(
                 include_columns.extend(
                     [
                         k
-                        for k in model.get_metadata().model_fields.keys()
+                        for k in type(model.get_metadata()).model_fields.keys()
                         if k not in exclude_columns
                     ]
                 )
@@ -465,7 +560,7 @@ def print_pydantic_model(
     for k in include_columns:
         value = getattr(model, k)
         if isinstance(value, BaseIdentifiedResponse):
-            if "name" in value.model_fields:
+            if "name" in type(value).model_fields:
                 items[k] = str(getattr(value, "name"))
             else:
                 items[k] = str(value.id)
@@ -475,7 +570,7 @@ def print_pydantic_model(
         elif isinstance(value, list):
             for v in value:
                 if isinstance(v, BaseIdentifiedResponse):
-                    if "name" in v.model_fields:
+                    if "name" in type(v).model_fields:
                         items.setdefault(k, []).append(str(getattr(v, "name")))
                     else:
                         items.setdefault(k, []).append(str(v.id))
@@ -522,43 +617,6 @@ def format_integration_list(
     return list_of_dicts
 
 
-def print_stack_outputs(stack: "StackResponse") -> None:
-    """Prints outputs for stacks deployed with mlstacks.
-
-    Args:
-        stack: Instance of a stack model.
-    """
-    verify_mlstacks_prerequisites_installation()
-
-    if not stack.stack_spec_path:
-        declare("No stack spec path is set for this stack.")
-        return
-    stack_caption = f"'{stack.name}' stack"
-    rich_table = table.Table(
-        box=box.HEAVY_EDGE,
-        title="MLStacks Outputs",
-        caption=stack_caption,
-        show_lines=True,
-    )
-    rich_table.add_column("OUTPUT_KEY", overflow="fold")
-    rich_table.add_column("OUTPUT_VALUE", overflow="fold")
-
-    from mlstacks.utils.terraform_utils import get_stack_outputs
-
-    stack_spec_file = stack.stack_spec_path
-    stack_outputs = get_stack_outputs(stack_path=stack_spec_file)
-
-    for output_key, output_value in stack_outputs.items():
-        rich_table.add_row(output_key, output_value)
-
-    # capitalize entries in first column
-    rich_table.columns[0]._cells = [
-        component.upper()  # type: ignore[union-attr]
-        for component in rich_table.columns[0]._cells
-    ]
-    console.print(rich_table)
-
-
 def print_stack_configuration(stack: "StackResponse", active: bool) -> None:
     """Prints the configuration options of a stack.
 
@@ -570,10 +628,11 @@ def print_stack_configuration(stack: "StackResponse", active: bool) -> None:
     if active:
         stack_caption += " (ACTIVE)"
     rich_table = table.Table(
-        box=box.HEAVY_EDGE,
+        box=box.ROUNDED,
         title="Stack Configuration",
         caption=stack_caption,
         show_lines=True,
+        border_style="dim",
     )
     rich_table.add_column("COMPONENT_TYPE", overflow="fold")
     rich_table.add_column("COMPONENT_NAME", overflow="fold")
@@ -591,9 +650,10 @@ def print_stack_configuration(stack: "StackResponse", active: bool) -> None:
         declare("No labels are set for this stack.")
     else:
         rich_table = table.Table(
-            box=box.HEAVY_EDGE,
+            box=box.ROUNDED,
             title="Labels",
             show_lines=True,
+            border_style="dim",
         )
         rich_table.add_column("LABEL")
         rich_table.add_column("VALUE", overflow="fold")
@@ -607,9 +667,6 @@ def print_stack_configuration(stack: "StackResponse", active: bool) -> None:
         f"Stack '{stack.name}' with id '{stack.id}' is "
         f"{f'owned by user {stack.user.name}.' if stack.user else 'unowned.'}"
     )
-
-    if stack.stack_spec_path:
-        declare(f"Stack spec path for `mlstacks`: '{stack.stack_spec_path}'")
 
 
 def print_flavor_list(flavors: Page["FlavorResponse"]) -> None:
@@ -654,7 +711,7 @@ def print_stack_component_configuration(
 
     declare(
         f"{component.type.value.title()} '{component.name}' of flavor "
-        f"'{component.flavor}' with id '{component.id}' is owned by "
+        f"'{component.flavor_name}' with id '{component.id}' is owned by "
         f"user '{user_name}'."
     )
 
@@ -670,9 +727,10 @@ def print_stack_component_configuration(
         if active_status:
             title_ += " (ACTIVE)"
         rich_table = table.Table(
-            box=box.HEAVY_EDGE,
+            box=box.ROUNDED,
             title=title_,
             show_lines=True,
+            border_style="dim",
         )
         rich_table.add_column("COMPONENT_PROPERTY")
         rich_table.add_column("VALUE", overflow="fold")
@@ -693,9 +751,10 @@ def print_stack_component_configuration(
         declare("No labels are set for this component.")
     else:
         rich_table = table.Table(
-            box=box.HEAVY_EDGE,
+            box=box.ROUNDED,
             title="Labels",
             show_lines=True,
+            border_style="dim",
         )
         rich_table.add_column("LABEL")
         rich_table.add_column("VALUE", overflow="fold")
@@ -709,9 +768,10 @@ def print_stack_component_configuration(
         declare("No connector is set for this component.")
     else:
         rich_table = table.Table(
-            box=box.HEAVY_EDGE,
+            box=box.ROUNDED,
             title="Service Connector",
             show_lines=True,
+            border_style="dim",
         )
         rich_table.add_column("PROPERTY")
         rich_table.add_column("VALUE", overflow="fold")
@@ -736,11 +796,6 @@ def print_stack_component_configuration(
             rich_table.add_row(label, value)
 
         console.print(rich_table)
-
-    if component.component_spec_path:
-        declare(
-            f"Component spec path for `mlstacks`: {component.component_spec_path}"
-        )
 
 
 def expand_argument_value_from_file(name: str, value: str) -> str:
@@ -1078,22 +1133,18 @@ def install_packages(
         # just return without doing anything
         return
 
-    pip_command = ["uv", "pip"] if use_uv else ["pip"]
-    if upgrade:
-        command = (
-            [
-                sys.executable,
-                "-m",
-            ]
-            + pip_command
-            + [
-                "install",
-                "--upgrade",
-            ]
-            + packages
-        )
+    if use_uv and not requirement_installed("uv"):
+        # If uv is installed globally, don't run as a python module
+        command = []
     else:
-        command = [sys.executable, "-m"] + pip_command + ["install"] + packages
+        command = [sys.executable, "-m"]
+
+    command += ["uv", "pip", "install"] if use_uv else ["pip", "install"]
+
+    if upgrade:
+        command += ["--upgrade"]
+
+    command += packages
 
     if not IS_DEBUG_ENV:
         quiet_flag = "-q" if use_uv else "-qqq"
@@ -1124,49 +1175,38 @@ def uninstall_package(package: str, use_uv: bool = False) -> None:
         package: The package to uninstall.
         use_uv: Whether to use uv for package uninstallation.
     """
-    pip_command = ["uv", "pip"] if use_uv else ["pip"]
-    quiet_flag = "-q" if use_uv else "-qqq"
-
-    if use_uv:
-        subprocess.check_call(
-            [
-                sys.executable,
-                "-m",
-            ]
-            + pip_command
-            + [
-                "uninstall",
-                quiet_flag,
-                package,
-            ]
-        )
+    if use_uv and not requirement_installed("uv"):
+        # If uv is installed globally, don't run as a python module
+        command = []
     else:
-        subprocess.check_call(
-            [
-                sys.executable,
-                "-m",
-            ]
-            + pip_command
-            + [
-                "uninstall",
-                quiet_flag,
-                "-y",
-                package,
-            ]
-        )
+        command = [sys.executable, "-m"]
+
+    command += (
+        ["uv", "pip", "uninstall", "-q"]
+        if use_uv
+        else ["pip", "uninstall", "-y", "-qqq"]
+    )
+    command += [package]
+
+    subprocess.check_call(command)
 
 
 def is_uv_installed() -> bool:
-    """Check if uv is installed in the current environment.
+    """Check if uv is installed.
 
     Returns:
         True if uv is installed, False otherwise.
     """
-    try:
-        pkg_resources.get_distribution("uv")
-        return True
-    except pkg_resources.DistributionNotFound:
-        return False
+    return shutil.which("uv") is not None
+
+
+def is_pip_installed() -> bool:
+    """Check if pip is installed in the current environment.
+
+    Returns:
+        True if pip is installed, False otherwise.
+    """
+    return requirement_installed("pip")
 
 
 def pretty_print_secret(
@@ -1206,8 +1246,9 @@ def print_list_items(list_items: List[str], column_title: str) -> None:
         column_title: Title of the column
     """
     rich_table = table.Table(
-        box=box.HEAVY_EDGE,
+        box=box.ROUNDED,
         show_lines=True,
+        border_style="dim",
     )
     rich_table.add_column(column_title.upper(), overflow="fold")
     list_items.sort()
@@ -1226,7 +1267,7 @@ def get_service_state_emoji(state: "ServiceState") -> str:
     Returns:
         String representing the emoji.
     """
-    from zenml.services.service_status import ServiceState
+    from zenml.enums import ServiceState
 
     if state == ServiceState.ACTIVE:
         return ":white_check_mark:"
@@ -1332,9 +1373,10 @@ def pretty_print_model_version_details(
     title_ = f"Properties of model `{model_version.registered_model.name}` version `{model_version.version}`"
 
     rich_table = table.Table(
-        box=box.HEAVY_EDGE,
+        box=box.ROUNDED,
         title=title_,
         show_lines=True,
+        border_style="dim",
     )
     rich_table.add_column("MODEL VERSION PROPERTY", overflow="fold")
     rich_table.add_column("VALUE", overflow="fold")
@@ -1384,9 +1426,10 @@ def print_served_model_configuration(
     title_ = f"Properties of Served Model {model_service.uuid}"
 
     rich_table = table.Table(
-        box=box.HEAVY_EDGE,
+        box=box.ROUNDED,
         title=title_,
         show_lines=True,
+        border_style="dim",
     )
     rich_table.add_column("MODEL SERVICE PROPERTY", overflow="fold")
     rich_table.add_column("VALUE", overflow="fold")
@@ -1419,74 +1462,6 @@ def print_served_model_configuration(
     console.print(rich_table)
 
 
-def print_server_deployment_list(servers: List["ServerDeployment"]) -> None:
-    """Print a table with a list of ZenML server deployments.
-
-    Args:
-        servers: list of ZenML server deployments
-    """
-    server_dicts = []
-    for server in servers:
-        status = ""
-        url = ""
-        connected = ""
-        if server.status:
-            status = get_service_state_emoji(server.status.status)
-            if server.status.url:
-                url = server.status.url
-            if server.status.connected:
-                connected = ":point_left:"
-        server_dicts.append(
-            {
-                "STATUS": status,
-                "NAME": server.config.name,
-                "PROVIDER": server.config.provider.value,
-                "URL": url,
-                "CONNECTED": connected,
-            }
-        )
-    print_table(server_dicts)
-
-
-def print_server_deployment(server: "ServerDeployment") -> None:
-    """Prints the configuration and status of a ZenML server deployment.
-
-    Args:
-        server: Server deployment to print
-    """
-    server_name = server.config.name
-    title_ = f"ZenML server '{server_name}'"
-
-    rich_table = table.Table(
-        box=box.HEAVY_EDGE,
-        title=title_,
-        show_header=False,
-        show_lines=True,
-    )
-    rich_table.add_column("", overflow="fold")
-    rich_table.add_column("", overflow="fold")
-
-    server_info = []
-
-    if server.status:
-        server_info.extend(
-            [
-                ("URL", server.status.url or ""),
-                ("STATUS", get_service_state_emoji(server.status.status)),
-                ("STATUS_MESSAGE", server.status.status_message or ""),
-                (
-                    "CONNECTED",
-                    ":white_check_mark:" if server.status.connected else "",
-                ),
-            ]
-        )
-
-    for item in server_info:
-        rich_table.add_row(*item)
-
-    console.print(rich_table)
-
-
 def describe_pydantic_object(schema_json: Dict[str, Any]) -> None:
     """Describes a Pydantic object based on the dict-representation of its schema.
 
@@ -1515,7 +1490,7 @@ def describe_pydantic_object(schema_json: Dict[str, Any]) -> None:
                     prop_type = prop_schema["type"]
                 elif "anyOf" in prop_schema.keys():
                     prop_type = ", ".join(
-                        [p["type"] for p in prop_schema["anyOf"]]
+                        [p.get("type", "object") for p in prop_schema["anyOf"]]
                     )
                     prop_type = f"one of: {prop_type}"
                 else:
@@ -1660,63 +1635,11 @@ def print_components_table(
             "ACTIVE": ":point_right:" if is_active else "",
             "NAME": component.name,
             "COMPONENT ID": component.id,
-            "FLAVOR": component.flavor,
+            "FLAVOR": component.flavor_name,
             "OWNER": f"{component.user.name if component.user else '-'}",
         }
         configurations.append(component_config)
     print_table(configurations)
-
-
-def seconds_to_human_readable(time_seconds: int) -> str:
-    """Converts seconds to human-readable format.
-
-    Args:
-        time_seconds: Seconds to convert.
-
-    Returns:
-        Human readable string.
-    """
-    seconds = time_seconds % 60
-    minutes = (time_seconds // 60) % 60
-    hours = (time_seconds // 3600) % 24
-    days = time_seconds // 86400
-    tokens = []
-    if days:
-        tokens.append(f"{days}d")
-    if hours:
-        tokens.append(f"{hours}h")
-    if minutes:
-        tokens.append(f"{minutes}m")
-    if seconds:
-        tokens.append(f"{seconds}s")
-
-    return "".join(tokens)
-
-
-def expires_in(
-    expires_at: datetime.datetime,
-    expired_str: str,
-    skew_tolerance: Optional[int] = None,
-) -> str:
-    """Returns a human-readable string of the time until the token expires.
-
-    Args:
-        expires_at: Datetime object of the token expiration.
-        expired_str: String to return if the token is expired.
-        skew_tolerance: Seconds of skew tolerance to subtract from the
-            expiration time. If the token expires within this time, it will be
-            considered expired.
-
-    Returns:
-        Human readable string.
-    """
-    now = datetime.datetime.now(datetime.timezone.utc)
-    expires_at = expires_at.replace(tzinfo=datetime.timezone.utc)
-    if skew_tolerance:
-        expires_at -= datetime.timedelta(seconds=skew_tolerance)
-    if expires_at < now:
-        return expired_str
-    return seconds_to_human_readable(int((expires_at - now).total_seconds()))
 
 
 def print_service_connectors_table(
@@ -1898,8 +1821,7 @@ def print_service_connector_configuration(
         )
     else:
         declare(
-            f"Service connector '{connector.name}' of type "
-            f"'{connector.type}'."
+            f"Service connector '{connector.name}' of type '{connector.type}'."
         )
 
     title_ = f"'{connector.name}' {connector.type} Service Connector Details"
@@ -1907,9 +1829,10 @@ def print_service_connector_configuration(
     if active_status:
         title_ += " (ACTIVE)"
     rich_table = table.Table(
-        box=box.HEAVY_EDGE,
+        box=box.ROUNDED,
         title=title_,
         show_lines=True,
+        border_style="dim",
     )
     rich_table.add_column("PROPERTY")
     rich_table.add_column("VALUE", overflow="fold")
@@ -1927,7 +1850,6 @@ def print_service_connector_configuration(
             "AUTH METHOD": connector.auth_method,
             "RESOURCE TYPES": ", ".join(connector.emojified_resource_types),
             "RESOURCE NAME": connector.resource_id or "<multiple>",
-            "SECRET ID": connector.secret_id or "",
             "SESSION DURATION": expiration,
             "EXPIRES IN": (
                 expires_in(
@@ -1944,7 +1866,6 @@ def print_service_connector_configuration(
                 else "N/A"
             ),
             "OWNER": user_name,
-            "WORKSPACE": connector.workspace.name,
             "CREATED_AT": connector.created,
             "UPDATED_AT": connector.updated,
         }
@@ -1978,20 +1899,21 @@ def print_service_connector_configuration(
 
     console.print(rich_table)
 
-    if len(connector.configuration) == 0 and len(connector.secrets) == 0:
+    if len(connector.configuration) == 0:
         declare("No configuration options are set for this connector.")
 
     else:
         rich_table = table.Table(
-            box=box.HEAVY_EDGE,
+            box=box.ROUNDED,
             title="Configuration",
             show_lines=True,
+            border_style="dim",
         )
         rich_table.add_column("PROPERTY")
         rich_table.add_column("VALUE", overflow="fold")
 
-        config = connector.configuration.copy()
-        secrets = connector.secrets.copy()
+        config = connector.configuration.non_secrets
+        secrets = connector.configuration.secrets
         for key, value in secrets.items():
             if not show_secrets:
                 config[key] = "[HIDDEN]"
@@ -2011,9 +1933,10 @@ def print_service_connector_configuration(
         return
 
     rich_table = table.Table(
-        box=box.HEAVY_EDGE,
+        box=box.ROUNDED,
         title="Labels",
         show_lines=True,
+        border_style="dim",
     )
     rich_table.add_column("LABEL")
     rich_table.add_column("VALUE", overflow="fold")
@@ -2079,7 +2002,7 @@ def print_service_connector_resource_type(
     message = f"{title}\n" if title else ""
     emoji = replace_emojis(resource_type.emoji) if resource_type.emoji else ""
     supported_auth_methods = [
-        f'{Emoji("lock")} {a}' for a in resource_type.auth_methods
+        f"{Emoji('lock')} {a}" for a in resource_type.auth_methods
     ]
     message += (
         f"{heading} {emoji} {resource_type.name} "
@@ -2203,7 +2126,7 @@ def print_service_connector_type(
     """
     message = f"{title}\n" if title else ""
     supported_auth_methods = [
-        f'{Emoji("lock")} {a.auth_method}' for a in connector_type.auth_methods
+        f"{Emoji('lock')} {a.auth_method}" for a in connector_type.auth_methods
     ]
     supported_resource_types = [
         f"{replace_emojis(r.emoji)} {r.resource_type}"
@@ -2288,12 +2211,13 @@ def _scrub_secret(config: StackComponentConfig) -> Dict[str, Any]:
         A configuration with secret values removed.
     """
     config_dict = {}
-    config_fields = config.__class__.model_fields
+    config_fields = type(config).model_fields
     for key, value in config_fields.items():
-        if secret_utils.is_secret_field(value):
-            config_dict[key] = "********"
-        else:
-            config_dict[key] = getattr(config, key)
+        if getattr(config, key):
+            if secret_utils.is_secret_field(value):
+                config_dict[key] = "********"
+            else:
+                config_dict[key] = getattr(config, key)
     return config_dict
 
 
@@ -2303,19 +2227,15 @@ def print_debug_stack() -> None:
 
     client = Client()
     stack = client.get_stack()
-    active_stack = client.active_stack
-    components = _get_stack_components(active_stack)
 
     declare("\nCURRENT STACK\n", bold=True)
     console.print(f"Name: {stack.name}")
     console.print(f"ID: {str(stack.id)}")
     if stack.user and stack.user.name and stack.user.id:  # mypy check
         console.print(f"User: {stack.user.name} / {str(stack.user.id)}")
-    console.print(
-        f"Workspace: {stack.workspace.name} / {str(stack.workspace.id)}"
-    )
 
-    for component in components:
+    for component_type, components in stack.components.items():
+        component = components[0]
         component_response = client.get_stack_component(
             name_id_or_prefix=component.id, component_type=component.type
         )
@@ -2325,8 +2245,12 @@ def print_debug_stack() -> None:
         console.print(f"Name: {component.name}")
         console.print(f"ID: {str(component.id)}")
         console.print(f"Type: {component.type.value}")
-        console.print(f"Flavor: {component.flavor}")
-        console.print(f"Configuration: {_scrub_secret(component.config)}")
+        console.print(f"Flavor: {component.flavor_name}")
+
+        flavor = Flavor.from_model(component.flavor)
+        config = flavor.config_class(**component.configuration)
+
+        console.print(f"Configuration: {_scrub_secret(config)}")
         if (
             component_response.user
             and component_response.user.name
@@ -2335,9 +2259,6 @@ def print_debug_stack() -> None:
             console.print(
                 f"User: {component_response.user.name} / {str(component_response.user.id)}"
             )
-        console.print(
-            f"Workspace: {component_response.workspace.name} / {str(component_response.workspace.id)}"
-        )
 
 
 def _component_display_name(
@@ -2370,7 +2291,7 @@ def get_execution_status_emoji(status: "ExecutionStatus") -> str:
     """
     from zenml.enums import ExecutionStatus
 
-    if status == ExecutionStatus.INITIALIZING:
+    if status in {ExecutionStatus.INITIALIZING, ExecutionStatus.PROVISIONING}:
         return ":hourglass_flowing_sand:"
     if status == ExecutionStatus.FAILED:
         return ":x:"
@@ -2380,6 +2301,8 @@ def get_execution_status_emoji(status: "ExecutionStatus") -> str:
         return ":white_check_mark:"
     if status == ExecutionStatus.CACHED:
         return ":package:"
+    if status == ExecutionStatus.STOPPED or status == ExecutionStatus.STOPPING:
+        return ":stop_sign:"
     raise RuntimeError(f"Unknown status: {status}")
 
 
@@ -2420,22 +2343,330 @@ def print_pipeline_runs_table(
     print_table(runs_dicts)
 
 
-def warn_unsupported_non_default_workspace() -> None:
-    """Warning for unsupported non-default workspace."""
-    from zenml.constants import (
-        ENV_ZENML_DISABLE_WORKSPACE_WARNINGS,
-        handle_bool_env_var,
+def fetch_snapshot(
+    snapshot_name_or_id: str,
+    pipeline_name_or_id: Optional[str] = None,
+) -> "PipelineSnapshotResponse":
+    """Fetch a snapshot by name or ID.
+
+    Args:
+        snapshot_name_or_id: The name or ID of the snapshot.
+        pipeline_name_or_id: The name or ID of the pipeline.
+
+    Returns:
+        The snapshot.
+    """
+    if is_valid_uuid(snapshot_name_or_id):
+        return Client().get_snapshot(snapshot_name_or_id)
+    elif pipeline_name_or_id:
+        try:
+            return Client().get_snapshot(
+                snapshot_name_or_id,
+                pipeline_name_or_id=pipeline_name_or_id,
+            )
+        except KeyError:
+            error(
+                f"There are no snapshots with name `{snapshot_name_or_id}` for "
+                f"pipeline `{pipeline_name_or_id}`."
+            )
+    else:
+        snapshots = Client().list_snapshots(
+            name=snapshot_name_or_id,
+        )
+        if snapshots.total == 0:
+            error(f"There are no snapshots with name `{snapshot_name_or_id}`.")
+        elif snapshots.total == 1:
+            return snapshots.items[0]
+
+        snapshot_index = multi_choice_prompt(
+            object_type="snapshots",
+            choices=[
+                [snapshot.pipeline.name, snapshot.name]
+                for snapshot in snapshots.items
+            ],
+            headers=["Pipeline", "Snapshot"],
+            prompt_text=f"There are multiple snapshots with name "
+            f"`{snapshot_name_or_id}`. Please select the snapshot to run",
+        )
+        assert snapshot_index is not None
+        return snapshots.items[snapshot_index]
+
+
+def get_deployment_status_emoji(
+    status: Optional[str],
+) -> str:
+    """Returns an emoji representing the given deployment status.
+
+    Args:
+        status: The deployment status to get the emoji for.
+
+    Returns:
+        An emoji representing the given deployment status.
+    """
+    if status == DeploymentStatus.PENDING:
+        return ":hourglass_flowing_sand:"
+    if status == DeploymentStatus.ERROR:
+        return ":x:"
+    if status == DeploymentStatus.RUNNING:
+        return ":green_circle:"
+    if status == DeploymentStatus.ABSENT:
+        return ":stop_sign:"
+
+    return ":question:"
+
+
+def format_deployment_status(status: Optional[str]) -> str:
+    """Format deployment status with color.
+
+    Args:
+        status: The deployment status.
+
+    Returns:
+        Formatted status string.
+    """
+    if status == DeploymentStatus.RUNNING:
+        return "[green]RUNNING[/green]"
+    elif status == DeploymentStatus.PENDING:
+        return "[yellow]PENDING[/yellow]"
+    elif status == DeploymentStatus.ERROR:
+        return "[red]ERROR[/red]"
+    elif status == DeploymentStatus.ABSENT:
+        return "[dim]ABSENT[/dim]"
+
+    return "[dim]UNKNOWN[/dim]"
+
+
+def print_deployment_table(
+    deployments: Sequence["DeploymentResponse"],
+) -> None:
+    """Print a prettified list of all deployments supplied to this method.
+
+    Args:
+        deployments: List of deployments
+    """
+    deployment_dicts = []
+    for deployment in deployments:
+        if deployment.user:
+            user_name = deployment.user.name
+        else:
+            user_name = "-"
+
+        if deployment.snapshot is None or deployment.snapshot.pipeline is None:
+            pipeline_name = "unlisted"
+        else:
+            pipeline_name = deployment.snapshot.pipeline.name
+        if deployment.snapshot is None or deployment.snapshot.stack is None:
+            stack_name = "[DELETED]"
+        else:
+            stack_name = deployment.snapshot.stack.name
+        status = deployment.status or DeploymentStatus.UNKNOWN.value
+        status_emoji = get_deployment_status_emoji(status)
+        run_dict = {
+            "ID": deployment.id,
+            "NAME": deployment.name,
+            "PIPELINE": pipeline_name,
+            "SNAPSHOT": deployment.snapshot.name or ""
+            if deployment.snapshot
+            else "N/A",
+            "URL": deployment.url or "N/A",
+            "STATUS": f"{status_emoji} {status.upper()}",
+            "STACK": stack_name,
+            "OWNER": user_name,
+        }
+        deployment_dicts.append(run_dict)
+    print_table(deployment_dicts)
+
+
+def pretty_print_deployment(
+    deployment: "DeploymentResponse",
+    show_secret: bool = False,
+    show_metadata: bool = False,
+    show_schema: bool = False,
+    no_truncate: bool = False,
+) -> None:
+    """Print a prettified deployment with organized sections.
+
+    Args:
+        deployment: The deployment to print.
+        show_secret: Whether to show the auth key or mask it.
+        show_metadata: Whether to show the metadata.
+        show_schema: Whether to show the schema.
+        no_truncate: Whether to truncate the metadata.
+    """
+    # Header section
+    status_label = (deployment.status or "UNKNOWN").upper()
+    status_emoji = get_deployment_status_emoji(deployment.status)
+    declare(
+        f"\n[bold]Deployment:[/bold] [bold cyan]{deployment.name}[/bold cyan] status: {status_label} {status_emoji}"
+    )
+    if deployment.snapshot is None:
+        pipeline_name = "N/A"
+        snapshot_name = "N/A"
+    else:
+        pipeline_name = deployment.snapshot.pipeline.name
+        snapshot_name = deployment.snapshot.name or str(deployment.snapshot.id)
+    if deployment.snapshot is None or deployment.snapshot.stack is None:
+        stack_name = "[DELETED]"
+    else:
+        stack_name = deployment.snapshot.stack.name
+    declare(f"\n[bold]Pipeline:[/bold] [bold cyan]{pipeline_name}[/bold cyan]")
+    declare(f"[bold]Snapshot:[/bold] [bold cyan]{snapshot_name}[/bold cyan]")
+    declare(f"[bold]Stack:[/bold] [bold cyan]{stack_name}[/bold cyan]")
+
+    # Connection section
+    if deployment.url:
+        declare("\n[bold]Connection information:[/bold]")
+
+        declare(f"\n[bold]Endpoint URL:[/bold] [link]{deployment.url}[/link]")
+        declare(
+            f"[bold]Swagger URL:[/bold] [link]{deployment.url.rstrip('/')}/docs[/link]"
+        )
+
+        # Auth key handling with proper security
+        auth_key = deployment.auth_key
+        if auth_key:
+            if show_secret:
+                declare(f"[bold]Auth key:[/bold] [yellow]{auth_key}[/yellow]")
+            else:
+                masked_key = (
+                    f"{auth_key[:8]}***" if len(auth_key) > 8 else "***"
+                )
+                declare(
+                    f"[bold]Auth key:[/bold] [yellow]{masked_key}[/yellow] "
+                    f"[dim](run `zenml deployment describe {deployment.name} --show-secret` to reveal)[/dim]"
+                )
+
+        example = get_deployment_invocation_example(deployment)
+
+        # CLI invoke command
+        cli_args = " ".join(
+            [
+                f"--{k}="
+                + (
+                    f"'{json.dumps(v)}'"
+                    if isinstance(v, (dict, list))
+                    else json.dumps(v)
+                )
+                for k, v in example.items()
+            ]
+        )
+        cli_command = f"zenml deployment invoke {deployment.name} {cli_args}"
+
+        declare("[bold]CLI command example:[/bold]")
+        console.print(cli_command)
+
+        # cURL example
+        declare("\n[bold]cURL example:[/bold]")
+        curl_headers = []
+        if auth_key:
+            if show_secret:
+                curl_headers.append(f'-H "Authorization: Bearer {auth_key}"')
+            else:
+                curl_headers.append(
+                    '-H "Authorization: Bearer <YOUR_AUTH_KEY>"'
+                )
+
+        curl_params = json.dumps(example, indent=2).replace("\n", "\n    ")
+
+        curl_headers.append('-H "Content-Type: application/json"')
+        headers_str = "\\\n  ".join(curl_headers)
+
+        curl_command = f"""curl -X POST {deployment.url}/invoke \\
+  {headers_str} \\
+  -d '{{
+    "parameters": {curl_params}
+  }}'"""
+
+        console.print(curl_command)
+
+    # JSON Schemas
+    if show_schema:
+        input_schema = get_deployment_input_schema(deployment)
+        output_schema = get_deployment_output_schema(deployment)
+        declare("\n[bold]Deployment JSON schemas:[/bold]")
+        declare("\n[bold]Input schema:[/bold]")
+        schema_json = json.dumps(input_schema, indent=2)
+        console.print(schema_json)
+        declare("\n[bold]Output schema:[/bold]")
+        schema_json = json.dumps(output_schema, indent=2)
+        console.print(schema_json)
+
+    # Metadata section
+    if show_metadata:
+        declare("\n[bold]Deployment metadata:[/bold]")
+
+        # Get the metadata - it could be from deployment_metadata property or metadata
+        metadata = deployment.deployment_metadata
+
+        if metadata:
+            # Recursively format nested dictionaries and lists
+            def format_value(value: Any, indent_level: int = 0) -> str:
+                if isinstance(value, dict):
+                    if not value:
+                        return "[dim]{}[/dim]"
+                    formatted_items: List[str] = []
+                    for k, v in value.items():
+                        formatted_v = format_value(v, indent_level + 1)
+                        formatted_items.append(
+                            f"  {'  ' * indent_level}[bold]{k}[/bold]: {formatted_v}"
+                        )
+                    return "\n" + "\n".join(formatted_items)
+                elif isinstance(value, list):
+                    if not value:
+                        return "[dim][][/dim]"
+                    formatted_items = []
+                    for i, item in enumerate(value):
+                        formatted_item = format_value(item, indent_level + 1)
+                        formatted_items.append(
+                            f"  {'  ' * indent_level}[{i}]: {formatted_item}"
+                        )
+                    return "\n" + "\n".join(formatted_items)
+                elif isinstance(value, str):
+                    # Handle long strings by truncating if needed
+                    if len(value) > 100 and not no_truncate:
+                        return f"[green]{value[:97]}...[/green]"
+                    return f"[green]{value}[/green]"
+                elif isinstance(value, bool):
+                    return f"[yellow]{value}[/yellow]"
+                elif isinstance(value, (int, float)):
+                    return f"[blue]{value}[/blue]"
+                elif value is None:
+                    return "[dim]null[/dim]"
+                else:
+                    return f"[white]{str(value)}[/white]"
+
+            formatted_metadata = format_value(metadata)
+            console.print(formatted_metadata)
+        else:
+            declare("  [dim]No metadata available[/dim]")
+
+    # Management section
+    declare("\n[bold]Management commands[/bold]\n")
+
+    console.print(f"[bold]zenml deployment logs {deployment.name} -f[/bold]")
+    console.print("  [dim]Follow deployment logs in real time[/dim]\n")
+
+    console.print(f"[bold]zenml deployment describe {deployment.name}[/bold]")
+    console.print("  [dim]Show detailed deployment information[/dim]\n")
+
+    console.print(
+        f"[bold]zenml deployment deprovision {deployment.name}[/bold]"
+    )
+    console.print(
+        "  [dim]Deprovision this deployment and keep a record of it[/dim]\n"
     )
 
-    disable_warnings = handle_bool_env_var(
-        ENV_ZENML_DISABLE_WORKSPACE_WARNINGS, False
-    )
-    if not disable_warnings:
+    console.print(f"[bold]zenml deployment delete {deployment.name}[/bold]")
+    console.print("  [dim]Deprovision and delete this deployment[/dim]")
+
+
+def check_zenml_pro_project_availability() -> None:
+    """Check if the ZenML Pro project feature is available."""
+    client = Client()
+    if not client.zen_store.get_store_info().is_pro_server():
         warning(
-            "Currently the concept of `workspace` is not supported "
-            "within the Dashboard. The Project functionality will be "
-            "completed in the coming weeks. For the time being it "
-            "is recommended to stay within the `default` workspace."
+            "The ZenML projects feature is available only on ZenML Pro. "
+            "Please visit https://zenml.io/pro to learn more."
         )
 
 
@@ -2464,12 +2695,13 @@ def create_filter_help_text(filter_model: Type[BaseFilter], field: str) -> str:
     Returns:
         The help text.
     """
-    if filter_model.is_sort_by_field(field):
+    filter_generator = FilterGenerator(filter_model)
+    if filter_generator.is_sort_by_field(field):
         return (
             "[STRING] Example: --sort_by='desc:name' to sort by name in "
             "descending order. "
         )
-    if filter_model.is_datetime_field(field):
+    if filter_generator.is_datetime_field(field):
         return (
             f"[DATETIME] The following datetime format is supported: "
             f"'{FILTERING_DATETIME_FORMAT}'. Make sure to keep it in "
@@ -2478,23 +2710,23 @@ def create_filter_help_text(filter_model: Type[BaseFilter], field: str) -> str:
             f"'{GenericFilterOps.GTE}:{FILTERING_DATETIME_FORMAT}' to "
             f"filter for everything created on or after the given date."
         )
-    elif filter_model.is_uuid_field(field):
+    elif filter_generator.is_uuid_field(field):
         return (
             f"[UUID] Example: --{field}='{GenericFilterOps.STARTSWITH}:ab53ca' "
             f"to filter for all UUIDs starting with that prefix."
         )
-    elif filter_model.is_int_field(field):
+    elif filter_generator.is_int_field(field):
         return (
             f"[INTEGER] Example: --{field}='{GenericFilterOps.GTE}:25' to "
             f"filter for all entities where this field has a value greater than "
             f"or equal to the value."
         )
-    elif filter_model.is_bool_field(field):
+    elif filter_generator.is_bool_field(field):
         return (
             f"[BOOL] Example: --{field}='True' to "
             f"filter for all instances where this field is true."
         )
-    elif filter_model.is_str_field(field):
+    elif filter_generator.is_str_field(field):
         return (
             f"[STRING] Example: --{field}='{GenericFilterOps.CONTAINS}:example' "
             f"to filter everything that contains the query string somewhere in "
@@ -2516,33 +2748,51 @@ def create_data_type_help_text(
     Returns:
         The help text.
     """
-    if filter_model.is_datetime_field(field):
+    filter_generator = FilterGenerator(filter_model)
+    if filter_generator.is_datetime_field(field):
         return (
             f"[DATETIME] supported filter operators: "
             f"{[str(op) for op in NumericFilter.ALLOWED_OPS]}"
         )
-    elif filter_model.is_uuid_field(field):
+    elif filter_generator.is_uuid_field(field):
         return (
             f"[UUID] supported filter operators: "
             f"{[str(op) for op in UUIDFilter.ALLOWED_OPS]}"
         )
-    elif filter_model.is_int_field(field):
+    elif filter_generator.is_int_field(field):
         return (
             f"[INTEGER] supported filter operators: "
             f"{[str(op) for op in NumericFilter.ALLOWED_OPS]}"
         )
-    elif filter_model.is_bool_field(field):
+    elif filter_generator.is_bool_field(field):
         return (
             f"[BOOL] supported filter operators: "
             f"{[str(op) for op in BoolFilter.ALLOWED_OPS]}"
         )
-    elif filter_model.is_str_field(field):
+    elif filter_generator.is_str_field(field):
         return (
             f"[STRING] supported filter operators: "
             f"{[str(op) for op in StrFilter.ALLOWED_OPS]}"
         )
     else:
         return f"{field}"
+
+
+def _is_list_field(field_info: Any) -> bool:
+    """Check if a field is a list field.
+
+    Args:
+        field_info: The field info to check.
+
+    Returns:
+        True if the field is a list field, False otherwise.
+    """
+    field_type = field_info.annotation
+    origin = get_origin(field_type)
+    return origin is list or (
+        is_union(origin)
+        and any(get_origin(arg) is list for arg in field_type.__args__)
+    )
 
 
 def list_options(filter_model: Type[BaseFilter]) -> Callable[[F], F]:
@@ -2573,6 +2823,7 @@ def list_options(filter_model: Type[BaseFilter]) -> Callable[[F], F]:
                         type=str,
                         default=v.default,
                         required=False,
+                        multiple=_is_list_field(v),
                         help=create_filter_help_text(filter_model, k),
                     )
                 )
@@ -2580,11 +2831,6 @@ def list_options(filter_model: Type[BaseFilter]) -> Callable[[F], F]:
                 data_type_descriptors.add(
                     create_data_type_help_text(filter_model, k)
                 )
-
-        def wrapper(function: F) -> F:
-            for option in reversed(options):
-                function = option(function)
-            return function
 
         func.__doc__ = (
             f"{func.__doc__} By default all filters are "
@@ -2606,7 +2852,17 @@ def list_options(filter_model: Type[BaseFilter]) -> Callable[[F], F]:
                 f"{joined_data_type_descriptors}"
             )
 
-        return wrapper(func)
+        for option in reversed(options):
+            func = option(func)
+
+        @functools.wraps(func)
+        def wrapper(*args: Any, **kwargs: Any) -> Any:
+            nonlocal func
+
+            kwargs = dict_utils.remove_none_values(kwargs)
+            return func(*args, **kwargs)
+
+        return cast(F, wrapper)
 
     return inner_decorator
 
@@ -2636,30 +2892,6 @@ def temporary_active_stack(
     finally:
         if old_stack_id:
             Client().activate_stack(old_stack_id)
-
-
-def get_package_information(
-    package_names: Optional[List[str]] = None,
-) -> Dict[str, str]:
-    """Get a dictionary of installed packages.
-
-    Args:
-        package_names: Specific package names to get the information for.
-
-    Returns:
-        A dictionary of the name:version for the package names passed in or
-            all packages and their respective versions.
-    """
-    import pkg_resources
-
-    if package_names:
-        return {
-            pkg.key: pkg.version
-            for pkg in pkg_resources.working_set
-            if pkg.key in package_names
-        }
-
-    return {pkg.key: pkg.version for pkg in pkg_resources.working_set}
 
 
 def print_user_info(info: Dict[str, Any]) -> None:
@@ -2745,32 +2977,9 @@ def print_model_url(url: Optional[str]) -> None:
         warning(
             "You can display various ZenML entities including pipelines, "
             "runs, stacks and much more on the ZenML Dashboard. "
-            "You can try it locally, by running `zenml up`, or remotely, "
-            "by deploying ZenML on the infrastructure of your choice."
+            "You can try it locally, by running `zenml login --local`, or "
+            "remotely, by deploying ZenML on the infrastructure of your choice."
         )
-
-
-def warn_deprecated_example_subcommand() -> None:
-    """Warning for deprecating example subcommand."""
-    warning(
-        "The `example` CLI subcommand has been deprecated and will be removed "
-        "in a future release."
-    )
-
-
-def verify_mlstacks_prerequisites_installation() -> None:
-    """Checks if the `mlstacks` package is installed."""
-    try:
-        import mlstacks  # noqa: F401
-        import python_terraform  # noqa: F401
-
-        subprocess.check_output(
-            ["terraform", "--version"], universal_newlines=True
-        )
-    except ImportError:
-        error(NOT_INSTALLED_MESSAGE)
-    except subprocess.CalledProcessError:
-        error(TERRAFORM_NOT_INSTALLED_MESSAGE)
 
 
 def is_jupyter_installed() -> bool:
@@ -2779,11 +2988,7 @@ def is_jupyter_installed() -> bool:
     Returns:
         bool: True if Jupyter notebook is installed, False otherwise.
     """
-    try:
-        pkg_resources.get_distribution("notebook")
-        return True
-    except pkg_resources.DistributionNotFound:
-        return False
+    return requirement_installed("notebook")
 
 
 def multi_choice_prompt(
@@ -2813,7 +3018,7 @@ def multi_choice_prompt(
     table = Table(
         title=f"Available {object_type}",
         show_header=True,
-        border_style=None,
+        border_style="dim",
         expand=True,
         show_lines=True,
     )
@@ -2831,7 +3036,7 @@ def multi_choice_prompt(
             *([f"Create a new {object_type}"] * len(headers)),
         )
     for i, one_choice in enumerate(choices):
-        table.add_row(f"[{i+i_shift}]", *[str(x) for x in one_choice])
+        table.add_row(f"[{i + i_shift}]", *[str(x) for x in one_choice])
     Console().print(table)
 
     selected = Prompt.ask(

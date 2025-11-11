@@ -22,43 +22,38 @@ from typing import (
     Optional,
     Tuple,
     Type,
-    Union,
 )
-from urllib.parse import urlparse
 from uuid import UUID
 
 from pydantic import BaseModel, ConfigDict, model_validator
-from requests import ConnectionError
 
 import zenml
 from zenml.config.global_config import GlobalConfiguration
 from zenml.config.server_config import ServerConfiguration
 from zenml.config.store_config import StoreConfiguration
 from zenml.constants import (
+    DEFAULT_PROJECT_NAME,
     DEFAULT_STACK_AND_COMPONENT_NAME,
-    DEFAULT_WORKSPACE_NAME,
-    ENV_ZENML_DEFAULT_WORKSPACE_NAME,
+    ENV_ZENML_DEFAULT_PROJECT_NAME,
+    ENV_ZENML_SERVER,
     IS_DEBUG_ENV,
 )
 from zenml.enums import (
     SecretsStoreType,
     StoreType,
 )
-from zenml.exceptions import AuthorizationException
+from zenml.exceptions import IllegalOperationError
 from zenml.logger import get_logger
 from zenml.models import (
+    ProjectFilter,
+    ProjectResponse,
     ServerDatabaseType,
+    ServerDeploymentType,
     ServerModel,
     StackFilter,
     StackResponse,
-    UserFilter,
-    UserResponse,
-    WorkspaceResponse,
 )
 from zenml.utils.pydantic_utils import before_validator_handler
-from zenml.zen_stores.secrets_stores.sql_secrets_store import (
-    SqlSecretsStoreConfiguration,
-)
 from zenml.zen_stores.zen_store_interface import ZenStoreInterface
 
 logger = get_logger(__name__)
@@ -135,46 +130,10 @@ class BaseZenStore(
                 stack and user in the store will be skipped.
             **kwargs: Additional keyword arguments to pass to the Pydantic
                 constructor.
-
-        Raises:
-            RuntimeError: If the store cannot be initialized.
-            AuthorizationException: If the store cannot be initialized due to
-                authentication errors.
         """
         super().__init__(**kwargs)
 
-        try:
-            self._initialize()
-
-        # Handle cases where the ZenML server is not available
-        except ConnectionError as e:
-            error_message = (
-                "Cannot connect to the ZenML database because the ZenML server "
-                f"at {self.url} is not running."
-            )
-            if urlparse(self.url).hostname in ["localhost", "127.0.0.1"]:
-                recommendation = (
-                    "Please run `zenml down` and `zenml up` to restart the "
-                    "server."
-                )
-            else:
-                recommendation = (
-                    "Please run `zenml disconnect` and `zenml connect --url "
-                    f"{self.url}` to reconnect to the server."
-                )
-            raise RuntimeError(f"{error_message}\n{recommendation}") from e
-
-        except AuthorizationException as e:
-            raise AuthorizationException(
-                f"Authorization failed for store at '{self.url}'. Please check "
-                f"your credentials: {str(e)}"
-            )
-
-        except Exception as e:
-            raise RuntimeError(
-                f"Error initializing {self.type.value} store with URL "
-                f"'{self.url}': {str(e)}"
-            ) from e
+        self._initialize()
 
         if not skip_default_registrations:
             logger.debug("Initializing database")
@@ -196,9 +155,16 @@ class BaseZenStore(
             TypeError: If the store type is unsupported.
         """
         if store_type == StoreType.SQL:
-            from zenml.zen_stores.sql_zen_store import SqlZenStore
+            if os.environ.get(ENV_ZENML_SERVER):
+                from zenml.zen_server.rbac.rbac_sql_zen_store import (
+                    RBACSqlZenStore,
+                )
 
-            return SqlZenStore
+                return RBACSqlZenStore
+            else:
+                from zenml.zen_stores.sql_zen_store import SqlZenStore
+
+                return SqlZenStore
         elif store_type == StoreType.REST:
             from zenml.zen_stores.rest_zen_store import RestZenStore
 
@@ -238,14 +204,19 @@ class BaseZenStore(
             TypeError: If no store type was found to support the supplied URL.
         """
         from zenml.zen_stores.rest_zen_store import RestZenStoreConfiguration
+
+        if RestZenStoreConfiguration.supports_url_scheme(url):
+            return StoreType.REST
+
+        # Only import this once we've made sure it's not a REST URL, as the
+        # zenml package without the local extra will fail this import due to
+        # missing database dependencies.
         from zenml.zen_stores.sql_zen_store import SqlZenStoreConfiguration
 
         if SqlZenStoreConfiguration.supports_url_scheme(url):
             return StoreType.SQL
-        elif RestZenStoreConfiguration.supports_url_scheme(url):
-            return StoreType.REST
-        else:
-            raise TypeError(f"No store implementation found for URL: {url}.")
+
+        raise TypeError(f"No store implementation found for URL: {url}.")
 
     @staticmethod
     def create_store(
@@ -264,7 +235,6 @@ class BaseZenStore(
         Returns:
             The initialized store.
         """
-        logger.debug(f"Creating store with config '{config}'...")
         store_class = BaseZenStore.get_store_class(config.type)
         store = store_class(
             config=config,
@@ -287,6 +257,9 @@ class BaseZenStore(
         Returns:
             The default store configuration.
         """
+        from zenml.zen_stores.secrets_stores.sql_secrets_store import (
+            SqlSecretsStoreConfiguration,
+        )
         from zenml.zen_stores.sql_zen_store import SqlZenStoreConfiguration
 
         config = SqlZenStoreConfiguration(
@@ -321,51 +294,72 @@ class BaseZenStore(
 
     def validate_active_config(
         self,
-        active_workspace_name_or_id: Optional[Union[str, UUID]] = None,
+        active_project_id: Optional[UUID] = None,
         active_stack_id: Optional[UUID] = None,
         config_name: str = "",
-    ) -> Tuple[WorkspaceResponse, StackResponse]:
+    ) -> Tuple[Optional[ProjectResponse], StackResponse]:
         """Validate the active configuration.
 
-        Call this method to validate the supplied active workspace and active
+        Call this method to validate the supplied active project and active
         stack values.
 
-        This method is guaranteed to return valid workspace ID and stack ID
-        values. If the supplied workspace and stack are not set or are not valid
-        (e.g. they do not exist or are not accessible), the default workspace and
-        default workspace stack will be returned in their stead.
+        This method returns a valid project and stack values. If the
+        supplied project and stack are not set or are not valid (e.g. they
+        do not exist or are not accessible), the default project and default
+        stack will be returned in their stead.
 
         Args:
-            active_workspace_name_or_id: The name or ID of the active workspace.
+            active_project_id: The ID of the active project.
             active_stack_id: The ID of the active stack.
             config_name: The name of the configuration to validate (used in the
                 displayed logs/messages).
 
         Returns:
-            A tuple containing the active workspace and active stack.
+            A tuple containing the active project and active stack.
         """
-        active_workspace: WorkspaceResponse
+        active_project: Optional[ProjectResponse] = None
 
-        if active_workspace_name_or_id:
+        if active_project_id:
             try:
-                active_workspace = self.get_workspace(
-                    active_workspace_name_or_id
-                )
-            except KeyError:
-                active_workspace = self._get_default_workspace()
-
+                active_project = self.get_project(active_project_id)
+            except (KeyError, IllegalOperationError):
+                active_project_id = None
                 logger.warning(
-                    f"The current {config_name} active workspace is no longer "
-                    f"available. Resetting the active workspace to "
-                    f"'{active_workspace.name}'."
+                    f"The current {config_name} active project is no longer "
+                    f"available."
                 )
-        else:
-            active_workspace = self._get_default_workspace()
 
-            logger.info(
-                f"Setting the {config_name} active workspace "
-                f"to '{active_workspace.name}'."
-            )
+        if active_project is None:
+            user = self.get_user()
+            if user.default_project_id:
+                try:
+                    active_project = self.get_project(user.default_project_id)
+                except (KeyError, IllegalOperationError):
+                    logger.warning(
+                        "The default project %s for the active user is no "
+                        "longer available.",
+                        user.default_project_id,
+                    )
+                else:
+                    logger.info(
+                        f"Setting the {config_name} active project "
+                        f"to '{active_project.name}'."
+                    )
+
+        if active_project is None:
+            try:
+                projects = self.list_projects(
+                    project_filter_model=ProjectFilter()
+                )
+            except Exception:
+                pass
+            else:
+                if len(projects) == 1:
+                    active_project = projects.items[0]
+                    logger.info(
+                        f"Setting the {config_name} active project "
+                        f"to '{active_project.name}'."
+                    )
 
         active_stack: StackResponse
 
@@ -374,36 +368,22 @@ class BaseZenStore(
             # Ensure that the active stack is still valid
             try:
                 active_stack = self.get_stack(stack_id=active_stack_id)
-            except KeyError:
+            except (KeyError, IllegalOperationError):
                 logger.warning(
                     "The current %s active stack is no longer available. "
                     "Resetting the active stack to default.",
                     config_name,
                 )
-                active_stack = self._get_default_stack(
-                    workspace_id=active_workspace.id
-                )
-            else:
-                if active_stack.workspace.id != active_workspace.id:
-                    logger.warning(
-                        "The current %s active stack is not part of the active "
-                        "workspace. Resetting the active stack to default.",
-                        config_name,
-                    )
-                    active_stack = self._get_default_stack(
-                        workspace_id=active_workspace.id
-                    )
+                active_stack = self._get_default_stack()
 
         else:
             logger.warning(
                 "Setting the %s active stack to default.",
                 config_name,
             )
-            active_stack = self._get_default_stack(
-                workspace_id=active_workspace.id
-            )
+            active_stack = self._get_default_stack()
 
-        return active_workspace, active_stack
+        return active_project, active_stack
 
     def get_store_info(self) -> ServerModel:
         """Get information about the store.
@@ -411,17 +391,14 @@ class BaseZenStore(
         Returns:
             Information about the store.
         """
-        from zenml.zen_stores.sql_zen_store import SqlZenStore
-
         server_config = ServerConfiguration.get_server_config()
         deployment_type = server_config.deployment_type
         auth_scheme = server_config.auth_scheme
         metadata = server_config.metadata
         secrets_store_type = SecretsStoreType.NONE
-        if isinstance(self, SqlZenStore) and self.config.secrets_store:
+        if self.config.type == StoreType.SQL and self.config.secrets_store:
             secrets_store_type = self.config.secrets_store.type
-        use_legacy_dashboard = server_config.use_legacy_dashboard
-        return ServerModel(
+        store_info = ServerModel(
             id=GlobalConfiguration().user_id,
             active=True,
             version=zenml.__version__,
@@ -434,8 +411,24 @@ class BaseZenStore(
             dashboard_url=server_config.dashboard_url or "",
             analytics_enabled=GlobalConfiguration().analytics_opt_in,
             metadata=metadata,
-            use_legacy_dashboard=use_legacy_dashboard,
         )
+
+        # Add ZenML Pro specific store information to the server model, if available.
+        if store_info.deployment_type == ServerDeploymentType.CLOUD:
+            from zenml.config.server_config import ServerProConfiguration
+
+            pro_config = ServerProConfiguration.get_server_config()
+
+            store_info.pro_api_url = pro_config.api_url
+            store_info.pro_dashboard_url = pro_config.dashboard_url
+            store_info.pro_organization_id = pro_config.organization_id
+            store_info.pro_workspace_id = pro_config.workspace_id
+            if pro_config.workspace_name:
+                store_info.pro_workspace_name = pro_config.workspace_name
+            if pro_config.organization_name:
+                store_info.pro_organization_name = pro_config.organization_name
+
+        return store_info
 
     def is_local_store(self) -> bool:
         """Check if the store is local or connected to a local ZenML server.
@@ -446,77 +439,37 @@ class BaseZenStore(
         return self.get_store_info().is_local()
 
     # -----------------------------
-    # Default workspaces and stacks
+    # Default projects and stacks
     # -----------------------------
 
     @property
-    def _default_workspace_name(self) -> str:
-        """Get the default workspace name.
+    def _default_project_name(self) -> str:
+        """Get the default project name.
 
         Returns:
-            The default workspace name.
+            The default project name.
         """
-        return os.getenv(
-            ENV_ZENML_DEFAULT_WORKSPACE_NAME, DEFAULT_WORKSPACE_NAME
-        )
-
-    def _get_default_workspace(self) -> WorkspaceResponse:
-        """Get the default workspace.
-
-        Raises:
-            KeyError: If the default workspace doesn't exist.
-
-        Returns:
-            The default workspace.
-        """
-        try:
-            return self.get_workspace(self._default_workspace_name)
-        except KeyError:
-            raise KeyError("Unable to find default workspace.")
+        return os.getenv(ENV_ZENML_DEFAULT_PROJECT_NAME, DEFAULT_PROJECT_NAME)
 
     def _get_default_stack(
         self,
-        workspace_id: UUID,
     ) -> StackResponse:
-        """Get the default stack for a user in a workspace.
-
-        Args:
-            workspace_id: ID of the workspace.
+        """Get the default stack.
 
         Returns:
-            The default stack in the workspace.
+            The default stack.
 
         Raises:
-            KeyError: if the workspace or default stack doesn't exist.
+            KeyError: if the default stack doesn't exist.
         """
         default_stacks = self.list_stacks(
             StackFilter(
-                workspace_id=workspace_id,
                 name=DEFAULT_STACK_AND_COMPONENT_NAME,
             )
         )
         if default_stacks.total == 0:
-            raise KeyError(
-                f"No default stack found in workspace {workspace_id}."
-            )
+            raise KeyError("No default stack found.")
         return default_stacks.items[0]
-
-    def get_external_user(self, user_id: UUID) -> UserResponse:
-        """Get a user by external ID.
-
-        Args:
-            user_id: The external ID of the user.
-
-        Returns:
-            The user with the supplied external ID.
-
-        Raises:
-            KeyError: If the user doesn't exist.
-        """
-        users = self.list_users(UserFilter(external_user_id=user_id))
-        if users.total == 0:
-            raise KeyError(f"User with external ID '{user_id}' not found.")
-        return users.items[0]
 
     model_config = ConfigDict(
         # Validate attributes when assigning them. We need to set this in order

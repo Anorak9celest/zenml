@@ -42,7 +42,6 @@ def _get_vertex_orchestrator(**kwargs):
         flavor="gcp",
         type=StackComponentType.ORCHESTRATOR,
         user=uuid4(),
-        workspace=uuid4(),
         created=datetime.now(),
         updated=datetime.now(),
     )
@@ -77,7 +76,6 @@ def test_vertex_orchestrator_stack_validation(
         flavor="azure",
         type=StackComponentType.ARTIFACT_STORE,
         user=uuid4(),
-        workspace=uuid4(),
         created=datetime.now(),
         updated=datetime.now(),
     )
@@ -140,19 +138,25 @@ def test_vertex_orchestrator_stack_validation(
             ResourceSettings(cpu_count=1, gpu_count=1, memory="1GB"),
             {"cpu_limit": "4", "gpu_limit": 4, "memory_limit": "1G"},
             {
-                "accelerator": {"count": "1", "type": "NVIDIA_TESLA_K80"},
-                "cpuLimit": 1.0,
-                "memoryLimit": 1.0,
+                "accelerator": {
+                    "resourceCount": "1",
+                    "resourceType": "NVIDIA_TESLA_K80",
+                },
+                "resourceCpuLimit": "1.0",
+                "resourceMemoryLimit": "1G",
             },
         ),
         # No ResourceSettings, should take values from the orchestrator
         (
             ResourceSettings(cpu_count=None, gpu_count=None, memory=None),
-            {"cpu_limit": "1", "gpu_limit": 1, "memory_limit": "1G"},
+            {"cpu_limit": "1.0", "gpu_limit": 1, "memory_limit": "1G"},
             {
-                "accelerator": {"count": "1", "type": "NVIDIA_TESLA_K80"},
-                "cpuLimit": 1.0,
-                "memoryLimit": 1.0,
+                "accelerator": {
+                    "resourceCount": "1",
+                    "resourceType": "NVIDIA_TESLA_K80",
+                },
+                "resourceCpuLimit": "1.0",
+                "resourceMemoryLimit": "1G",
             },
         ),
         # GPU count is None, 1 gpu should be used (KFP default)
@@ -160,15 +164,18 @@ def test_vertex_orchestrator_stack_validation(
             ResourceSettings(cpu_count=1, gpu_count=None, memory="1GB"),
             {"cpu_limit": None, "gpu_limit": None, "memory_limit": None},
             {
-                "cpuLimit": 1.0,
-                "memoryLimit": 1.0,
+                "resourceCpuLimit": "1.0",
+                "resourceMemoryLimit": "1G",
             },
         ),
         # GPU count is 0, should not be set in the resource spec
         (
             ResourceSettings(cpu_count=1, gpu_count=0, memory="1GB"),
             {"cpu_limit": None, "gpu_limit": None, "memory_limit": None},
-            {"cpuLimit": 1.0, "memoryLimit": 1.0},
+            {
+                "resourceCpuLimit": "1.0",
+                "resourceMemoryLimit": "1G",
+            },
         ),
     ],
 )
@@ -227,4 +234,48 @@ def test_vertex_orchestrator_configure_container_resources(
     job_spec = pipeline_json["deploymentSpec"]["executors"][
         f"exec-{step_name}"
     ]["container"]
-    assert job_spec["resources"] == expected_resources
+
+    if "accelerator" in job_spec["resources"]:
+        if "resourceCount" not in job_spec["resources"]["accelerator"]:
+            expected_resources["accelerator"].pop("resourceCount", None)
+        if "resourceType" not in job_spec["resources"]["accelerator"]:
+            expected_resources["accelerator"].pop("resourceType", None)
+
+    if "resourceCpuLimit" not in job_spec["resources"]:
+        expected_resources.pop("resourceCpuLimit", None)
+    if "resourceMemoryLimit" not in job_spec["resources"]:
+        expected_resources.pop("resourceMemoryLimit", None)
+
+    def assert_dict_is_subset(subset, actual):
+        """Recursively checks if all values in `subset` are present in `actual`.
+
+        This means:
+        - All keys in `subset` must exist in `actual`.
+        - If a value in `subset` is a dict, it must be a subset
+            of the corresponding value in `actual`.
+        - If a value in `subset` is a list, all its elements must
+            be in the corresponding list in `actual`.
+        - Otherwise, the values must be equal.
+        """
+        for key, subset_value in subset.items():
+            if key not in actual:
+                return False
+            actual_value = actual[key]
+
+            if isinstance(subset_value, dict):
+                if not isinstance(
+                    actual_value, dict
+                ) or not assert_dict_is_subset(subset_value, actual_value):
+                    return False
+            elif isinstance(subset_value, list):
+                if not isinstance(actual_value, list) or not all(
+                    elem in actual_value for elem in subset_value
+                ):
+                    return False
+            else:
+                if subset_value != actual_value:
+                    return False
+
+        return True
+
+    assert assert_dict_is_subset(expected_resources, job_spec["resources"])

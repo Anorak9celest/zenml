@@ -30,18 +30,26 @@ from zenml.zen_stores.schemas.code_repository_schemas import (
 from zenml.zen_stores.schemas.device_schemas import OAuthDeviceSchema
 from zenml.zen_stores.schemas.event_source_schemas import EventSourceSchema
 from zenml.zen_stores.schemas.pipeline_build_schemas import PipelineBuildSchema
+from zenml.zen_stores.schemas.deployment_schemas import DeploymentSchema
+from zenml.zen_stores.schemas.curated_visualization_schemas import (
+    CuratedVisualizationSchema,
+)
 from zenml.zen_stores.schemas.component_schemas import StackComponentSchema
 from zenml.zen_stores.schemas.flavor_schemas import FlavorSchema
 from zenml.zen_stores.schemas.server_settings_schemas import ServerSettingsSchema
-from zenml.zen_stores.schemas.pipeline_deployment_schemas import (
-    PipelineDeploymentSchema,
+from zenml.zen_stores.schemas.pipeline_snapshot_schemas import (
+    PipelineSnapshotSchema,
+    StepConfigurationSchema,
 )
 from zenml.zen_stores.schemas.pipeline_run_schemas import PipelineRunSchema
 from zenml.zen_stores.schemas.pipeline_schemas import PipelineSchema
-from zenml.zen_stores.schemas.workspace_schemas import WorkspaceSchema
-from zenml.zen_stores.schemas.run_metadata_schemas import RunMetadataSchema
+from zenml.zen_stores.schemas.project_schemas import ProjectSchema
+from zenml.zen_stores.schemas.run_metadata_schemas import (
+    RunMetadataResourceSchema,
+    RunMetadataSchema,
+)
 from zenml.zen_stores.schemas.schedule_schema import ScheduleSchema
-from zenml.zen_stores.schemas.secret_schemas import SecretSchema
+from zenml.zen_stores.schemas.secret_schemas import SecretSchema, SecretResourceSchema
 from zenml.zen_stores.schemas.service_schemas import ServiceSchema
 from zenml.zen_stores.schemas.service_connector_schemas import (
     ServiceConnectorSchema,
@@ -69,7 +77,9 @@ from zenml.zen_stores.schemas.model_schemas import (
     ModelVersionArtifactSchema,
     ModelVersionPipelineRunSchema,
 )
+from zenml.zen_stores.schemas.run_template_schemas import RunTemplateSchema
 from zenml.zen_stores.schemas.server_settings_schemas import ServerSettingsSchema
+from zenml.zen_stores.schemas.api_transaction_schemas import ApiTransactionSchema
 
 __all__ = [
     "ActionSchema",
@@ -80,18 +90,23 @@ __all__ = [
     "BaseSchema",
     "CodeReferenceSchema",
     "CodeRepositorySchema",
+    "DeploymentSchema",
+    "CuratedVisualizationSchema",
     "EventSourceSchema",
     "FlavorSchema",
     "LogsSchema",
     "NamedSchema",
     "OAuthDeviceSchema",
     "PipelineBuildSchema",
-    "PipelineDeploymentSchema",
+    "PipelineSnapshotSchema",
+    "StepConfigurationSchema",
     "PipelineRunSchema",
     "PipelineSchema",
+    "RunMetadataResourceSchema",
     "RunMetadataSchema",
     "ScheduleSchema",
     "SecretSchema",
+    "SecretResourceSchema",
     "ServerSettingsSchema",
     "ServiceConnectorSchema",
     "ServiceSchema",
@@ -102,6 +117,7 @@ __all__ = [
     "StepRunOutputArtifactSchema",
     "StepRunParentsSchema",
     "StepRunSchema",
+    "RunTemplateSchema",
     "TagSchema",
     "TagResourceSchema",
     "TriggerSchema",
@@ -112,5 +128,6 @@ __all__ = [
     "ModelVersionSchema",
     "ModelVersionArtifactSchema",
     "ModelVersionPipelineRunSchema",
-    "WorkspaceSchema",
+    "ProjectSchema",
+    "ApiTransactionSchema",
 ]

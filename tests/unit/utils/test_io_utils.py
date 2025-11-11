@@ -74,7 +74,7 @@ def test_write_file_contents_as_string_works(tmp_path):
 def test_write_file_contents_as_string_fails_with_non_string_types(tmp_path):
     """Tests writing to file."""
     file_path = os.path.join(tmp_path, "test.txt")
-    with pytest.raises(ValueError):
+    with pytest.raises(ValueError, match="Content must be of type str"):
         io_utils.write_file_contents_as_string(file_path, 1)
 
 
@@ -212,8 +212,13 @@ def test_is_remote_when_using_remote_prefix(filesystem):
 def test_is_remote_when_using_non_remote_prefix(filesystem):
     """is_remote returns False when path doesn't start with
     a remote prefix"""
+    expected_result = False
+
+    if filesystem in REMOTE_FS_PREFIX:
+        expected_result = True
+
     some_random_path = os.path.join(f"{filesystem}some_directory")
-    assert io_utils.is_remote(some_random_path) is False
+    assert io_utils.is_remote(some_random_path) is expected_result
 
 
 def test_create_file_if_not_exists(tmp_path) -> None:

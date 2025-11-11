@@ -1,6 +1,6 @@
 # Apache Software License 2.0
 #
-# Copyright (c) ZenML GmbH 2024. All rights reserved.
+# Copyright (c) ZenML GmbH 2025. All rights reserved.
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
 # you may not use this file except in compliance with the License.
@@ -61,7 +61,10 @@ def promote_with_metric_compare(
     latest_version = get_step_context().model
     current_version = Model(name=latest_version.name, version=target_env)
 
-    current_version_number = current_version.number
+    try:
+        current_version_number = current_version.number
+    except KeyError:
+        current_version_number = None
 
     if current_version_number is None:
         logger.info("No current model version found - promoting latest")
@@ -89,14 +92,14 @@ def promote_with_metric_compare(
         # Promote in Model Registry
         latest_version_model_registry_number = latest_version.run_metadata[
             "model_registry_version"
-        ].value
+        ]
         if current_version_number is None:
             current_version_model_registry_number = (
                 latest_version_model_registry_number
             )
         else:
             current_version_model_registry_number = (
-                current_version.run_metadata["model_registry_version"].value
+                current_version.run_metadata["model_registry_version"]
             )
         promote_in_model_registry(
             latest_version=latest_version_model_registry_number,
@@ -108,7 +111,7 @@ def promote_with_metric_compare(
     else:
         promoted_version = current_version.run_metadata[
             "model_registry_version"
-        ].value
+        ]
 
     logger.info(
         f"Current model version in `{target_env}` is `{promoted_version}` registered in Model Registry"

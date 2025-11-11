@@ -13,8 +13,8 @@
 #  permissions and limitations under the License.
 """Initialization for ZenML."""
 
-# Define ROOT_DIR
 import os
+from typing import Any
 
 ROOT_DIR = os.path.dirname(os.path.abspath(__file__))
 
@@ -27,51 +27,61 @@ from zenml.logger import init_logging  # noqa
 
 init_logging()
 
-# The following code is needed for `zenml.hub` subpackages to be found
-from pkgutil import extend_path
+def __getattr__(name: str) -> Any:
+    # We allow directly accessing the entrypoint module as `zenml.entrypoint`
+    # as this is needed for some orchestrators. Instead of directly importing
+    # the entrypoint module here, we import it dynamically. This avoids a
+    # warning when running the `zenml.entrypoints.entrypoint` module directly.
+    if name == "entrypoint":
+        from zenml.entrypoints import entrypoint
+        return entrypoint
 
-__path__ = extend_path(__path__, __name__)
+    raise AttributeError(f"module '{__name__}' has no attribute '{name}'")
 
 # Need to import zenml.models before zenml.config to avoid circular imports
 from zenml.models import *  # noqa: F401
 
 # Define public Python API
-from zenml.api import show
+from zenml.utils.dashboard_utils import show_dashboard as show
 from zenml.artifacts.utils import (
     log_artifact_metadata,
     save_artifact,
     load_artifact,
+    register_artifact,
 )
 from zenml.model.utils import (
     log_model_metadata,
     link_artifact_to_model,
-    log_model_version_metadata,
 )
 from zenml.artifacts.artifact_config import ArtifactConfig
 from zenml.artifacts.external_artifact import ExternalArtifact
 from zenml.model.model import Model
-from zenml.model.model_version import ModelVersion # TODO: deprecate me
-from zenml.new.pipelines.pipeline_context import get_pipeline_context
-from zenml.new.pipelines.pipeline_decorator import pipeline
-from zenml.new.steps.step_decorator import step
-from zenml.new.steps.step_context import get_step_context
+from zenml.pipelines import get_pipeline_context, pipeline
+from zenml.steps import step, get_step_context
 from zenml.steps.utils import log_step_metadata
+from zenml.utils.metadata_utils import log_metadata, bulk_log_metadata
+from zenml.utils.tag_utils import Tag, add_tags, remove_tags
+
 
 __all__ = [
+    "add_tags",
+    "remove_tags",
+    "Tag",
     "ArtifactConfig",
     "ExternalArtifact",
     "get_pipeline_context",
     "get_step_context",
     "load_artifact",
+    "log_metadata",
+    "bulk_log_metadata",
     "log_artifact_metadata",
     "log_model_metadata",
-    "log_model_version_metadata",
     "log_step_metadata",
     "Model",
-    "ModelVersion", # TODO: deprecate me
     "link_artifact_to_model",
     "pipeline",
     "save_artifact",
+    "register_artifact",
     "show",
     "step",
 ]

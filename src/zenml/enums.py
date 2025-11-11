@@ -34,15 +34,31 @@ class ArtifactType(StrEnum):
 class StepRunInputArtifactType(StrEnum):
     """All possible types of a step run input artifact."""
 
-    DEFAULT = "default"  # input argument that is the output of a previous step
+    STEP_OUTPUT = (
+        "step_output"  # input argument that is the output of a previous step
+    )
     MANUAL = "manual"  # manually loaded via `zenml.load_artifact()`
+    EXTERNAL = "external"  # loaded via `ExternalArtifact(value=...)`
+    LAZY_LOADED = "lazy"  # loaded via various lazy methods
 
 
-class StepRunOutputArtifactType(StrEnum):
-    """All possible types of a step run output artifact."""
+class ArtifactSaveType(StrEnum):
+    """All possible method types of how artifact versions can be saved."""
 
-    DEFAULT = "default"  # output of the current step
+    STEP_OUTPUT = "step_output"  # output of the current step
     MANUAL = "manual"  # manually saved via `zenml.save_artifact()`
+    PREEXISTING = "preexisting"  # register via `zenml.register_artifact()`
+    EXTERNAL = (
+        "external"  # saved via `zenml.ExternalArtifact.upload_by_value()`
+    )
+
+
+class DownloadType(StrEnum):
+    """All possible types of downloadable content."""
+
+    ARTIFACT_VERSION = "artifact_version"
+    STEP_LOGS = "step_logs"
+    RUN_LOGS = "run_logs"
 
 
 class VisualizationType(StrEnum):
@@ -52,6 +68,7 @@ class VisualizationType(StrEnum):
     HTML = "html"
     IMAGE = "image"
     MARKDOWN = "markdown"
+    JSON = "json"
 
 
 class ZenMLServiceType(StrEnum):
@@ -62,26 +79,51 @@ class ZenMLServiceType(StrEnum):
 
 
 class ExecutionStatus(StrEnum):
-    """Enum that represents the current status of a step or pipeline run."""
+    """Enum that represents the execution status of a step or pipeline run."""
 
     INITIALIZING = "initializing"
+    PROVISIONING = "provisioning"
     FAILED = "failed"
     COMPLETED = "completed"
     RUNNING = "running"
     CACHED = "cached"
+    RETRYING = "retrying"
+    RETRIED = "retried"
+    STOPPED = "stopped"
+    STOPPING = "stopping"
 
     @property
     def is_finished(self) -> bool:
-        """Whether the execution status refers to a finished execution.
+        """Returns whether the execution status is in a finished state.
 
         Returns:
-            Whether the execution status refers to a finished execution.
+            Whether the execution status is finished.
         """
         return self in {
             ExecutionStatus.FAILED,
             ExecutionStatus.COMPLETED,
             ExecutionStatus.CACHED,
+            ExecutionStatus.RETRIED,
+            ExecutionStatus.STOPPED,
         }
+
+    @property
+    def is_successful(self) -> bool:
+        """Whether the execution status refers to a successful execution.
+
+        Returns:
+            Whether the execution status refers to a successful execution.
+        """
+        return self in {ExecutionStatus.COMPLETED, ExecutionStatus.CACHED}
+
+    @property
+    def is_failed(self) -> bool:
+        """Whether the execution status refers to a failed execution.
+
+        Returns:
+            Whether the execution status refers to a failed execution.
+        """
+        return self in {ExecutionStatus.FAILED}
 
 
 class LoggingLevels(Enum):
@@ -90,9 +132,18 @@ class LoggingLevels(Enum):
     NOTSET = logging.NOTSET
     ERROR = logging.ERROR
     WARN = logging.WARN
+    WARNING = logging.WARNING
     INFO = logging.INFO
     DEBUG = logging.DEBUG
     CRITICAL = logging.CRITICAL
+
+
+class ExecutionMode(StrEnum):
+    """Enum that represents the execution mode of a pipeline run."""
+
+    FAIL_FAST = "fail_fast"
+    STOP_ON_FAILURE = "stop_on_failure"
+    CONTINUE_ON_FAILURE = "continue_on_failure"
 
 
 class StackComponentType(StrEnum):
@@ -110,6 +161,7 @@ class StackComponentType(StrEnum):
     ORCHESTRATOR = "orchestrator"
     STEP_OPERATOR = "step_operator"
     MODEL_REGISTRY = "model_registry"
+    DEPLOYER = "deployer"
 
     @property
     def plural(self) -> str:
@@ -124,13 +176,6 @@ class StackComponentType(StrEnum):
             return "model_registries"
 
         return f"{self.value}s"
-
-
-class SecretScope(StrEnum):
-    """Enum for the scope of a secret."""
-
-    WORKSPACE = "workspace"
-    USER = "user"
 
 
 class StoreType(StrEnum):
@@ -171,7 +216,6 @@ class CliCategories(StrEnum):
 
     STACK_COMPONENTS = "Stack Components"
     MODEL_DEPLOYMENT = "Model Deployment"
-    HUB = "ZenML Hub"
     INTEGRATIONS = "Integrations"
     MANAGEMENT_TOOLS = "Management Tools"
     MODEL_CONTROL_PLANE = "Model Control Plane"
@@ -199,11 +243,8 @@ class SecretValidationLevel(StrEnum):
 class ServerProviderType(StrEnum):
     """ZenML server providers."""
 
-    LOCAL = "local"
+    DAEMON = "daemon"
     DOCKER = "docker"
-    AWS = "aws"
-    GCP = "gcp"
-    AZURE = "azure"
 
 
 class AnalyticsEventSource(StrEnum):
@@ -241,17 +282,27 @@ class OAuthDeviceStatus(StrEnum):
     LOCKED = "locked"
 
 
+class APITokenType(StrEnum):
+    """The API token type."""
+
+    GENERIC = "generic"
+    WORKLOAD = "workload"
+
+
 class GenericFilterOps(StrEnum):
     """Ops for all filters for string values on list methods."""
 
     EQUALS = "equals"
+    NOT_EQUALS = "notequals"
     CONTAINS = "contains"
     STARTSWITH = "startswith"
     ENDSWITH = "endswith"
+    ONEOF = "oneof"
     GTE = "gte"
     GT = "gt"
     LTE = "lte"
     LT = "lt"
+    IN = "in"
 
 
 class SorterOps(StrEnum):
@@ -303,6 +354,10 @@ class EnvironmentType(StrEnum):
     NOTEBOOK = "notebook"
     PAPERSPACE = "paperspace"
     WSL = "wsl"
+    LIGHTNING_AI_STUDIO = "lightning_ai_studio"
+    GITHUB_CODESPACES = "github_codespaces"
+    VSCODE_REMOTE_CONTAINER = "vscode_remote_container"
+    ZENML_CODESPACE = "zenml_codespace"
 
 
 class ModelStages(StrEnum):
@@ -338,6 +393,11 @@ class TaggableResourceTypes(StrEnum):
     ARTIFACT_VERSION = "artifact_version"
     MODEL = "model"
     MODEL_VERSION = "model_version"
+    PIPELINE = "pipeline"
+    PIPELINE_RUN = "pipeline_run"
+    RUN_TEMPLATE = "run_template"
+    PIPELINE_SNAPSHOT = "pipeline_snapshot"
+    DEPLOYMENT = "deployment"
 
 
 class ResponseUpdateStrategy(StrEnum):
@@ -355,6 +415,49 @@ class MetadataResourceTypes(StrEnum):
     STEP_RUN = "step_run"
     ARTIFACT_VERSION = "artifact_version"
     MODEL_VERSION = "model_version"
+    SCHEDULE = "schedule"
+
+
+class VisualizationResourceTypes(StrEnum):
+    """Resource types that support curated visualizations.
+
+    Curated visualizations can be attached to these ZenML resources to provide
+    contextual dashboards and visual insights throughout the ML lifecycle:
+
+    - **DEPLOYMENT**: Server-side pipeline deployments - surface visualizations
+      on deployment monitoring dashboards and status pages
+    - **MODEL**: ZenML model entities - surface model evaluation dashboards and
+      performance summaries directly on the model detail pages
+    - **PIPELINE**: Pipeline definitions - associate visualizations with pipeline
+      configurations for reusable visual documentation
+    - **PIPELINE_RUN**: Pipeline execution runs - attach visualizations to specific
+      run results for detailed analysis and debugging
+    - **PIPELINE_SNAPSHOT**: Pipeline snapshots - link visualizations to captured
+      pipeline configurations for version comparison and historical analysis
+    - **PROJECT**: Project-level overviews - provide high-level project dashboards
+      and KPI visualizations for cross-pipeline insights
+    """
+
+    DEPLOYMENT = "deployment"  # Server-side pipeline deployments
+    MODEL = "model"  # ZenML models
+    PIPELINE = "pipeline"  # Pipeline definitions
+    PIPELINE_RUN = "pipeline_run"  # Execution runs
+    PIPELINE_SNAPSHOT = "pipeline_snapshot"  # Snapshot configurations
+    PROJECT = "project"  # Project-level dashboards
+
+
+class CuratedVisualizationSize(StrEnum):
+    """Layout size options for curated visualizations."""
+
+    FULL_WIDTH = "full_width"
+    HALF_WIDTH = "half_width"
+
+
+class SecretResourceTypes(StrEnum):
+    """All possible resource types for adding secrets."""
+
+    STACK = "stack"
+    STACK_COMPONENT = "stack_component"
 
 
 class DatabaseBackupStrategy(StrEnum):
@@ -386,7 +489,66 @@ class PluginSubType(StrEnum):
     PIPELINE_RUN = "pipeline_run"
 
 
+class OnboardingStep(StrEnum):
+    """All onboarding steps."""
+
+    DEVICE_VERIFIED = "device_verified"
+    PROJECT_CREATED = "project_created"
+    PIPELINE_RUN = "pipeline_run"
+    STACK_WITH_REMOTE_ORCHESTRATOR_CREATED = (
+        "stack_with_remote_orchestrator_created"
+    )
+    STACK_WITH_REMOTE_ARTIFACT_STORE_CREATED = (
+        "stack_with_remote_artifact_store_created"
+    )
+    PIPELINE_RUN_WITH_REMOTE_ORCHESTRATOR = (
+        "pipeline_run_with_remote_orchestrator"
+    )
+    PIPELINE_RUN_WITH_REMOTE_ARTIFACT_STORE = (
+        "pipeline_run_with_remote_artifact_store"
+    )
+    OSS_ONBOARDING_COMPLETED = "oss_onboarding_completed"
+    PRO_ONBOARDING_COMPLETED = "pro_onboarding_completed"
+
+
 class StackDeploymentProvider(StrEnum):
     """All possible stack deployment providers."""
 
     AWS = "aws"
+    GCP = "gcp"
+    AZURE = "azure"
+
+
+class ServiceState(StrEnum):
+    """Possible states for the service and service endpoint."""
+
+    INACTIVE = "inactive"
+    ACTIVE = "active"
+    PENDING_STARTUP = "pending_startup"
+    PENDING_SHUTDOWN = "pending_shutdown"
+    ERROR = "error"
+    SCALED_TO_ZERO = "scaled_to_zero"
+
+
+class DeploymentStatus(StrEnum):
+    """Status of a deployment."""
+
+    UNKNOWN = "unknown"
+    PENDING = "pending"
+    RUNNING = "running"
+    ABSENT = "absent"
+    ERROR = "error"
+
+
+class PipelineRunTriggeredByType(StrEnum):
+    """All possible types that can trigger a pipeline run."""
+
+    STEP_RUN = "step_run"
+    DEPLOYMENT = "deployment"
+
+
+class StepRuntime(StrEnum):
+    """All possible runtime modes for a step."""
+
+    INLINE = "inline"
+    ISOLATED = "isolated"

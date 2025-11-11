@@ -13,14 +13,17 @@
 #  permissions and limitations under the License.
 """Authentication module for ZenML server."""
 
-from contextvars import ContextVar
-from datetime import datetime
-from typing import Callable, Optional, Union
-from urllib.parse import urlencode
-from uuid import UUID
+import functools
+from datetime import datetime, timedelta
+from functools import wraps
+from typing import Any, Awaitable, Callable, Dict, Optional, Tuple, Union, cast
+from urllib.parse import urlencode, urlparse
+from uuid import UUID, uuid4
 
+import anyio.to_thread
 import requests
-from fastapi import Depends, HTTPException, status
+from anyio import CapacityLimiter
+from fastapi import Depends, Response
 from fastapi.security import (
     HTTPBasic,
     HTTPBasicCredentials,
@@ -33,12 +36,26 @@ from zenml.analytics.context import AnalyticsContext
 from zenml.constants import (
     API,
     DEFAULT_USERNAME,
+    DEFAULT_ZENML_SERVER_GENERIC_API_TOKEN_LIFETIME,
+    ENV_ZENML_WORKLOAD_TOKEN_EXPIRATION_LEEWAY,
     EXTERNAL_AUTHENTICATOR_TIMEOUT,
     LOGIN,
     VERSION_1,
+    ZENML_API_KEY_PREFIX,
+    ZENML_PRO_API_KEY_PREFIX,
+    handle_int_env_var,
 )
-from zenml.enums import AuthScheme, OAuthDeviceStatus
-from zenml.exceptions import AuthorizationException, OAuthError
+from zenml.enums import (
+    AuthScheme,
+    DownloadType,
+    OAuthDeviceStatus,
+    OnboardingStep,
+)
+from zenml.exceptions import (
+    AuthorizationException,
+    CredentialsNotValid,
+    OAuthError,
+)
 from zenml.logger import get_logger
 from zenml.models import (
     APIKey,
@@ -47,43 +64,30 @@ from zenml.models import (
     ExternalUserModel,
     OAuthDeviceInternalResponse,
     OAuthDeviceInternalUpdate,
+    OAuthTokenResponse,
+    ServiceAccountFilter,
+    ServiceAccountInternalRequest,
+    ServiceAccountInternalUpdate,
     UserAuthModel,
+    UserFilter,
     UserRequest,
     UserResponse,
     UserUpdate,
 )
+from zenml.utils.time_utils import utc_now
+from zenml.zen_server.cache import cache_result
+from zenml.zen_server.csrf import CSRFToken
+from zenml.zen_server.exceptions import http_exception_from_error
 from zenml.zen_server.jwt import JWTToken
-from zenml.zen_server.utils import server_config, zen_store
-
-logger = get_logger(__name__)
-
-# create a context variable to store the authentication context
-_auth_context: ContextVar[Optional["AuthContext"]] = ContextVar(
-    "auth_context", default=None
+from zenml.zen_server.utils import (
+    get_zenml_headers,
+    is_same_or_subdomain,
+    request_manager,
+    server_config,
+    zen_store,
 )
 
-
-def get_auth_context() -> Optional["AuthContext"]:
-    """Returns the current authentication context.
-
-    Returns:
-        The authentication context.
-    """
-    auth_context = _auth_context.get()
-    return auth_context
-
-
-def set_auth_context(auth_context: "AuthContext") -> "AuthContext":
-    """Sets the current authentication context.
-
-    Args:
-        auth_context: The authentication context.
-
-    Returns:
-        The authentication context.
-    """
-    _auth_context.set(auth_context)
-    return auth_context
+logger = get_logger(__name__)
 
 
 class AuthContext(BaseModel):
@@ -109,20 +113,19 @@ def _fetch_and_verify_api_key(
         The fetched API key.
 
     Raises:
-        AuthorizationException: If the API key could not be found, is not
+        CredentialsNotValid: If the API key could not be found, is not
             active, if it could not be verified against the supplied key value
-            or if the associated service account is not active.
+            or if the associated service account is not active or is an
+            external service account.
     """
     store = zen_store()
 
     try:
         api_key = zen_store().get_internal_api_key(api_key_id)
     except KeyError:
-        error = (
-            f"Authentication error: error retrieving API key " f"{api_key_id}"
-        )
+        error = f"Authentication error: error retrieving API key {api_key_id}"
         logger.error(error)
-        raise AuthorizationException(error)
+        raise CredentialsNotValid(error)
 
     if not api_key.service_account.active:
         error = (
@@ -131,7 +134,15 @@ def _fetch_and_verify_api_key(
             f"associated with API key {api_key.name} is not active"
         )
         logger.exception(error)
-        raise AuthorizationException(error)
+        raise CredentialsNotValid(error)
+
+    if api_key.service_account.external_user_id:
+        error = (
+            "Authentication error: cannot use an API key associated with an "
+            "external service account to authenticate to the ZenML server"
+        )
+        logger.exception(error)
+        raise CredentialsNotValid(error)
 
     if not api_key.active:
         error = (
@@ -141,7 +152,7 @@ def _fetch_and_verify_api_key(
             f"{api_key.service_account.name} is not active"
         )
         logger.error(error)
-        raise AuthorizationException(error)
+        raise CredentialsNotValid(error)
 
     if key_to_verify and not api_key.verify_key(key_to_verify):
         error = (
@@ -149,7 +160,7 @@ def _fetch_and_verify_api_key(
             f"{api_key.name}"
         )
         logger.exception(error)
-        raise AuthorizationException(error)
+        raise CredentialsNotValid(error)
 
     # Update the "last used" timestamp of the API key
     store.update_internal_api_key(
@@ -164,6 +175,7 @@ def authenticate_credentials(
     user_name_or_id: Optional[Union[str, UUID]] = None,
     password: Optional[str] = None,
     access_token: Optional[str] = None,
+    csrf_token: Optional[str] = None,
     activation_token: Optional[str] = None,
 ) -> AuthContext:
     """Verify if user authentication credentials are valid.
@@ -176,19 +188,22 @@ def authenticate_credentials(
        grant
      * access token (with embedded user id) - after successful authentication
        using one of the supported grants
+     * API key (e.g. used directly in the authorization header instead of a
+       regular access token)
      * username+activation token - for user activation
 
     Args:
         user_name_or_id: The username or user ID.
         password: The password.
-        access_token: The access token.
+        access_token: The access token or API key.
+        csrf_token: The CSRF token.
         activation_token: The activation token.
 
     Returns:
         The authenticated account details.
 
     Raises:
-        AuthorizationException: If the credentials are invalid.
+        CredentialsNotValid: If the credentials are invalid.
     """
     user: Optional[UserAuthModel] = None
     auth_context: Optional[AuthContext] = None
@@ -218,11 +233,11 @@ def authenticate_credentials(
         if not UserAuthModel.verify_password(password, user):
             error = "Authentication error: invalid username or password"
             logger.error(error)
-            raise AuthorizationException(error)
+            raise CredentialsNotValid(error)
         if user and not user.active:
             error = f"Authentication error: user {user.name} is not active"
             logger.error(error)
-            raise AuthorizationException(error)
+            raise CredentialsNotValid(error)
 
     elif activation_token is not None:
         if not UserAuthModel.verify_activation_token(activation_token, user):
@@ -231,17 +246,50 @@ def authenticate_credentials(
                 f"{user_name_or_id}"
             )
             logger.error(error)
-            raise AuthorizationException(error)
+            raise CredentialsNotValid(error)
 
+    elif access_token is not None and access_token.startswith(
+        ZENML_API_KEY_PREFIX
+    ):
+        # This is an API key used in place of an access token.
+        return authenticate_api_key(api_key=access_token)
+    elif access_token is not None and access_token.startswith(
+        ZENML_PRO_API_KEY_PREFIX
+    ):
+        # This is a ZenML Pro API key used in place of an access token.
+        try:
+            return authenticate_external_user(
+                external_access_token=access_token
+            )
+        except AuthorizationException as e:
+            error = f"Authentication error: {e}."
+            logger.exception(error)
+            raise CredentialsNotValid(error)
     elif access_token is not None:
         try:
             decoded_token = JWTToken.decode_token(
                 token=access_token,
             )
-        except AuthorizationException as e:
+        except CredentialsNotValid as e:
             error = f"Authentication error: error decoding access token: {e}."
             logger.exception(error)
-            raise AuthorizationException(error)
+            raise CredentialsNotValid(error)
+
+        if decoded_token.session_id:
+            if not csrf_token:
+                error = "Authentication error: missing CSRF token"
+                logger.error(error)
+                raise CredentialsNotValid(error)
+
+            decoded_csrf_token = CSRFToken.decode_token(csrf_token)
+
+            if decoded_csrf_token.session_id != decoded_token.session_id:
+                error = (
+                    "Authentication error: CSRF token does not match the "
+                    "access token"
+                )
+                logger.error(error)
+                raise CredentialsNotValid(error)
 
         try:
             user_model = zen_store().get_user(
@@ -253,7 +301,7 @@ def authenticate_credentials(
                 f"{decoded_token.user_id}"
             )
             logger.error(error)
-            raise AuthorizationException(error)
+            raise CredentialsNotValid(error)
 
         if not user_model.active:
             error = (
@@ -261,7 +309,7 @@ def authenticate_credentials(
                 f"active"
             )
             logger.error(error)
-            raise AuthorizationException(error)
+            raise CredentialsNotValid(error)
 
         api_key_model: Optional[APIKeyInternalResponse] = None
         if decoded_token.api_key_id:
@@ -272,6 +320,14 @@ def authenticate_credentials(
 
         device_model: Optional[OAuthDeviceInternalResponse] = None
         if decoded_token.device_id:
+            if server_config().auth_scheme in [
+                AuthScheme.NO_AUTH,
+                AuthScheme.EXTERNAL,
+            ]:
+                error = "Authentication error: device authorization is not supported."
+                logger.error(error)
+                raise CredentialsNotValid(error)
+
             # Access tokens that have been issued for a device are only valid
             # for that device, so we need to check if the device ID matches any
             # of the valid devices in the database.
@@ -285,18 +341,18 @@ def authenticate_credentials(
                     f"{decoded_token.device_id}"
                 )
                 logger.error(error)
-                raise AuthorizationException(error)
+                raise CredentialsNotValid(error)
 
             if (
-                device_model.user is None
-                or device_model.user.id != user_model.id
+                device_model.user_id is None
+                or device_model.user_id != user_model.id
             ):
                 error = (
                     f"Authentication error: device {decoded_token.device_id} "
                     f"does not belong to user {user_model.name}"
                 )
                 logger.error(error)
-                raise AuthorizationException(error)
+                raise CredentialsNotValid(error)
 
             if device_model.status != OAuthDeviceStatus.ACTIVE:
                 error = (
@@ -304,18 +360,19 @@ def authenticate_credentials(
                     f"is not active"
                 )
                 logger.error(error)
-                raise AuthorizationException(error)
+                raise CredentialsNotValid(error)
 
             if (
                 device_model.expires
-                and datetime.utcnow() >= device_model.expires
+                and utc_now(tz_aware=device_model.expires)
+                >= device_model.expires
             ):
                 error = (
                     f"Authentication error: device {decoded_token.device_id} "
                     "has expired"
                 )
                 logger.error(error)
-                raise AuthorizationException(error)
+                raise CredentialsNotValid(error)
 
             zen_store().update_internal_authorized_device(
                 device_id=device_model.id,
@@ -323,6 +380,120 @@ def authenticate_credentials(
                     update_last_login=True,
                 ),
             )
+
+        if decoded_token.schedule_id:
+            # If the token contains a schedule ID, we need to check if the
+            # schedule still exists in the database. We use a cached version
+            # of the schedule active status to avoid unnecessary database
+            # queries.
+
+            @cache_result(expiry=30)
+            def get_schedule_active(schedule_id: UUID) -> Optional[bool]:
+                """Get the active status of a schedule.
+
+                Args:
+                    schedule_id: The schedule ID.
+
+                Returns:
+                    The schedule active status or None if the schedule does not
+                    exist.
+                """
+                try:
+                    schedule = zen_store().get_schedule(
+                        schedule_id, hydrate=False
+                    )
+                except KeyError:
+                    return False
+
+                return schedule.active
+
+            schedule_active = get_schedule_active(decoded_token.schedule_id)
+            if schedule_active is None:
+                error = (
+                    f"Authentication error: error retrieving token schedule "
+                    f"{decoded_token.schedule_id}"
+                )
+                logger.error(error)
+                raise CredentialsNotValid(error)
+
+            if not schedule_active:
+                error = (
+                    f"Authentication error: schedule {decoded_token.schedule_id} "
+                    "is not active"
+                )
+                logger.error(error)
+                raise CredentialsNotValid(error)
+
+        if decoded_token.pipeline_run_id:
+            # If the token contains a pipeline run ID, we need to check if the
+            # pipeline run exists in the database and the pipeline run has
+            # not concluded. We use a cached version of the pipeline run status
+            # to avoid unnecessary database queries.
+
+            @cache_result(expiry=30)
+            def check_if_pipeline_run_in_progress(
+                pipeline_run_id: UUID,
+            ) -> Tuple[Optional[bool], Optional[datetime]]:
+                """Get the status of a pipeline run.
+
+                Args:
+                    pipeline_run_id: The pipeline run ID.
+
+                Returns:
+                    The pipeline run status and end time or None if the pipeline
+                    run does not exist.
+                """
+                try:
+                    return zen_store()._check_if_run_in_progress(
+                        pipeline_run_id
+                    )
+                except KeyError:
+                    return None, None
+
+            (
+                pipeline_run_in_progress,
+                pipeline_run_end_time,
+            ) = check_if_pipeline_run_in_progress(
+                decoded_token.pipeline_run_id
+            )
+
+            if pipeline_run_in_progress is None:
+                error = (
+                    f"Authentication error: error retrieving token. Pipeline run "
+                    f"{decoded_token.pipeline_run_id} does not exist."
+                )
+                logger.error(error)
+                raise CredentialsNotValid(error)
+
+            leeway = handle_int_env_var(
+                ENV_ZENML_WORKLOAD_TOKEN_EXPIRATION_LEEWAY,
+                DEFAULT_ZENML_SERVER_GENERIC_API_TOKEN_LIFETIME,
+            )
+            if not pipeline_run_in_progress:
+                if leeway < 0:
+                    # The token should never expire, we don't need to check
+                    # the end time.
+                    pass
+                elif (
+                    # We don't know the end time. This should never happen, but
+                    # just in case we always expire the token.
+                    pipeline_run_end_time is None
+                    # Calculate whether the token has expired.
+                    or utc_now(tz_aware=pipeline_run_end_time)
+                    > pipeline_run_end_time + timedelta(seconds=leeway)
+                ):
+                    error = (
+                        f"The pipeline run {decoded_token.pipeline_run_id} has "
+                        "finished and API tokens scoped to it are no longer "
+                        "valid. If you want to increase the expiration time "
+                        "of the token to allow steps to continue for longer "
+                        "after other steps have failed, you can do so by "
+                        "configuring the "
+                        f"`{ENV_ZENML_WORKLOAD_TOKEN_EXPIRATION_LEEWAY}` "
+                        "ZenML server environment variable."
+                    )
+                    logger.error(error)
+                    raise CredentialsNotValid(error)
 
         auth_context = AuthContext(
             user=user_model,
@@ -340,12 +511,12 @@ def authenticate_credentials(
         if server_config().auth_scheme != AuthScheme.NO_AUTH:
             error = "Authentication error: no credentials provided"
             logger.error(error)
-            raise AuthorizationException(error)
+            raise CredentialsNotValid(error)
 
     if not auth_context:
         error = "Authentication error: invalid credentials"
         logger.error(error)
-        raise AuthorizationException(error)
+        raise CredentialsNotValid(error)
 
     return auth_context
 
@@ -409,7 +580,10 @@ def authenticate_device(client_id: UUID, device_code: str) -> AuthContext:
             error_description=error,
         )
 
-    if device_model.expires and datetime.utcnow() >= device_model.expires:
+    if (
+        device_model.expires
+        and utc_now(tz_aware=device_model.expires) >= device_model.expires
+    ):
         error = (
             f"Authentication error: device for client ID {client_id} has "
             "expired"
@@ -487,12 +661,15 @@ def authenticate_device(client_id: UUID, device_code: str) -> AuthContext:
     return AuthContext(user=device_model.user, device=device_model)
 
 
-def authenticate_external_user(external_access_token: str) -> AuthContext:
+def authenticate_external_user(
+    external_access_token: str, request: Optional[Request] = None
+) -> AuthContext:
     """Implement external authentication.
 
     Args:
         external_access_token: The access token used to authenticate the user
             to the external authenticator.
+        request: The request object.
 
     Returns:
         The authentication context reflecting the authenticated user.
@@ -511,6 +688,7 @@ def authenticate_external_user(external_access_token: str) -> AuthContext:
     # Get the user information from the external authenticator
     user_info_url = config.external_user_info_url
     headers = {"Authorization": "Bearer " + external_access_token}
+    headers.update(get_zenml_headers())
     query_params = dict(server_id=str(config.get_external_server_id()))
 
     try:
@@ -522,8 +700,7 @@ def authenticate_external_user(external_access_token: str) -> AuthContext:
         )
     except Exception as e:
         logger.exception(
-            f"Error fetching user information from external authenticator: "
-            f"{e}"
+            f"Error fetching user information from external authenticator: {e}"
         )
         raise AuthorizationException(
             "Error fetching user information from external authenticator."
@@ -576,37 +753,135 @@ def authenticate_external_user(external_access_token: str) -> AuthContext:
 
     # Check if the external user already exists in the ZenML server database
     # If not, create a new user. If yes, update the existing user.
-    try:
-        user = store.get_external_user(user_id=external_user.id)
-
-        # Update the user information
-        user = store.update_user(
-            user_id=user.id,
-            user_update=UserUpdate(
-                name=external_user.email,
-                full_name=external_user.name or "",
-                email_opted_in=True,
-                active=True,
-                email=external_user.email,
-                is_admin=external_user.is_admin,
+    user: Optional[UserResponse] = None
+    if not external_user.is_service_account:
+        users = store.list_users(
+            UserFilter(
+                external_user_id=external_user.id,
             ),
         )
-    except KeyError:
-        logger.info(
-            f"External user with ID {external_user.id} not found in ZenML "
-            f"server database. Creating a new user."
-        )
-        user = store.create_user(
-            UserRequest(
-                name=external_user.email,
-                full_name=external_user.name or "",
+        if users.items:
+            user = users.items[0]
+            logger.info(
+                f"Found user with ID {user.id} matching the external user ID "
+                f"{external_user.id}."
+            )
+        else:
+            logger.info(
+                f"User with external user ID {external_user.id} not found."
+            )
+            # Try finding a user or service account with the same username.
+            # This is to handle migration of accounts from ZenML OSS to ZenML
+            # Pro: if the server contains an internal account with the same
+            # username as the ZenML Pro account, we adopt the existing
+            # user/service account.
+            users = store.list_users(
+                UserFilter(
+                    name=external_user.username,
+                )
+            )
+            if users.items:
+                user = users.items[0]
+                logger.info(
+                    f"Adopting existing user with username {user.name} and "
+                    f"internal ID {user.id} as external user with ID "
+                    f"{external_user.id}."
+                )
+    else:
+        service_accounts = store.list_service_accounts(
+            ServiceAccountFilter(
                 external_user_id=external_user.id,
-                email_opted_in=True,
-                active=True,
-                email=external_user.email,
-                is_admin=external_user.is_admin,
             )
         )
+        if service_accounts.items:
+            service_account = service_accounts.items[0]
+            logger.info(
+                f"Found service account with ID {service_account.id} matching "
+                f"the external user ID {external_user.id}."
+            )
+            user = service_account.to_user_model()
+        else:
+            logger.info(
+                f"Service account with external user ID {external_user.id} "
+                f"not found."
+            )
+            # Try finding a service account with the same username.
+            # This is to handle migration of accounts from ZenML OSS to ZenML
+            # Pro: if the server contains an internal service account with the
+            # same username as the ZenML Pro service account, we adopt the
+            # existing service account.
+            service_accounts = store.list_service_accounts(
+                ServiceAccountFilter(
+                    name=external_user.username,
+                )
+            )
+            if service_accounts.items:
+                service_account = service_accounts.items[0]
+                logger.info(
+                    f"Adopting existing service account with username "
+                    f"{service_account.name} and internal ID "
+                    f"{service_account.id} as external service account with "
+                    f"ID {external_user.id}."
+                )
+                user = service_account.to_user_model()
+
+    if user is not None:
+        if not user.is_service_account:
+            # Update the user information
+            user = store.update_user(
+                user_id=user.id,
+                user_update=UserUpdate(
+                    name=external_user.username,
+                    full_name=external_user.name or "",
+                    email_opted_in=True,
+                    active=True,
+                    email=external_user.email,
+                    is_admin=external_user.is_admin,
+                    avatar_url=external_user.avatar_url,
+                    external_user_id=external_user.id,
+                ),
+            )
+        else:
+            # Update the service account information
+            user = store.update_service_account(
+                service_account_name_or_id=user.id,
+                service_account_update=ServiceAccountInternalUpdate(
+                    name=external_user.username,
+                    full_name=external_user.name or "",
+                    external_user_id=external_user.id,
+                    active=True,
+                    avatar_url=external_user.avatar_url,
+                ),
+            ).to_user_model()
+    else:
+        logger.info(
+            f"External account with ID {external_user.id} or name "
+            f"{external_user.username} not found in ZenML server database. "
+            f"Creating a new account."
+        )
+        if external_user.is_service_account:
+            user = store.create_service_account(
+                service_account=ServiceAccountInternalRequest(
+                    name=external_user.username,
+                    full_name=external_user.name or "",
+                    external_user_id=external_user.id,
+                    active=True,
+                    avatar_url=external_user.avatar_url,
+                ),
+            ).to_user_model()
+        else:
+            user = store.create_user(
+                UserRequest(
+                    name=external_user.username,
+                    full_name=external_user.name or "",
+                    external_user_id=external_user.id,
+                    email_opted_in=True,
+                    active=True,
+                    email=external_user.email,
+                    is_admin=external_user.is_admin,
+                    avatar_url=external_user.avatar_url,
+                )
+            )
 
         with AnalyticsContext() as context:
             context.user_id = user.id
@@ -617,6 +892,20 @@ def authenticate_external_user(external_access_token: str) -> AuthContext:
                 }
             )
             context.alias(user_id=external_user.id, previous_id=user.id)
+
+    if request:
+        # This is the best spot to update the onboarding state to mark the
+        # "zenml login" step as completed for ZenML Pro servers, because the
+        # user has just successfully logged in. However, we need to differentiate
+        # between web clients (i.e. the dashboard) and CLI clients (i.e. the
+        # zenml CLI).
+        user_agent = request.headers.get("User-Agent", "").lower()
+        if "zenml/" in user_agent:
+            store.update_onboarding_state(
+                completed_steps={
+                    OnboardingStep.DEVICE_VERIFIED,
+                }
+            )
 
     return AuthContext(user=user)
 
@@ -634,14 +923,25 @@ def authenticate_api_key(
         The authentication context reflecting the authenticated service account.
 
     Raises:
-        AuthorizationException: If the service account could not be authorized.
+        CredentialsNotValid: If the service account could not be authorized.
     """
+    if api_key.startswith(ZENML_PRO_API_KEY_PREFIX):
+        # This is a ZenML Pro API key. We need to authenticate the user using
+        # the external user authentication flow and pass the API key as the
+        # external access token.
+        try:
+            return authenticate_external_user(external_access_token=api_key)
+        except AuthorizationException as e:
+            error = f"Authentication error: {e}."
+            logger.exception(error)
+            raise CredentialsNotValid(error)
+
     try:
         decoded_api_key = APIKey.decode_api_key(api_key)
     except ValueError:
         error = "Authentication error: error decoding API key"
         logger.exception(error)
-        raise AuthorizationException(error)
+        raise CredentialsNotValid(error)
 
     internal_api_key = _fetch_and_verify_api_key(
         api_key_id=decoded_api_key.id, key_to_verify=decoded_api_key.key
@@ -655,6 +955,218 @@ def authenticate_api_key(
     return AuthContext(user=user_model, api_key=internal_api_key)
 
 
+def generate_access_token(
+    user_id: UUID,
+    response: Optional[Response] = None,
+    request: Optional[Request] = None,
+    device: Optional[OAuthDeviceInternalResponse] = None,
+    api_key: Optional[APIKeyInternalResponse] = None,
+    expires_in: Optional[int] = None,
+    schedule_id: Optional[UUID] = None,
+    pipeline_run_id: Optional[UUID] = None,
+    deployment_id: Optional[UUID] = None,
+) -> OAuthTokenResponse:
+    """Generates an access token for the given user.
+
+    Args:
+        user_id: The ID of the user.
+        response: The FastAPI response object. If passed, the access
+            token will also be set as an HTTP only cookie in the response.
+        request: The FastAPI request object. Used to determine the request
+            origin and to decide whether to use cross-site security measures for
+            the access token cookie.
+        device: The device used for authentication.
+        api_key: The service account API key used for authentication.
+        expires_in: The number of seconds until the token expires. If not set,
+            the default value is determined automatically based on the server
+            configuration and type of token. If set to 0, the token will not
+            expire.
+        schedule_id: The ID of the schedule to scope the token to.
+        pipeline_run_id: The ID of the pipeline run to scope the token to.
+        deployment_id: The ID of the deployment to scope the token to.
+
+    Returns:
+        An authentication response with an access token.
+    """
+    config = server_config()
+
+    # If the expiration time is not supplied, the JWT tokens are set to expire
+    # according to the values configured in the server config. Device tokens are
+    # handled separately from regular user tokens.
+    expires: Optional[datetime] = None
+    if expires_in == 0:
+        expires_in = None
+    elif expires_in is not None:
+        expires = utc_now() + timedelta(seconds=expires_in)
+    elif device:
+        # If a device was used for authentication, the token will expire
+        # at the same time as the device.
+        expires = device.expires
+        if expires:
+            expires_in = max(
+                int(expires.timestamp() - utc_now().timestamp()),
+                0,
+            )
+    elif config.jwt_token_expire_minutes:
+        expires = utc_now() + timedelta(
+            minutes=config.jwt_token_expire_minutes
+        )
+        expires_in = config.jwt_token_expire_minutes * 60
+
+    # Figure out if this is a same-site request or a cross-site request
+    same_site = True
+    if response and request:
+        # Extract the origin domain from the request; use the referer as a
+        # fallback
+        origin_domain: Optional[str] = None
+        origin = request.headers.get("origin", request.headers.get("referer"))
+        if origin:
+            # If the request origin is known, we use it to determine whether
+            # this is a cross-site request and enable additional security
+            # measures.
+            origin_domain = urlparse(origin).netloc
+
+        server_domain: Optional[str] = config.auth_cookie_domain
+        # If the server's cookie domain is not explicitly set in the
+        # server's configuration, we use other sources to determine it:
+        #
+        # 1. the server's root URL, if set in the server's configuration
+        # 2. the X-Forwarded-Host header, if set by the reverse proxy
+        # 3. the request URL, if all else fails
+        if not server_domain and config.server_url:
+            server_domain = urlparse(config.server_url).netloc
+        if not server_domain:
+            server_domain = request.headers.get(
+                "x-forwarded-host", request.url.netloc
+            )
+
+        # Same-site requests can come from the same domain or from a
+        # subdomain of the domain used to issue cookies.
+        if origin_domain and server_domain:
+            same_site = is_same_or_subdomain(origin_domain, server_domain)
+
+    csrf_token: Optional[str] = None
+    session_id: Optional[UUID] = None
+    if not same_site:
+        # If responding to a cross-site login request, we need to generate and
+        # sign a CSRF token associated with the authentication session.
+        session_id = uuid4()
+        csrf_token = CSRFToken(session_id=session_id).encode()
+
+    access_token = JWTToken(
+        user_id=user_id,
+        device_id=device.id if device else None,
+        api_key_id=api_key.id if api_key else None,
+        schedule_id=schedule_id,
+        pipeline_run_id=pipeline_run_id,
+        deployment_id=deployment_id,
+        # Set the session ID if this is a cross-site request
+        session_id=session_id,
+    ).encode(expires=expires)
+
+    if response:
+        # Also set the access token as an HTTP only cookie in the response
+        response.set_cookie(
+            key=config.get_auth_cookie_name(),
+            value=access_token,
+            httponly=True,
+            secure=not same_site,
+            samesite="lax" if same_site else "none",
+            max_age=config.jwt_token_expire_minutes * 60
+            if config.jwt_token_expire_minutes
+            else None,
+            domain=config.auth_cookie_domain,
+        )
+
+    return OAuthTokenResponse(
+        access_token=access_token,
+        expires_in=expires_in,
+        token_type="bearer",
+        csrf_token=csrf_token,
+    )
+
+
+def generate_download_token(
+    download_type: DownloadType,
+    resource_id: UUID,
+    extra_claims: Optional[Dict[str, Any]] = None,
+    expires_in_seconds: int = 30,
+) -> str:
+    """Generate a JWT token for downloading content.
+
+    Args:
+        download_type: The type of content being downloaded.
+        resource_id: The ID of the resource to download.
+        extra_claims: Optional extra claims to include in the token.
+        expires_in_seconds: Token expiration time in seconds.
+
+    Returns:
+        The JWT token for the download.
+    """
+    import jwt
+
+    config = server_config()
+
+    payload = {
+        "exp": utc_now() + timedelta(seconds=expires_in_seconds),
+        "download_type": download_type.value,
+        "resource_id": str(resource_id),
+    }
+
+    if extra_claims:
+        payload.update(extra_claims)
+
+    return jwt.encode(
+        payload,
+        key=config.jwt_secret_key,
+        algorithm=config.jwt_token_algorithm,
+    )
+
+
+def verify_download_token(
+    token: str,
+    download_type: DownloadType,
+    resource_id: UUID,
+    extra_claims: Optional[Dict[str, Any]] = None,
+) -> None:
+    """Verify a JWT token for downloading content.
+
+    Args:
+        token: The JWT token to verify.
+        download_type: The expected download type.
+        resource_id: The expected resource ID.
+        extra_claims: Optional extra claims to verify in the token.
+
+    Raises:
+        CredentialsNotValid: If the token is invalid or doesn't match expected values.
+    """
+    import jwt
+
+    config = server_config()
+    try:
+        claims = cast(
+            Dict[str, Any],
+            jwt.decode(
+                token,
+                config.jwt_secret_key,
+                algorithms=[config.jwt_token_algorithm],
+            ),
+        )
+    except jwt.PyJWTError as e:
+        raise CredentialsNotValid(f"Invalid JWT token: {e}") from e
+
+    if claims.get("download_type") != download_type.value:
+        raise CredentialsNotValid("Invalid download type")
+
+    if claims.get("resource_id") != str(resource_id):
+        raise CredentialsNotValid("Invalid resource ID")
+
+    if extra_claims:
+        for key, expected_value in extra_claims.items():
+            if claims.get(key) != expected_value:
+                raise CredentialsNotValid(f"Invalid {key}")
+
+
 def http_authentication(
     credentials: HTTPBasicCredentials = Depends(HTTPBasic()),
 ) -> AuthContext:
@@ -666,19 +1178,19 @@ def http_authentication(
     Returns:
         The authentication context reflecting the authenticated user.
 
-    Raises:
-        HTTPException: If the credentials are invalid.
+    # noqa: DAR401
     """
     try:
         return authenticate_credentials(
             user_name_or_id=credentials.username, password=credentials.password
         )
-    except AuthorizationException as e:
-        raise HTTPException(
-            status_code=status.HTTP_401_UNAUTHORIZED,
-            detail=str(e),
-            headers={"WWW-Authenticate": "Basic"},
-        )
+    except CredentialsNotValid as e:
+        # We want to be very explicit here and return a CredentialsNotValid
+        # exception encoded as a 401 Unauthorized error encoded, so that the
+        # client can distinguish between a 401 error due to invalid credentials
+        # and other 401 errors and handle them accordingly by throwing away the
+        # current access token and re-authenticating.
+        raise http_exception_from_error(e)
 
 
 class CookieOAuth2TokenBearer(OAuth2PasswordBearer):
@@ -707,6 +1219,7 @@ class CookieOAuth2TokenBearer(OAuth2PasswordBearer):
 
 
 def oauth2_authentication(
+    request: Request,
     token: str = Depends(
         CookieOAuth2TokenBearer(
             tokenUrl=server_config().root_url_path + API + VERSION_1 + LOGIN,
@@ -717,21 +1230,25 @@ def oauth2_authentication(
 
     Args:
         token: The JWT bearer token to be authenticated.
+        request: The FastAPI request object.
 
     Returns:
         The authentication context reflecting the authenticated user.
 
-    Raises:
-        HTTPException: If the JWT token could not be authorized.
+    # noqa: DAR401
     """
+    csrf_token = request.headers.get("X-CSRF-Token")
     try:
-        auth_context = authenticate_credentials(access_token=token)
-    except AuthorizationException as e:
-        raise HTTPException(
-            status_code=status.HTTP_401_UNAUTHORIZED,
-            detail=str(e),
-            headers={"WWW-Authenticate": "Bearer"},
+        auth_context = authenticate_credentials(
+            access_token=token, csrf_token=csrf_token
         )
+    except CredentialsNotValid as e:
+        # We want to be very explicit here and return a CredentialsNotValid
+        # exception encoded as a 401 Unauthorized error encoded, so that the
+        # client can distinguish between a 401 error due to invalid credentials
+        # and other 401 errors and handle them accordingly by throwing away the
+        # current access token and re-authenticating.
+        raise http_exception_from_error(e)
 
     return auth_context
 
@@ -767,4 +1284,50 @@ def authentication_provider() -> Callable[..., AuthContext]:
         raise ValueError(f"Unknown authentication scheme: {auth_scheme}")
 
 
-authorize = authentication_provider()
+def get_authorization_provider() -> Callable[..., Awaitable[AuthContext]]:
+    """Fetches the async authorization provider.
+
+    Returns:
+        The async authorization provider.
+    """
+    provider = authentication_provider()
+    # Create a custom thread pool limiter with a limit of 1 thread for all
+    # auth calls
+    thread_limiter = CapacityLimiter(server_config().auth_thread_pool_size)
+
+    @wraps(provider)
+    async def async_authorize_fn(*args: Any, **kwargs: Any) -> AuthContext:
+        from zenml.zen_server.utils import get_system_metrics_log_str
+
+        request_context = request_manager().current_request
+
+        @wraps(provider)
+        def sync_authorize_fn(*args: Any, **kwargs: Any) -> AuthContext:
+            assert request_context is not None
+
+            logger.debug(
+                f"[{request_context.log_request_id}] API STATS - "
+                f"{request_context.log_request} "
+                f"AUTHORIZING "
+                f"{get_system_metrics_log_str(request_context.request)}"
+            )
+
+            try:
+                auth_context = provider(*args, **kwargs)
+                request_context.auth_context = auth_context
+                return auth_context
+            finally:
+                logger.debug(
+                    f"[{request_context.log_request_id}] API STATS - "
+                    f"{request_context.log_request} "
+                    f"AUTHORIZED "
+                    f"{get_system_metrics_log_str(request_context.request)}"
+                )
+
+        func = functools.partial(sync_authorize_fn, *args, **kwargs)
+        return await anyio.to_thread.run_sync(func, limiter=thread_limiter)
+
+    return async_authorize_fn
+
+
+authorize = get_authorization_provider()

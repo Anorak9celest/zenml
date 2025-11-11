@@ -1,8 +1,9 @@
 ---
+icon: earth-africa
 description: How to control ZenML behavior with environmental variables.
 ---
 
-# 🌎 Environment Variables
+# Environment Variables
 
 There are a few pre-defined environmental variables that can be used to control the behavior of ZenML. See the list below with default values and options:
 
@@ -14,14 +15,22 @@ export ZENML_LOGGING_VERBOSITY=INFO
 
 Choose from `INFO`, `WARN`, `ERROR`, `CRITICAL`, `DEBUG`.
 
+## Logging format
+
+```bash
+export ZENML_LOGGING_FORMAT='%(asctime)s %(message)s'
+```
+
+See [this page](https://docs.zenml.io/concepts/steps_and_pipelines/logging) for more information.
+
 ## Disable step logs
 
-Usually, ZenML [stores step logs in the artifact store](../how-to/control-logging/enable-or-disable-logs-storing.md), but this can sometimes cause performance bottlenecks, especially if the code utilizes progress bars.
+Usually, ZenML [stores step logs in the artifact store](https://docs.zenml.io/concepts/steps_and_pipelines/logging), but this can sometimes cause performance bottlenecks, especially if the code utilizes progress bars.
 
 If you want to configure whether logged output from steps is stored or not, set the `ZENML_DISABLE_STEP_LOGS_STORAGE` environment variable to `true`. Note that this will mean that logs from your steps will no longer be stored and thus won't be visible on the dashboard anymore.
 
 ```bash
-export ZENML_DISABLE_STEP_LOGS_STORAGE=false
+export ZENML_DISABLE_STEP_LOGS_STORAGE=true
 ```
 
 ## ZenML repository path
@@ -72,15 +81,15 @@ Set to `false` to disable the [`rich` traceback](https://rich.readthedocs.io/en/
 export ZENML_ENABLE_RICH_TRACEBACK=true
 ```
 
-## Disable colourful logging
+## Disable colorful logging
 
-If you wish to disable colourful logging, set the following environment variable:
+If you wish to disable colorful logging, set the following environment variable:
 
 ```bash
 ZENML_LOGGING_COLORS_DISABLED=true
 ```
 
-Note that setting this on the [client environment](../how-to/configure-python-environments/README.md#client-environment-or-the-runner-environment) (e.g. your local machine which runs the pipeline) will automatically disable colorful logging on remote orchestrators. If you wish to disable it locally, but turn on for remote orchestrators, you can set the `ZENML_LOGGING_COLORS_DISABLED` environment variable in your orchestrator's environment as follows:
+Note that setting this on the client environment (e.g. your local machine which runs the pipeline) will automatically disable colorful logging on remote orchestrators. If you wish to disable it locally, but turn on for remote orchestrators, you can set the `ZENML_LOGGING_COLORS_DISABLED` environment variable in your orchestrator's environment as follows:
 
 ```python
 docker_settings = DockerSettings(environment={"ZENML_LOGGING_COLORS_DISABLED": "false"})
@@ -96,6 +105,22 @@ my_pipeline = my_pipeline.with_options(
 )
 ```
 
+## Disable stack validation
+
+If you wish to disable stack validation, set the following environment variable:
+
+```bash
+ZENML_SKIP_STACK_VALIDATION=true
+```
+
+## Ignore untracked code repository files
+
+When using [code repositories](https://docs.zenml.io/concepts/code-repositories),
+ZenML will by default require the local checkout to have no uncommitted or untracked files
+in order to use the code repository to track the commit and download files. If you want to ignore untracked files, you can set
+the `ZENML_CODE_REPOSITORY_IGNORE_UNTRACKED_FILES` environment variable to `True`. When doing this, you're responsible that
+the files committed to the repository includes everything necessary to run your pipeline.
+
 ## ZenML global config path
 
 To set the path to the global config file, used by ZenML to manage and store the state for a number of settings, set the environment variable as follows:
@@ -110,11 +135,12 @@ For more information on server configuration, see the [ZenML Server documentatio
 
 ## Client configuration
 
-Setting the `ZENML_STORE_URL` and `ZENML_STORE_API_KEY` environment variables automatically connects your ZenML Client to the specified server. This method is particularly useful when you are using the ZenML client in an automated CI/CD workload environment like GitHub Actions or GitLab CI or in a containerized environment like Docker or Kubernetes:
+Setting the `ZENML_STORE_URL`, `ZENML_STORE_API_KEY` and `ZENML_ACTIVE_PROJECT_ID` environment variables automatically connects your ZenML Client to the specified server for a specific project. This method is particularly useful when you are using the ZenML client in an automated CI/CD workload environment like GitHub Actions or GitLab CI or in a containerized environment like Docker or Kubernetes:
 
 ```bash
 export ZENML_STORE_URL=https://...
 export ZENML_STORE_API_KEY=<API_KEY>
+export ZENML_ACTIVE_PROJECT_ID=<PROJECT_ID>
 ```
 
 <figure><img src="https://static.scarf.sh/a.png?x-pxid=f0b4f458-0a54-4fcd-aa95-d5ee424815bc" alt="ZenML Scarf"><figcaption></figcaption></figure>

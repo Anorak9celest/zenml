@@ -37,7 +37,7 @@ from zenml.zen_server.rbac.endpoint_utils import (
 from zenml.zen_server.rbac.models import Action, ResourceType
 from zenml.zen_server.rbac.utils import verify_permission
 from zenml.zen_server.utils import (
-    handle_exceptions,
+    async_fastapi_endpoint_wrapper,
     make_dependable,
     zen_store,
 )
@@ -51,10 +51,9 @@ router = APIRouter(
 
 @router.get(
     "",
-    response_model=Page[FlavorResponse],
     responses={401: error_response, 404: error_response, 422: error_response},
 )
-@handle_exceptions
+@async_fastapi_endpoint_wrapper
 def list_flavors(
     flavor_filter_model: FlavorFilter = Depends(make_dependable(FlavorFilter)),
     hydrate: bool = False,
@@ -81,10 +80,9 @@ def list_flavors(
 
 @router.get(
     "/{flavor_id}",
-    response_model=FlavorResponse,
     responses={401: error_response, 404: error_response, 422: error_response},
 )
-@handle_exceptions
+@async_fastapi_endpoint_wrapper
 def get_flavor(
     flavor_id: UUID,
     hydrate: bool = True,
@@ -107,10 +105,9 @@ def get_flavor(
 
 @router.post(
     "",
-    response_model=FlavorResponse,
     responses={401: error_response, 409: error_response, 422: error_response},
 )
-@handle_exceptions
+@async_fastapi_endpoint_wrapper
 def create_flavor(
     flavor: FlavorRequest,
     _: AuthContext = Security(authorize),
@@ -125,17 +122,15 @@ def create_flavor(
     """
     return verify_permissions_and_create_entity(
         request_model=flavor,
-        resource_type=ResourceType.FLAVOR,
         create_method=zen_store().create_flavor,
     )
 
 
 @router.put(
     "/{flavor_id}",
-    response_model=FlavorResponse,
     responses={401: error_response, 409: error_response, 422: error_response},
 )
-@handle_exceptions
+@async_fastapi_endpoint_wrapper
 def update_flavor(
     flavor_id: UUID,
     flavor_update: FlavorUpdate,
@@ -164,7 +159,7 @@ def update_flavor(
     "/{flavor_id}",
     responses={401: error_response, 404: error_response, 422: error_response},
 )
-@handle_exceptions
+@async_fastapi_endpoint_wrapper
 def delete_flavor(
     flavor_id: UUID,
     _: AuthContext = Security(authorize),
@@ -185,7 +180,7 @@ def delete_flavor(
     "/sync",
     responses={401: error_response, 404: error_response, 422: error_response},
 )
-@handle_exceptions
+@async_fastapi_endpoint_wrapper
 def sync_flavors(
     _: AuthContext = Security(authorize),
 ) -> None:

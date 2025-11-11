@@ -1,6 +1,6 @@
 # Apache Software License 2.0
 # 
-# Copyright (c) ZenML GmbH 2024. All rights reserved.
+# Copyright (c) ZenML GmbH 2025. All rights reserved.
 # 
 # Licensed under the Apache License, Version 2.0 (the "License");
 # you may not use this file except in compliance with the License.
@@ -17,6 +17,8 @@
 
 settings:
   docker:
+    python_package_installer: uv
+    install_stack_requirements: False
     required_integrations:
       - aws
       - skypilot_aws
@@ -26,7 +28,6 @@ settings:
       - mlflow
       - discord
     requirements:
-      - accelerate
       - zenml[server]
 
 extra:

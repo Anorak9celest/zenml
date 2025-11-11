@@ -31,12 +31,10 @@ from uuid import UUID
 
 from pydantic import (
     BaseModel,
-    SecretStr,
     ValidationError,
 )
 from pydantic._internal._model_construction import ModelMetaclass
 
-from zenml.client import Client
 from zenml.constants import (
     ENV_ZENML_ENABLE_IMPLICIT_AUTH_METHODS,
     SERVICE_CONNECTOR_SKEW_TOLERANCE_SECONDS,
@@ -50,43 +48,18 @@ from zenml.models import (
     ServiceConnectorResponse,
     ServiceConnectorResponseBody,
     ServiceConnectorResponseMetadata,
+    ServiceConnectorResponseResources,
     ServiceConnectorTypedResourcesModel,
     ServiceConnectorTypeModel,
     UserResponse,
-    WorkspaceResponse,
 )
+from zenml.utils.time_utils import utc_now
 
 logger = get_logger(__name__)
 
 
 class AuthenticationConfig(BaseModel):
     """Base authentication configuration."""
-
-    @property
-    def secret_values(self) -> Dict[str, SecretStr]:
-        """Get the secret values as a dictionary.
-
-        Returns:
-            A dictionary of all secret values in the configuration.
-        """
-        return {
-            k: v
-            for k, v in self.model_dump(exclude_none=True).items()
-            if isinstance(v, SecretStr)
-        }
-
-    @property
-    def non_secret_values(self) -> Dict[str, str]:
-        """Get the non-secret values as a dictionary.
-
-        Returns:
-            A dictionary of all non-secret values in the configuration.
-        """
-        return {
-            k: v
-            for k, v in self.model_dump(exclude_none=True).items()
-            if not isinstance(v, SecretStr)
-        }
 
     @property
     def all_values(self) -> Dict[str, Any]:
@@ -642,34 +615,7 @@ class ServiceConnector(BaseModel, metaclass=ServiceConnectorMeta):
             ) from e
 
         # Unpack the authentication configuration
-        config = model.configuration.copy()
-        if isinstance(model, ServiceConnectorResponse) and model.secret_id:
-            try:
-                secret = Client().get_secret(model.secret_id)
-            except KeyError as e:
-                raise ValueError(
-                    f"could not fetch secret with ID '{model.secret_id}' "
-                    f"referenced in the connector configuration: {e}"
-                ) from e
-
-            if secret.has_missing_values:
-                raise ValueError(
-                    f"secret with ID '{model.secret_id}' referenced in the "
-                    "connector configuration has missing values. This can "
-                    "happen for example if your user lacks the permissions "
-                    "required to access the secret."
-                )
-
-            config.update(secret.secret_values)
-
-        if model.secrets:
-            config.update(
-                {
-                    k: v.get_secret_value()
-                    for k, v in model.secrets.items()
-                    if v
-                }
-            )
+        config = model.configuration.plain
 
         if method_spec.config_class is None:
             raise ValueError(
@@ -682,8 +628,15 @@ class ServiceConnector(BaseModel, metaclass=ServiceConnectorMeta):
         try:
             auth_config = method_spec.config_class(**config)
         except ValidationError as e:
+            hint = ""
+            if isinstance(model, ServiceConnectorResponse):
+                hint = (
+                    "If the error is related to missing secret attributes, "
+                    "you might be missing permissions to access the service "
+                    "connector's secret values."
+                )
             raise ValueError(
-                f"connector configuration is not valid: {e}"
+                f"connector configuration is not valid: {e}\n{hint}"
             ) from e
 
         assert isinstance(auth_config, AuthenticationConfig)
@@ -705,8 +658,6 @@ class ServiceConnector(BaseModel, metaclass=ServiceConnectorMeta):
 
     def to_model(
         self,
-        user: UUID,
-        workspace: UUID,
         name: Optional[str] = None,
         description: str = "",
         labels: Optional[Dict[str, str]] = None,
@@ -715,8 +666,6 @@ class ServiceConnector(BaseModel, metaclass=ServiceConnectorMeta):
 
         Args:
             name: The name of the connector.
-            user: The ID of the user that created the connector.
-            workspace: The ID of the workspace that the connector belongs to.
             description: The description of the connector.
             labels: The labels of the connector.
 
@@ -739,8 +688,6 @@ class ServiceConnector(BaseModel, metaclass=ServiceConnectorMeta):
             connector_type=spec.connector_type,
             name=name,
             description=description,
-            user=user,
-            workspace=workspace,
             auth_method=self.auth_method,
             expires_at=self.expires_at,
             expires_skew_tolerance=self.expires_skew_tolerance,
@@ -753,15 +700,13 @@ class ServiceConnector(BaseModel, metaclass=ServiceConnectorMeta):
             connector_type=spec,
             resource_types=self.resource_type,
             resource_id=self.resource_id,
-            configuration=self.config.non_secret_values,
-            secrets=self.config.secret_values,  # type: ignore[arg-type]
+            configuration=self.config.all_values,
         )
 
         return model
 
     def to_response_model(
         self,
-        workspace: WorkspaceResponse,
         user: Optional[UserResponse] = None,
         name: Optional[str] = None,
         id: Optional[UUID] = None,
@@ -771,7 +716,6 @@ class ServiceConnector(BaseModel, metaclass=ServiceConnectorMeta):
         """Convert the connector instance to a service connector response model.
 
         Args:
-            workspace: The workspace that the connector belongs to.
             user: The user that created the connector.
             name: The name of the connector.
             id: The ID of the connector.
@@ -794,13 +738,14 @@ class ServiceConnector(BaseModel, metaclass=ServiceConnectorMeta):
                 "connector configuration is not valid: name and ID must be set"
             )
 
+        now = utc_now()
         model = ServiceConnectorResponse(
             id=id,
             name=name,
             body=ServiceConnectorResponseBody(
-                user=user,
-                created=datetime.utcnow(),
-                updated=datetime.utcnow(),
+                user_id=user.id if user else None,
+                created=now,
+                updated=now,
                 description=description,
                 connector_type=self.get_type(),
                 auth_method=self.auth_method,
@@ -808,9 +753,11 @@ class ServiceConnector(BaseModel, metaclass=ServiceConnectorMeta):
                 expires_skew_tolerance=self.expires_skew_tolerance,
             ),
             metadata=ServiceConnectorResponseMetadata(
-                workspace=workspace,
                 expiration_seconds=self.expiration_seconds,
                 labels=labels or {},
+            ),
+            resources=ServiceConnectorResponseResources(
+                user=user,
             ),
         )
 
@@ -819,8 +766,7 @@ class ServiceConnector(BaseModel, metaclass=ServiceConnectorMeta):
             connector_type=spec,
             resource_types=self.resource_type,
             resource_id=self.resource_id,
-            configuration=self.config.non_secret_values,
-            secrets=self.config.secret_values,  # type: ignore[arg-type]
+            configuration=self.config.all_values,
         )
 
         return model
@@ -845,14 +791,15 @@ class ServiceConnector(BaseModel, metaclass=ServiceConnectorMeta):
             if self.expires_skew_tolerance is not None
             else SERVICE_CONNECTOR_SKEW_TOLERANCE_SECONDS
         )
-        delta = expires_at - datetime.now(timezone.utc)
+        now = utc_now(tz_aware=expires_at)
+        delta = expires_at - now
         result = delta < timedelta(seconds=0)
 
         logger.debug(
             f"Checking if connector {self.name} has expired.\n"
             f"Expires at: {self.expires_at}\n"
             f"Expires at (+skew): {expires_at}\n"
-            f"Current UTC time: {datetime.now(timezone.utc)}\n"
+            f"Current UTC time: {now}\n"
             f"Delta: {delta}\n"
             f"Result: {result}\n"
         )

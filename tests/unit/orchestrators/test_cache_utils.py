@@ -12,25 +12,31 @@
 #  or implied. See the License for the specific language governing
 #  permissions and limitations under the License.
 
+import sys
+from typing import Tuple
 from unittest import mock
 from unittest.mock import ANY
 from uuid import uuid4
 
 import pytest
+from typing_extensions import Annotated
 
 from zenml.config.compiler import Compiler
+from zenml.config.pipeline_configurations import PipelineConfiguration
 from zenml.config.source import Source
 from zenml.config.step_configurations import Step
 from zenml.enums import ExecutionStatus, SorterOps
-from zenml.models import Page
-from zenml.new.pipelines.pipeline import Pipeline
+from zenml.models import Page, PipelineRequest
 from zenml.orchestrators import cache_utils
-from zenml.steps import Output, step
+from zenml.pipelines.pipeline_definition import Pipeline
+from zenml.steps import step
 from zenml.steps.base_step import BaseStep
 from zenml.steps.step_invocation import StepInvocation
 
 
 def _compile_step(step: BaseStep) -> Step:
+    from zenml.client import Client
+
     pipeline = Pipeline(name="test_pipeline", entrypoint=lambda: None)
     invocation = StepInvocation(
         id="",
@@ -48,28 +54,29 @@ def _compile_step(step: BaseStep) -> Step:
     compiler = Compiler()
     return compiler._compile_step_invocation(
         invocation=invocation,
-        pipeline_settings={},
-        pipeline_extra={},
-        stack=None,
+        stack=Client().active_stack,
         step_config=None,
-        pipeline_failure_hook_source=None,
-        pipeline_success_hook_source=None,
+        pipeline_configuration=PipelineConfiguration(name=""),
     )
 
 
 @step
-def _cache_test_step() -> Output(output_1=str, output_2=int):
+def _cache_test_step() -> Tuple[
+    Annotated[str, "output_1"], Annotated[str, "output_2"]
+]:
     return "Hello World", 42
 
 
 @pytest.fixture
-def generate_cache_key_kwargs(local_artifact_store):
+def generate_cache_key_kwargs(
+    local_artifact_store, sample_artifact_version_model
+):
     """Returns a dictionary of inputs for the cache key generation."""
     return {
-        "step": _compile_step(_cache_test_step()),
-        "input_artifact_ids": {"input_1": uuid4()},
+        "step": _compile_step(_cache_test_step),
+        "input_artifacts": {"input_1": sample_artifact_version_model},
         "artifact_store": local_artifact_store,
-        "workspace_id": uuid4(),
+        "project_id": uuid4(),
     }
 
 
@@ -80,10 +87,10 @@ def test_generate_cache_key_is_deterministic(generate_cache_key_kwargs):
     assert key_1 == key_2
 
 
-def test_generate_cache_key_considers_workspace_id(generate_cache_key_kwargs):
-    """Check that the cache key changes if the workspace ID changes."""
+def test_generate_cache_key_considers_project_id(generate_cache_key_kwargs):
+    """Check that the cache key changes if the project ID changes."""
     key_1 = cache_utils.generate_cache_key(**generate_cache_key_kwargs)
-    generate_cache_key_kwargs["workspace_id"] = uuid4()
+    generate_cache_key_kwargs["project_id"] = uuid4()
     key_2 = cache_utils.generate_cache_key(**generate_cache_key_kwargs)
     assert key_1 != key_2
 
@@ -135,14 +142,92 @@ def test_generate_cache_key_considers_step_parameters(
     assert key_1 != key_2
 
 
-def test_generate_cache_key_considers_input_artifacts(
+def test_generate_cache_key_considers_input_artifact_ids(
     generate_cache_key_kwargs,
 ):
     """Check that the cache key changes if the input artifacts change."""
     key_1 = cache_utils.generate_cache_key(**generate_cache_key_kwargs)
-    generate_cache_key_kwargs["input_artifact_ids"] = {"input_1": uuid4()}
+    generate_cache_key_kwargs["input_artifacts"]["input_1"].id = uuid4()
     key_2 = cache_utils.generate_cache_key(**generate_cache_key_kwargs)
     assert key_1 != key_2
+
+
+def test_generate_cache_key_considers_input_artifact_content_hash(
+    generate_cache_key_kwargs,
+):
+    """Check that the cache key changes if the input artifacts change."""
+    generate_cache_key_kwargs["input_artifacts"][
+        "input_1"
+    ].body.content_hash = "old_content_hash"
+    key_1 = cache_utils.generate_cache_key(**generate_cache_key_kwargs)
+    generate_cache_key_kwargs["input_artifacts"][
+        "input_1"
+    ].body.content_hash = "new_content_hash"
+    key_2 = cache_utils.generate_cache_key(**generate_cache_key_kwargs)
+    assert key_1 != key_2
+
+
+def test_generate_cache_key_considers_file_dependencies(
+    generate_cache_key_kwargs,
+    clean_client_with_repo,
+):
+    """Check that the cache key changes if the file dependencies change."""
+    with open("file_dependency.txt", "w") as f:
+        f.write("before")
+    generate_cache_key_kwargs["step"].config.cache_policy.file_dependencies = [
+        "file_dependency.txt"
+    ]
+    key_1 = cache_utils.generate_cache_key(**generate_cache_key_kwargs)
+
+    with open("file_dependency.txt", "w") as f:
+        f.write("after")
+    key_2 = cache_utils.generate_cache_key(**generate_cache_key_kwargs)
+    assert key_1 != key_2
+
+
+def test_generate_cache_key_considers_source_dependencies(
+    generate_cache_key_kwargs,
+    clean_client_with_repo,
+):
+    """Check that the cache key changes if the source dependencies change."""
+    module_name = str(uuid4())
+    with open(f"{module_name}.py", "w") as f:
+        f.write("def f():\n  return 1")
+    generate_cache_key_kwargs[
+        "step"
+    ].config.cache_policy.source_dependencies = [
+        Source.from_import_path(f"{module_name}.f")
+    ]
+    key_1 = cache_utils.generate_cache_key(**generate_cache_key_kwargs)
+    del sys.modules[module_name]
+    with open(f"{module_name}.py", "w") as f:
+        f.write("def f():\n  return 1 # comment")
+    key_2 = cache_utils.generate_cache_key(**generate_cache_key_kwargs)
+    assert key_1 != key_2
+    del sys.modules[module_name]
+
+
+def test_generate_cache_key_considers_cache_func(
+    generate_cache_key_kwargs,
+    clean_client_with_repo,
+):
+    """Check that the cache key changes if the cache func changes."""
+    module_name = str(uuid4())
+    with open(f"{module_name}.py", "w") as f:
+        f.write("def f():\n  return 'before'")
+    generate_cache_key_kwargs[
+        "step"
+    ].config.cache_policy.cache_func = Source.from_import_path(
+        f"{module_name}.f"
+    )
+    key_1 = cache_utils.generate_cache_key(**generate_cache_key_kwargs)
+
+    del sys.modules[module_name]
+    with open(f"{module_name}.py", "w") as f:
+        f.write("def f():\n  return 'after'")
+    key_2 = cache_utils.generate_cache_key(**generate_cache_key_kwargs)
+    assert key_1 != key_2
+    del sys.modules[module_name]
 
 
 def test_generate_cache_key_considers_output_artifacts(
@@ -202,8 +287,9 @@ def test_fetching_cached_step_run_queries_cache_candidates(
     cached_step = cache_utils.get_cached_step_run(cache_key="cache_key")
     assert cached_step == cache_candidate
     mock_list_run_steps.assert_called_with(
-        workspace_id=ANY,
+        project=ANY,
         cache_key="cache_key",
+        cache_expired=False,
         status=ExecutionStatus.COMPLETED,
         sort_by=f"{SorterOps.DESCENDING}:created",
         size=1,
@@ -212,20 +298,27 @@ def test_fetching_cached_step_run_queries_cache_candidates(
 
 def test_fetching_cached_step_run_uses_latest_candidate(
     clean_client,
-    sample_pipeline_deployment_request_model,
+    sample_pipeline_snapshot_request_model,
     sample_pipeline_run_request_model,
     sample_step_request_model,
 ):
     """Tests that the latest step run with the same cache key is used for
     caching."""
+    pipeline = clean_client.zen_store.create_pipeline(
+        PipelineRequest(
+            name="sample_pipeline",
+            project=clean_client.active_project.id,
+        )
+    )
     sample_step_request_model.cache_key = "cache_key"
-    sample_step_request_model.workspace = clean_client.active_workspace.id
-    sample_pipeline_deployment_request_model.workspace = (
-        clean_client.active_workspace.id
+    sample_step_request_model.project = clean_client.active_project.id
+    sample_pipeline_snapshot_request_model.project = (
+        clean_client.active_project.id
     )
-    sample_pipeline_run_request_model.workspace = (
-        clean_client.active_workspace.id
-    )
+    sample_pipeline_snapshot_request_model.stack = clean_client.active_stack.id
+    sample_pipeline_snapshot_request_model.pipeline = pipeline.id
+    sample_pipeline_run_request_model.project = clean_client.active_project.id
+    sample_pipeline_run_request_model.pipeline = pipeline.id
 
     sample_step = Step.model_validate(
         {
@@ -237,29 +330,42 @@ def test_fetching_cached_step_run_uses_latest_candidate(
             "config": {"name": "sample_step"},
         }
     )
-    sample_pipeline_deployment_request_model.step_configurations = {
+    sample_pipeline_snapshot_request_model.step_configurations = {
         "sample_step": sample_step
     }
 
-    # Create a pipeline deployment, pipeline run and step run
-    deployment_response = clean_client.zen_store.create_deployment(
-        sample_pipeline_deployment_request_model
+    # Create a pipeline snapshot, pipeline run and step run
+    snapshot_response = clean_client.zen_store.create_snapshot(
+        sample_pipeline_snapshot_request_model
     )
-    sample_pipeline_run_request_model.deployment = deployment_response.id
-    sample_step_request_model.deployment = deployment_response.id
+    sample_pipeline_run_request_model.snapshot = snapshot_response.id
 
-    run = clean_client.zen_store.create_run(sample_pipeline_run_request_model)
+    run, created = clean_client.zen_store.get_or_create_run(
+        sample_pipeline_run_request_model
+    )
+
+    assert created
+
     sample_step_request_model.pipeline_run_id = run.id
+
     response_1 = clean_client.zen_store.create_run_step(
         sample_step_request_model
     )
 
-    # Create another pipeline run and step run, with the same cache key
+    # Create another snapshot, pipeline run and step run, with the same cache key
+    snapshot_response = clean_client.zen_store.create_snapshot(
+        sample_pipeline_snapshot_request_model
+    )
+    sample_pipeline_run_request_model.snapshot = snapshot_response.id
+
     sample_pipeline_run_request_model.name = "new_run_name"
-    new_run = clean_client.zen_store.create_run(
+    new_run, created = clean_client.zen_store.get_or_create_run(
         sample_pipeline_run_request_model
     )
+    assert created
+
     sample_step_request_model.pipeline_run_id = new_run.id
+
     response_2 = clean_client.zen_store.create_run_step(
         sample_step_request_model
     )

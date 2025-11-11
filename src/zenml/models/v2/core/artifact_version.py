@@ -20,25 +20,35 @@ from typing import (
     Dict,
     List,
     Optional,
+    Type,
+    TypeVar,
     Union,
 )
 from uuid import UUID
 
-from pydantic import BaseModel, Field, field_validator
+from pydantic import (
+    ConfigDict,
+    Field,
+    field_validator,
+    model_validator,
+)
 
 from zenml.config.source import Source, SourceWithValidator
 from zenml.constants import STR_FIELD_MAX_LENGTH, TEXT_FIELD_MAX_LENGTH
-from zenml.enums import ArtifactType, GenericFilterOps
+from zenml.enums import ArtifactSaveType, ArtifactType
 from zenml.logger import get_logger
-from zenml.model.model import Model
-from zenml.models.v2.base.filter import StrFilter
+from zenml.metadata.metadata_types import MetadataType
+from zenml.models.v2.base.base import BaseUpdate
+from zenml.models.v2.base.filter import FilterGenerator
 from zenml.models.v2.base.scoped import (
-    WorkspaceScopedRequest,
-    WorkspaceScopedResponse,
-    WorkspaceScopedResponseBody,
-    WorkspaceScopedResponseMetadata,
-    WorkspaceScopedResponseResources,
-    WorkspaceScopedTaggableFilter,
+    ProjectScopedFilter,
+    ProjectScopedRequest,
+    ProjectScopedResponse,
+    ProjectScopedResponseBody,
+    ProjectScopedResponseMetadata,
+    ProjectScopedResponseResources,
+    RunMetadataFilterMixin,
+    TaggableFilter,
 )
 from zenml.models.v2.core.artifact import ArtifactResponse
 from zenml.models.v2.core.tag import TagResponse
@@ -51,24 +61,30 @@ if TYPE_CHECKING:
         ArtifactVisualizationResponse,
     )
     from zenml.models.v2.core.pipeline_run import PipelineRunResponse
-    from zenml.models.v2.core.run_metadata import (
-        RunMetadataResponse,
-    )
     from zenml.models.v2.core.step_run import StepRunResponse
+    from zenml.zen_stores.schemas.base_schemas import BaseSchema
+
+    AnySchema = TypeVar("AnySchema", bound=BaseSchema)
+
 
 logger = get_logger(__name__)
 
 # ------------------ Request Model ------------------
 
 
-class ArtifactVersionRequest(WorkspaceScopedRequest):
+class ArtifactVersionRequest(ProjectScopedRequest):
     """Request model for artifact versions."""
 
-    artifact_id: UUID = Field(
+    artifact_id: Optional[UUID] = Field(
+        default=None,
         title="ID of the artifact to which this version belongs.",
     )
-    version: Union[str, int] = Field(
-        title="Version of the artifact.", union_mode="left_to_right"
+    artifact_name: Optional[str] = Field(
+        default=None,
+        title="Name of the artifact to which this version belongs.",
+    )
+    version: Optional[Union[int, str]] = Field(
+        default=None, title="Version of the artifact."
     )
     has_custom_name: bool = Field(
         title="Whether the name is custom (True) or auto-generated (False).",
@@ -88,6 +104,11 @@ class ArtifactVersionRequest(WorkspaceScopedRequest):
     data_type: SourceWithValidator = Field(
         title="Data type of the artifact.",
     )
+    content_hash: Optional[str] = Field(
+        title="The content hash of the artifact version.",
+        default=None,
+        max_length=STR_FIELD_MAX_LENGTH,
+    )
     tags: Optional[List[str]] = Field(
         title="Tags of the artifact.",
         description="Should be a list of plain strings, e.g., ['tag1', 'tag2']",
@@ -95,6 +116,12 @@ class ArtifactVersionRequest(WorkspaceScopedRequest):
     )
     visualizations: Optional[List["ArtifactVisualizationRequest"]] = Field(
         default=None, title="Visualizations of the artifact."
+    )
+    save_type: ArtifactSaveType = Field(
+        title="The save type of the artifact version.",
+    )
+    metadata: Optional[Dict[str, MetadataType]] = Field(
+        default=None, title="Metadata of the artifact version."
     )
 
     @field_validator("version")
@@ -118,11 +145,33 @@ class ArtifactVersionRequest(WorkspaceScopedRequest):
         )
         return value
 
+    @model_validator(mode="after")
+    def _validate_request(self) -> "ArtifactVersionRequest":
+        """Validate the request values.
+
+        Raises:
+            ValueError: If the request is invalid.
+
+        Returns:
+            The validated request.
+        """
+        if self.artifact_id and self.artifact_name:
+            raise ValueError(
+                "Only one of artifact_name and artifact_id can be set."
+            )
+
+        if not (self.artifact_id or self.artifact_name):
+            raise ValueError(
+                "Either artifact_name or artifact_id must be set."
+            )
+
+        return self
+
 
 # ------------------ Update Model ------------------
 
 
-class ArtifactVersionUpdate(BaseModel):
+class ArtifactVersionUpdate(BaseUpdate):
     """Artifact version update model."""
 
     name: Optional[str] = None
@@ -133,7 +182,7 @@ class ArtifactVersionUpdate(BaseModel):
 # ------------------ Response Model ------------------
 
 
-class ArtifactVersionResponseBody(WorkspaceScopedResponseBody):
+class ArtifactVersionResponseBody(ProjectScopedResponseBody):
     """Response body for artifact versions."""
 
     artifact: ArtifactResponse = Field(
@@ -150,11 +199,15 @@ class ArtifactVersionResponseBody(WorkspaceScopedResponseBody):
     data_type: SourceWithValidator = Field(
         title="Data type of the artifact.",
     )
-    tags: List[TagResponse] = Field(
-        title="Tags associated with the model",
+    save_type: ArtifactSaveType = Field(
+        title="The save type of the artifact version.",
     )
-    producer_pipeline_run_id: Optional[UUID] = Field(
-        title="The ID of the pipeline run that generated this artifact version.",
+    artifact_store_id: Optional[UUID] = Field(
+        title="ID of the artifact store in which this artifact is stored.",
+        default=None,
+    )
+    content_hash: Optional[str] = Field(
+        title="The content hash of the artifact version.",
         default=None,
     )
 
@@ -180,31 +233,35 @@ class ArtifactVersionResponseBody(WorkspaceScopedResponseBody):
         return value
 
 
-class ArtifactVersionResponseMetadata(WorkspaceScopedResponseMetadata):
+class ArtifactVersionResponseMetadata(ProjectScopedResponseMetadata):
     """Response metadata for artifact versions."""
 
-    artifact_store_id: Optional[UUID] = Field(
-        title="ID of the artifact store in which this artifact is stored.",
-        default=None,
+    visualizations: Optional[List["ArtifactVisualizationResponse"]] = Field(
+        default=None, title="Visualizations of the artifact."
+    )
+    run_metadata: Dict[str, MetadataType] = Field(
+        default={}, title="Metadata of the artifact."
+    )
+
+
+class ArtifactVersionResponseResources(ProjectScopedResponseResources):
+    """Class for all resource models associated with the artifact version entity."""
+
+    tags: List[TagResponse] = Field(
+        title="Tags associated with the artifact version.",
     )
     producer_step_run_id: Optional[UUID] = Field(
         title="ID of the step run that produced this artifact.",
         default=None,
     )
-    visualizations: Optional[List["ArtifactVisualizationResponse"]] = Field(
-        default=None, title="Visualizations of the artifact."
+    producer_pipeline_run_id: Optional[UUID] = Field(
+        title="The ID of the pipeline run that generated this artifact version.",
+        default=None,
     )
-    run_metadata: Dict[str, "RunMetadataResponse"] = Field(
-        default={}, title="Metadata of the artifact."
-    )
-
-
-class ArtifactVersionResponseResources(WorkspaceScopedResponseResources):
-    """Class for all resource models associated with the artifact version entity."""
 
 
 class ArtifactVersionResponse(
-    WorkspaceScopedResponse[
+    ProjectScopedResponse[
         ArtifactVersionResponseBody,
         ArtifactVersionResponseMetadata,
         ArtifactVersionResponseResources,
@@ -233,7 +290,7 @@ class ArtifactVersionResponse(
         return self.get_body().artifact
 
     @property
-    def version(self) -> Union[str, int]:
+    def version(self) -> str:
         """The `version` property.
 
         Returns:
@@ -260,13 +317,22 @@ class ArtifactVersionResponse(
         return self.get_body().type
 
     @property
+    def content_hash(self) -> Optional[str]:
+        """The `content_hash` property.
+
+        Returns:
+            the value of the property.
+        """
+        return self.get_body().content_hash
+
+    @property
     def tags(self) -> List[TagResponse]:
         """The `tags` property.
 
         Returns:
             the value of the property.
         """
-        return self.get_body().tags
+        return self.get_resources().tags
 
     @property
     def producer_pipeline_run_id(self) -> Optional[UUID]:
@@ -275,7 +341,16 @@ class ArtifactVersionResponse(
         Returns:
             the value of the property.
         """
-        return self.get_body().producer_pipeline_run_id
+        return self.get_resources().producer_pipeline_run_id
+
+    @property
+    def save_type(self) -> ArtifactSaveType:
+        """The `save_type` property.
+
+        Returns:
+            the value of the property.
+        """
+        return self.get_body().save_type
 
     @property
     def artifact_store_id(self) -> Optional[UUID]:
@@ -284,7 +359,7 @@ class ArtifactVersionResponse(
         Returns:
             the value of the property.
         """
-        return self.get_metadata().artifact_store_id
+        return self.get_body().artifact_store_id
 
     @property
     def producer_step_run_id(self) -> Optional[UUID]:
@@ -293,7 +368,7 @@ class ArtifactVersionResponse(
         Returns:
             the value of the property.
         """
-        return self.get_metadata().producer_step_run_id
+        return self.get_resources().producer_step_run_id
 
     @property
     def visualizations(
@@ -307,7 +382,7 @@ class ArtifactVersionResponse(
         return self.get_metadata().visualizations
 
     @property
-    def run_metadata(self) -> Dict[str, "RunMetadataResponse"]:
+    def run_metadata(self) -> Dict[str, MetadataType]:
         """The `metadata` property.
 
         Returns:
@@ -365,15 +440,28 @@ class ArtifactVersionResponse(
 
         return Client().get_pipeline_run(self.step.pipeline_run_id)
 
-    def load(self) -> Any:
+    def load(self, disable_cache: bool = False) -> Any:
         """Materializes (loads) the data stored in this artifact.
+
+        Args:
+            disable_cache: Whether to disable the artifact cache.
 
         Returns:
             The materialized data.
         """
+        from zenml.artifacts.in_memory_cache import InMemoryArtifactCache
         from zenml.artifacts.utils import load_artifact_from_response
 
-        return load_artifact_from_response(self)
+        cache = InMemoryArtifactCache.get()
+
+        if cache and (data := cache.get_artifact_data(self.id)):
+            logger.debug("Returning artifact data (%s) from cache", self.id)
+            return data
+
+        data = load_artifact_from_response(self)
+        if cache and not disable_cache:
+            cache.set_artifact_data(self.id, data)
+        return data
 
     def download_files(self, path: str, overwrite: bool = False) -> None:
         """Downloads data for an artifact with no materializing.
@@ -401,18 +489,6 @@ class ArtifactVersionResponse(
             overwrite=overwrite,
         )
 
-    def read(self) -> Any:
-        """(Deprecated) Materializes (loads) the data stored in this artifact.
-
-        Returns:
-            The materialized data.
-        """
-        logger.warning(
-            "`artifact.read()` is deprecated and will be removed in a future "
-            "release. Please use `artifact.load()` instead."
-        )
-        return self.load()
-
     def visualize(self, title: Optional[str] = None) -> None:
         """Visualize the artifact in notebook environments.
 
@@ -427,26 +503,52 @@ class ArtifactVersionResponse(
 # ------------------ Filter Model ------------------
 
 
-class ArtifactVersionFilter(WorkspaceScopedTaggableFilter):
+class ArtifactVersionFilter(
+    ProjectScopedFilter, TaggableFilter, RunMetadataFilterMixin
+):
     """Model to enable advanced filtering of artifact versions."""
 
-    # `name` and `only_unused` refer to properties related to other entities
-    #  rather than a field in the db, hence they need to be handled
-    #  explicitly
     FILTER_EXCLUDE_FIELDS: ClassVar[List[str]] = [
-        *WorkspaceScopedTaggableFilter.FILTER_EXCLUDE_FIELDS,
-        "name",
+        *ProjectScopedFilter.FILTER_EXCLUDE_FIELDS,
+        *TaggableFilter.FILTER_EXCLUDE_FIELDS,
+        *RunMetadataFilterMixin.FILTER_EXCLUDE_FIELDS,
+        "artifact_id",
+        "artifact",
         "only_unused",
         "has_custom_name",
+        "model",
+        "pipeline_run",
+        "model_version_id",
     ]
-    artifact_id: Optional[Union[UUID, str]] = Field(
+    CUSTOM_SORTING_OPTIONS: ClassVar[List[str]] = [
+        *ProjectScopedFilter.CUSTOM_SORTING_OPTIONS,
+        *TaggableFilter.CUSTOM_SORTING_OPTIONS,
+        *RunMetadataFilterMixin.CUSTOM_SORTING_OPTIONS,
+    ]
+    CLI_EXCLUDE_FIELDS: ClassVar[List[str]] = [
+        *ProjectScopedFilter.CLI_EXCLUDE_FIELDS,
+        *TaggableFilter.CLI_EXCLUDE_FIELDS,
+        *RunMetadataFilterMixin.CLI_EXCLUDE_FIELDS,
+        "artifact_id",
+    ]
+    API_MULTI_INPUT_PARAMS: ClassVar[List[str]] = [
+        *ProjectScopedFilter.API_MULTI_INPUT_PARAMS,
+        *TaggableFilter.API_MULTI_INPUT_PARAMS,
+        *RunMetadataFilterMixin.API_MULTI_INPUT_PARAMS,
+    ]
+
+    artifact: Optional[Union[UUID, str]] = Field(
         default=None,
-        description="ID of the artifact to which this version belongs.",
+        description="The name or ID of the artifact which the search is scoped "
+        "to. This field must always be set and is always applied in addition "
+        "to the other filters, regardless of the value of the "
+        "logical_operator field.",
         union_mode="left_to_right",
     )
-    name: Optional[str] = Field(
+    artifact_id: Optional[Union[UUID, str]] = Field(
         default=None,
-        description="Name of the artifact to which this version belongs.",
+        description="[Deprecated] Use 'artifact' instead. ID of the artifact to which this version belongs.",
+        union_mode="left_to_right",
     )
     version: Optional[str] = Field(
         default=None,
@@ -478,14 +580,10 @@ class ArtifactVersionFilter(WorkspaceScopedTaggableFilter):
         description="Artifact store for this artifact",
         union_mode="left_to_right",
     )
-    workspace_id: Optional[Union[UUID, str]] = Field(
+    model_version_id: Optional[Union[UUID, str]] = Field(
         default=None,
-        description="Workspace for this artifact",
-        union_mode="left_to_right",
-    )
-    user_id: Optional[Union[UUID, str]] = Field(
-        default=None,
-        description="User that produced this artifact",
+        description="ID of the model version that is associated with this "
+        "artifact version.",
         union_mode="left_to_right",
     )
     only_unused: Optional[bool] = Field(
@@ -495,38 +593,55 @@ class ArtifactVersionFilter(WorkspaceScopedTaggableFilter):
         default=None,
         description="Filter only artifacts with/without custom names.",
     )
+    model: Optional[Union[UUID, str]] = Field(
+        default=None,
+        description="Name/ID of the model that is associated with this "
+        "artifact version.",
+    )
+    pipeline_run: Optional[Union[UUID, str]] = Field(
+        default=None,
+        description="Name/ID of a pipeline run that is associated with this "
+        "artifact version.",
+    )
 
-    def get_custom_filters(self) -> List[Union["ColumnElement[bool]"]]:
+    model_config = ConfigDict(protected_namespaces=())
+
+    def get_custom_filters(
+        self, table: Type["AnySchema"]
+    ) -> List[Union["ColumnElement[bool]"]]:
         """Get custom filters.
+
+        Args:
+            table: The query table.
 
         Returns:
             A list of custom filters.
         """
-        custom_filters = super().get_custom_filters()
+        custom_filters = super().get_custom_filters(table)
 
-        from sqlmodel import and_, select
+        from sqlmodel import and_, or_, select
 
-        from zenml.zen_stores.schemas.artifact_schemas import (
+        from zenml.zen_stores.schemas import (
             ArtifactSchema,
             ArtifactVersionSchema,
-        )
-        from zenml.zen_stores.schemas.step_run_schemas import (
+            ModelSchema,
+            ModelVersionArtifactSchema,
+            ModelVersionSchema,
+            PipelineRunSchema,
             StepRunInputArtifactSchema,
             StepRunOutputArtifactSchema,
+            StepRunSchema,
         )
 
-        if self.name:
-            value, filter_operator = self._resolve_operator(self.name)
-            filter_ = StrFilter(
-                operation=GenericFilterOps(filter_operator),
-                column="name",
-                value=value,
-            )
-            artifact_name_filter = and_(
+        if self.artifact:
+            value, operator = self._resolve_operator(self.artifact)
+            artifact_filter = and_(
                 ArtifactVersionSchema.artifact_id == ArtifactSchema.id,
-                filter_.generate_query_conditions(ArtifactSchema),
+                self.generate_name_or_id_query_conditions(
+                    value=self.artifact, table=ArtifactSchema
+                ),
             )
-            custom_filters.append(artifact_name_filter)
+            custom_filters.append(artifact_filter)
 
         if self.only_unused:
             unused_filter = and_(
@@ -539,6 +654,20 @@ class ArtifactVersionFilter(WorkspaceScopedTaggableFilter):
             )
             custom_filters.append(unused_filter)
 
+        if self.model_version_id:
+            value, operator = self._resolve_operator(self.model_version_id)
+
+            model_version_filter = and_(
+                ArtifactVersionSchema.id
+                == ModelVersionArtifactSchema.artifact_version_id,
+                ModelVersionArtifactSchema.model_version_id
+                == ModelVersionSchema.id,
+                FilterGenerator(ModelVersionSchema)
+                .define_filter(column="id", value=value, operator=operator)
+                .generate_query_conditions(ModelVersionSchema),
+            )
+            custom_filters.append(model_version_filter)
+
         if self.has_custom_name is not None:
             custom_name_filter = and_(
                 ArtifactVersionSchema.artifact_id == ArtifactSchema.id,
@@ -546,7 +675,60 @@ class ArtifactVersionFilter(WorkspaceScopedTaggableFilter):
             )
             custom_filters.append(custom_name_filter)
 
+        if self.model:
+            model_filter = and_(
+                ArtifactVersionSchema.id
+                == ModelVersionArtifactSchema.artifact_version_id,
+                ModelVersionArtifactSchema.model_version_id
+                == ModelVersionSchema.id,
+                ModelVersionSchema.model_id == ModelSchema.id,
+                self.generate_name_or_id_query_conditions(
+                    value=self.model, table=ModelSchema
+                ),
+            )
+            custom_filters.append(model_filter)
+
+        if self.pipeline_run:
+            pipeline_run_filter = and_(
+                or_(
+                    and_(
+                        ArtifactVersionSchema.id
+                        == StepRunOutputArtifactSchema.artifact_id,
+                        StepRunOutputArtifactSchema.step_id
+                        == StepRunSchema.id,
+                    ),
+                    and_(
+                        ArtifactVersionSchema.id
+                        == StepRunInputArtifactSchema.artifact_id,
+                        StepRunInputArtifactSchema.step_id == StepRunSchema.id,
+                    ),
+                ),
+                StepRunSchema.pipeline_run_id == PipelineRunSchema.id,
+                self.generate_name_or_id_query_conditions(
+                    value=self.pipeline_run, table=PipelineRunSchema
+                ),
+            )
+            custom_filters.append(pipeline_run_filter)
+
         return custom_filters
+
+    @model_validator(mode="after")
+    def _migrate_artifact_id(self) -> "ArtifactVersionFilter":
+        """Migrate value from the deprecated artifact_id attribute.
+
+        Returns:
+            The filter with migrated value.
+        """
+        # Handle deprecated artifact_id field
+        if self.artifact_id is not None:
+            logger.warning(
+                "The 'ArtifactVersionFilter.artifact_id' field is deprecated "
+                "and will be removed in a future version. Please use "
+                "'ArtifactVersionFilter.artifact' instead."
+            )
+            self.artifact = self.artifact or self.artifact_id
+
+        return self
 
 
 # -------------------- Lazy Loader --------------------
@@ -562,7 +744,8 @@ class LazyArtifactVersionResponse(ArtifactVersionResponse):
     id: Optional[UUID] = None  # type: ignore[assignment]
     lazy_load_name: Optional[str] = None
     lazy_load_version: Optional[str] = None
-    lazy_load_model: Model
+    lazy_load_model_name: str
+    lazy_load_model_version: Optional[str] = None
 
     def get_body(self) -> None:  # type: ignore[override]
         """Protects from misuse of the lazy loader.
@@ -583,7 +766,7 @@ class LazyArtifactVersionResponse(ArtifactVersionResponse):
         )
 
     @property
-    def run_metadata(self) -> Dict[str, "RunMetadataResponse"]:
+    def run_metadata(self) -> Dict[str, MetadataType]:
         """The `metadata` property in lazy loading mode.
 
         Returns:
@@ -592,7 +775,8 @@ class LazyArtifactVersionResponse(ArtifactVersionResponse):
         from zenml.metadata.lazy_load import RunMetadataLazyGetter
 
         return RunMetadataLazyGetter(  # type: ignore[return-value]
-            self.lazy_load_model,
+            self.lazy_load_model_name,
+            self.lazy_load_model_version,
             self.lazy_load_name,
             self.lazy_load_version,
         )

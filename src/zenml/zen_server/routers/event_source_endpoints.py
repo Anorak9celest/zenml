@@ -39,7 +39,7 @@ from zenml.zen_server.rbac.utils import (
     verify_permission_for_model,
 )
 from zenml.zen_server.utils import (
-    handle_exceptions,
+    async_fastapi_endpoint_wrapper,
     make_dependable,
     plugin_flavor_registry,
     zen_store,
@@ -57,10 +57,9 @@ event_source_router = APIRouter(
 
 @event_source_router.get(
     "",
-    response_model=Page[EventSourceResponse],
     responses={401: error_response, 404: error_response, 422: error_response},
 )
-@handle_exceptions
+@async_fastapi_endpoint_wrapper
 def list_event_sources(
     event_source_filter_model: EventSourceFilter = Depends(
         make_dependable(EventSourceFilter)
@@ -132,10 +131,9 @@ def list_event_sources(
 
 @event_source_router.get(
     "/{event_source_id}",
-    response_model=EventSourceResponse,
     responses={401: error_response, 404: error_response, 422: error_response},
 )
-@handle_exceptions
+@async_fastapi_endpoint_wrapper
 def get_event_source(
     event_source_id: UUID,
     hydrate: bool = True,
@@ -185,10 +183,9 @@ def get_event_source(
 
 @event_source_router.post(
     "",
-    response_model=EventSourceResponse,
     responses={401: error_response, 409: error_response, 422: error_response},
 )
-@handle_exceptions
+@async_fastapi_endpoint_wrapper
 def create_event_source(
     event_source: EventSourceRequest,
     _: AuthContext = Security(authorize),
@@ -222,17 +219,15 @@ def create_event_source(
 
     return verify_permissions_and_create_entity(
         request_model=event_source,
-        resource_type=ResourceType.EVENT_SOURCE,
         create_method=event_source_handler.create_event_source,
     )
 
 
 @event_source_router.put(
     "/{event_source_id}",
-    response_model=EventSourceResponse,
     responses={401: error_response, 404: error_response, 422: error_response},
 )
-@handle_exceptions
+@async_fastapi_endpoint_wrapper
 def update_event_source(
     event_source_id: UUID,
     event_source_update: EventSourceUpdate,
@@ -284,7 +279,7 @@ def update_event_source(
     "/{event_source_id}",
     responses={401: error_response, 404: error_response, 422: error_response},
 )
-@handle_exceptions
+@async_fastapi_endpoint_wrapper
 def delete_event_source(
     event_source_id: UUID,
     force: bool = False,

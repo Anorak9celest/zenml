@@ -13,8 +13,9 @@
 #  permissions and limitations under the License.
 """Zen Server docker deployer implementation."""
 
+import os
 import shutil
-from typing import ClassVar, List, Optional, Tuple, Type, cast
+from typing import ClassVar, Optional, Tuple, Type, cast
 from uuid import uuid4
 
 from zenml.enums import ServerProviderType
@@ -30,8 +31,9 @@ from zenml.services import (
     ServiceEndpointHealthMonitorConfig,
     ServiceEndpointProtocol,
 )
+from zenml.utils.docker_utils import check_docker
 from zenml.zen_server.deploy.base_provider import BaseServerProvider
-from zenml.zen_server.deploy.deployment import ServerDeploymentConfig
+from zenml.zen_server.deploy.deployment import LocalServerDeploymentConfig
 from zenml.zen_server.deploy.docker.docker_zen_server import (
     DOCKER_ZENML_SERVER_DEFAULT_TIMEOUT,
     ZEN_SERVER_HEALTHCHECK_URL_PATH,
@@ -47,14 +49,14 @@ class DockerServerProvider(BaseServerProvider):
     """Docker ZenML server provider."""
 
     TYPE: ClassVar[ServerProviderType] = ServerProviderType.DOCKER
-    CONFIG_TYPE: ClassVar[Type[ServerDeploymentConfig]] = (
+    CONFIG_TYPE: ClassVar[Type[LocalServerDeploymentConfig]] = (
         DockerServerDeploymentConfig
     )
 
     @classmethod
     def _get_service_configuration(
         cls,
-        server_config: ServerDeploymentConfig,
+        server_config: LocalServerDeploymentConfig,
     ) -> Tuple[
         ServiceConfig,
         ServiceEndpointConfig,
@@ -75,7 +77,7 @@ class DockerServerProvider(BaseServerProvider):
                 root_runtime_path=DockerZenServer.config_path(),
                 singleton=True,
                 image=server_config.image,
-                name=server_config.name,
+                name=ServerProviderType.DOCKER.value,
                 server=server_config,
             ),
             ContainerServiceEndpointConfig(
@@ -91,7 +93,7 @@ class DockerServerProvider(BaseServerProvider):
 
     def _create_service(
         self,
-        config: ServerDeploymentConfig,
+        config: LocalServerDeploymentConfig,
         timeout: Optional[int] = None,
     ) -> BaseService:
         """Create, start and return the docker ZenML server deployment service.
@@ -142,7 +144,7 @@ class DockerServerProvider(BaseServerProvider):
     def _update_service(
         self,
         service: BaseService,
-        config: ServerDeploymentConfig,
+        config: LocalServerDeploymentConfig,
         timeout: Optional[int] = None,
     ) -> BaseService:
         """Update the docker ZenML server deployment service.
@@ -244,11 +246,8 @@ class DockerServerProvider(BaseServerProvider):
         service.stop(timeout)
         shutil.rmtree(DockerZenServer.config_path())
 
-    def _get_service(self, server_name: str) -> BaseService:
+    def _get_service(self) -> BaseService:
         """Get the docker ZenML server deployment service.
-
-        Args:
-            server_name: The server deployment name.
 
         Returns:
             The service instance.
@@ -256,31 +255,36 @@ class DockerServerProvider(BaseServerProvider):
         Raises:
             KeyError: If the server deployment is not found.
         """
+        # Check if Docker is available first
+        if not check_docker():
+            # Docker is not available, so we can't have a running Docker service
+            # Clean up the stale service configuration
+            service_config_path = DockerZenServer.config_path()
+            if os.path.exists(service_config_path):
+                logger.warning(
+                    "Docker daemon is not running. Cleaning up stale Docker "
+                    "ZenML server configuration at %s",
+                    service_config_path,
+                )
+                try:
+                    shutil.rmtree(service_config_path)
+                except Exception as e:
+                    logger.debug(
+                        "Failed to clean up stale Docker config: %s", e
+                    )
+            raise KeyError(
+                "The docker ZenML server is not deployed (Docker daemon not running)."
+            )
+
         service = DockerZenServer.get_service()
         if service is None:
             raise KeyError("The docker ZenML server is not deployed.")
 
-        if service.config.name != server_name:
-            raise KeyError(
-                "The docker ZenML server is deployed but with a different name."
-            )
-
         return service
-
-    def _list_services(self) -> List[BaseService]:
-        """Get all service instances for all deployed ZenML servers.
-
-        Returns:
-            A list of service instances.
-        """
-        service = DockerZenServer.get_service()
-        if service:
-            return [service]
-        return []
 
     def _get_deployment_config(
         self, service: BaseService
-    ) -> ServerDeploymentConfig:
+    ) -> LocalServerDeploymentConfig:
         """Recreate the server deployment configuration from a service instance.
 
         Args:

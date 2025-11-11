@@ -17,20 +17,25 @@ import argparse
 import os
 import sys
 from abc import ABC, abstractmethod
-from typing import TYPE_CHECKING, Any, Dict, List, NoReturn, Set
+from typing import TYPE_CHECKING, Any, Dict, List, NoReturn, Optional
 from uuid import UUID
 
 from zenml.client import Client
 from zenml.code_repositories import BaseCodeRepository
-from zenml.constants import (
-    ENV_ZENML_REQUIRES_CODE_DOWNLOAD,
-    handle_bool_env_var,
-)
+from zenml.enums import StackComponentType
+from zenml.exceptions import CustomFlavorImportError
 from zenml.logger import get_logger
-from zenml.utils import code_repository_utils, source_utils, uuid_utils
+from zenml.utils import (
+    code_repository_utils,
+    code_utils,
+    source_utils,
+    uuid_utils,
+)
 
 if TYPE_CHECKING:
-    from zenml.models import PipelineDeploymentResponse
+    from zenml.artifact_stores import BaseArtifactStore
+    from zenml.config import DockerSettings
+    from zenml.models import CodeReferenceResponse, PipelineSnapshotResponse
 
 logger = get_logger(__name__)
 DEFAULT_ENTRYPOINT_COMMAND = [
@@ -40,7 +45,7 @@ DEFAULT_ENTRYPOINT_COMMAND = [
 ]
 
 ENTRYPOINT_CONFIG_SOURCE_OPTION = "entrypoint_config_source"
-DEPLOYMENT_ID_OPTION = "deployment_id"
+SNAPSHOT_ID_OPTION = "snapshot_id"
 
 
 class BaseEntrypointConfiguration(ABC):
@@ -60,6 +65,7 @@ class BaseEntrypointConfiguration(ABC):
             arguments: Command line arguments to configure this object.
         """
         self.entrypoint_args = self._parse_arguments(arguments)
+        self._snapshot: Optional["PipelineSnapshotResponse"] = None
 
     @classmethod
     def get_entrypoint_command(cls) -> List[str]:
@@ -79,18 +85,18 @@ class BaseEntrypointConfiguration(ABC):
         return DEFAULT_ENTRYPOINT_COMMAND
 
     @classmethod
-    def get_entrypoint_options(cls) -> Set[str]:
+    def get_entrypoint_options(cls) -> Dict[str, bool]:
         """Gets all options required for running with this configuration.
 
         Returns:
-            A set of strings with all required options.
+            A dictionary of options and whether they are required.
         """
         return {
             # Importable source pointing to the entrypoint configuration class
             # that should be used inside the entrypoint.
-            ENTRYPOINT_CONFIG_SOURCE_OPTION,
-            # ID of the pipeline deployment to use in this entrypoint
-            DEPLOYMENT_ID_OPTION,
+            ENTRYPOINT_CONFIG_SOURCE_OPTION: True,
+            # ID of the pipeline snapshot to use in this entrypoint
+            SNAPSHOT_ID_OPTION: True,
         }
 
     @classmethod
@@ -113,23 +119,29 @@ class BaseEntrypointConfiguration(ABC):
             A list of strings with the arguments.
 
         Raises:
-            ValueError: If no valid deployment ID is passed.
+            ValueError: If no valid snapshot ID is passed.
         """
-        deployment_id = kwargs.get(DEPLOYMENT_ID_OPTION)
-        if not uuid_utils.is_valid_uuid(deployment_id):
-            raise ValueError(
-                f"Missing or invalid deployment ID as argument for entrypoint "
-                f"configuration. Please make sure to pass a valid UUID to "
-                f"`{cls.__name__}.{cls.get_entrypoint_arguments.__name__}"
-                f"({DEPLOYMENT_ID_OPTION}=<UUID>)`."
-            )
-
         arguments = [
             f"--{ENTRYPOINT_CONFIG_SOURCE_OPTION}",
             source_utils.resolve(cls).import_path,
-            f"--{DEPLOYMENT_ID_OPTION}",
-            str(deployment_id),
         ]
+
+        if SNAPSHOT_ID_OPTION in cls.get_entrypoint_options():
+            snapshot_id = kwargs.get(SNAPSHOT_ID_OPTION)
+            if not uuid_utils.is_valid_uuid(snapshot_id):
+                raise ValueError(
+                    f"Missing or invalid snapshot ID as argument for entrypoint "
+                    f"configuration. Please make sure to pass a valid UUID to "
+                    f"`{cls.__name__}.{cls.get_entrypoint_arguments.__name__}"
+                    f"({SNAPSHOT_ID_OPTION}=<UUID>)`."
+                )
+
+            arguments.extend(
+                [
+                    f"--{SNAPSHOT_ID_OPTION}",
+                    str(snapshot_id),
+                ]
+            )
 
         return arguments
 
@@ -168,63 +180,135 @@ class BaseEntrypointConfiguration(ABC):
 
         parser = _CustomParser()
 
-        for option_name in cls.get_entrypoint_options():
+        for option_name, required in cls.get_entrypoint_options().items():
             if option_name == ENTRYPOINT_CONFIG_SOURCE_OPTION:
                 # This option is already used by
                 # `zenml.entrypoints.entrypoint` to read which config
                 # class to use
                 continue
-            parser.add_argument(f"--{option_name}", required=True)
+            parser.add_argument(f"--{option_name}", required=required)
 
         result, _ = parser.parse_known_args(arguments)
         return vars(result)
 
-    def load_deployment(self) -> "PipelineDeploymentResponse":
-        """Loads the deployment.
+    @property
+    def snapshot(self) -> "PipelineSnapshotResponse":
+        """The snapshot configured for this entrypoint configuration.
 
         Returns:
-            The deployment.
+            The snapshot.
         """
-        deployment_id = UUID(self.entrypoint_args[DEPLOYMENT_ID_OPTION])
-        return Client().zen_store.get_deployment(deployment_id=deployment_id)
+        if self._snapshot is None:
+            self._snapshot = self._load_snapshot()
+        return self._snapshot
 
-    def download_code_if_necessary(
-        self, deployment: "PipelineDeploymentResponse"
-    ) -> None:
+    @property
+    def docker_settings(self) -> "DockerSettings":
+        """The Docker settings configured for this entrypoint configuration.
+
+        Returns:
+            The Docker settings.
+        """
+        return self.snapshot.pipeline_configuration.docker_settings
+
+    @property
+    def should_download_code(self) -> bool:
+        """Whether code should be downloaded.
+
+        Returns:
+            Whether code should be downloaded.
+        """
+        if (
+            self.snapshot.code_reference
+            and self.docker_settings.allow_download_from_code_repository
+        ):
+            return True
+
+        if (
+            self.snapshot.code_path
+            and self.docker_settings.allow_download_from_artifact_store
+        ):
+            return True
+
+        return False
+
+    def _load_snapshot(self) -> "PipelineSnapshotResponse":
+        """Loads the snapshot.
+
+        Returns:
+            The snapshot.
+        """
+        snapshot_id = UUID(self.entrypoint_args[SNAPSHOT_ID_OPTION])
+        return Client().zen_store.get_snapshot(snapshot_id=snapshot_id)
+
+    def download_code_if_necessary(self) -> None:
         """Downloads user code if necessary.
 
-        Args:
-            deployment: The deployment for which to download the code.
-
         Raises:
+            CustomFlavorImportError: If the artifact store flavor can't be
+                imported.
             RuntimeError: If the current environment requires code download
-                but the deployment does not have an associated code reference.
+                but the snapshot does not have a reference to any code.
         """
-        requires_code_download = handle_bool_env_var(
-            ENV_ZENML_REQUIRES_CODE_DOWNLOAD
-        )
-
-        if not requires_code_download:
+        if not self.should_download_code:
             return
 
-        code_reference = deployment.code_reference
-        if not code_reference:
+        if code_path := self.snapshot.code_path:
+            # Load the artifact store not from the active stack but separately.
+            # This is required in case the stack has custom flavor components
+            # (other than the artifact store) for which the flavor
+            # implementations will only be available once the download finishes.
+            try:
+                artifact_store = self._load_active_artifact_store()
+            except CustomFlavorImportError as e:
+                raise CustomFlavorImportError(
+                    "Failed to import custom artifact store flavor. The "
+                    "artifact store flavor is needed to download your code, "
+                    "but it looks like it might be part of the files "
+                    "that we're trying to download. If this is the case, you "
+                    "should disable downloading code from the artifact store "
+                    "using `DockerSettings(allow_download_from_artifact_store=False)` "
+                    "or make sure the artifact flavor files are included in "
+                    "Docker image by using a custom parent image or installing "
+                    "them as part of a pip dependency."
+                ) from e
+            code_utils.download_code_from_artifact_store(
+                code_path=code_path, artifact_store=artifact_store
+            )
+        elif code_reference := self.snapshot.code_reference:
+            # TODO: This might fail if the code repository had unpushed changes
+            # at the time the pipeline run was started.
+            self.download_code_from_code_repository(
+                code_reference=code_reference
+            )
+        else:
             raise RuntimeError(
-                "Code download required but no code reference provided."
+                "Code download required but no code reference or path provided."
             )
 
+        logger.info("Code download finished.")
+
+    def download_code_from_code_repository(
+        self, code_reference: "CodeReferenceResponse"
+    ) -> None:
+        """Download code from a code repository.
+
+        Args:
+            code_reference: The reference to the code.
+        """
         logger.info(
             "Downloading code from code repository `%s` (commit `%s`).",
             code_reference.code_repository.name,
             code_reference.commit,
         )
+
         model = Client().get_code_repository(code_reference.code_repository.id)
         repo = BaseCodeRepository.from_model(model)
         code_repo_root = os.path.abspath("code")
         download_dir = os.path.join(
             code_repo_root, code_reference.subdirectory
         )
-        os.makedirs(download_dir)
+        os.makedirs(download_dir, exist_ok=True)
         repo.download_files(
             commit=code_reference.commit,
             directory=download_dir,
@@ -234,10 +318,25 @@ class BaseEntrypointConfiguration(ABC):
         code_repository_utils.set_custom_local_repository(
             root=code_repo_root, commit=code_reference.commit, repo=repo
         )
-        # Add downloaded file directory to python path
-        sys.path.insert(0, download_dir)
 
-        logger.info("Code download finished.")
+        sys.path.insert(0, download_dir)
+        os.chdir(download_dir)
+
+    def _load_active_artifact_store(self) -> "BaseArtifactStore":
+        """Load the active artifact store.
+
+        Returns:
+            The active artifact store.
+        """
+        from zenml.artifact_stores import BaseArtifactStore
+
+        artifact_store_model = Client().active_stack_model.components[
+            StackComponentType.ARTIFACT_STORE
+        ][0]
+        artifact_store = BaseArtifactStore.from_model(artifact_store_model)
+        assert isinstance(artifact_store, BaseArtifactStore)
+
+        return artifact_store
 
     @abstractmethod
     def run(self) -> None:

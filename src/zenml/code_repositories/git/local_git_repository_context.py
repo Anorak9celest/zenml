@@ -13,18 +13,22 @@
 #  permissions and limitations under the License.
 """Implementation of the Local git repository context."""
 
-from typing import TYPE_CHECKING, Callable, Optional, cast
-from uuid import UUID
+from typing import TYPE_CHECKING, Callable, Optional
 
 from zenml.code_repositories import (
     LocalRepositoryContext,
 )
+from zenml.constants import (
+    ENV_ZENML_CODE_REPOSITORY_IGNORE_UNTRACKED_FILES,
+    handle_bool_env_var,
+)
 from zenml.logger import get_logger
 
 if TYPE_CHECKING:
-    from git.objects import Commit
     from git.remote import Remote
     from git.repo.base import Repo
+
+    from zenml.code_repositories import BaseCodeRepository
 
 logger = get_logger(__name__)
 
@@ -33,16 +37,19 @@ class LocalGitRepositoryContext(LocalRepositoryContext):
     """Local git repository context."""
 
     def __init__(
-        self, code_repository_id: UUID, git_repo: "Repo", remote_name: str
+        self,
+        code_repository: "BaseCodeRepository",
+        git_repo: "Repo",
+        remote_name: str,
     ):
         """Initializes a local git repository context.
 
         Args:
-            code_repository_id: The ID of the code repository.
+            code_repository: The code repository.
             git_repo: The git repo.
             remote_name: Name of the remote.
         """
-        super().__init__(code_repository_id=code_repository_id)
+        super().__init__(code_repository=code_repository)
         self._git_repo = git_repo
         self._remote = git_repo.remote(name=remote_name)
 
@@ -50,14 +57,14 @@ class LocalGitRepositoryContext(LocalRepositoryContext):
     def at(
         cls,
         path: str,
-        code_repository_id: UUID,
+        code_repository: "BaseCodeRepository",
         remote_url_validation_callback: Callable[[str], bool],
     ) -> Optional["LocalGitRepositoryContext"]:
         """Returns a local git repository at the given path.
 
         Args:
             path: The path to the local git repository.
-            code_repository_id: The ID of the code repository.
+            code_repository: The code repository.
             remote_url_validation_callback: A callback that validates the
                 remote URL of the git repository.
 
@@ -70,11 +77,13 @@ class LocalGitRepositoryContext(LocalRepositoryContext):
             from git.exc import InvalidGitRepositoryError
             from git.repo.base import Repo
         except ImportError:
+            logger.debug("Failed to import git library.")
             return None
 
         try:
             git_repo = Repo(path=path, search_parent_directories=True)
         except InvalidGitRepositoryError:
+            logger.debug("No git repository exists at path %s.", path)
             return None
 
         remote_name = None
@@ -87,7 +96,7 @@ class LocalGitRepositoryContext(LocalRepositoryContext):
             return None
 
         return LocalGitRepositoryContext(
-            code_repository_id=code_repository_id,
+            code_repository=code_repository,
             git_repo=git_repo,
             remote_name=remote_name,
         )
@@ -124,13 +133,19 @@ class LocalGitRepositoryContext(LocalRepositoryContext):
     def is_dirty(self) -> bool:
         """Whether the git repo is dirty.
 
-        A repository counts as dirty if it has any untracked or uncommitted
-        changes.
+        By default, a repository counts as dirty if it has any untracked or
+        uncommitted changes. Users can use an environment variable to ignore
+        untracked files.
 
         Returns:
             True if the git repo is dirty, False otherwise.
         """
-        return self.git_repo.is_dirty(untracked_files=True)
+        ignore_untracked_files = handle_bool_env_var(
+            ENV_ZENML_CODE_REPOSITORY_IGNORE_UNTRACKED_FILES, default=False
+        )
+        return self.git_repo.is_dirty(
+            untracked_files=not ignore_untracked_files
+        )
 
     @property
     def has_local_changes(self) -> bool:
@@ -164,7 +179,7 @@ class LocalGitRepositoryContext(LocalRepositoryContext):
             # Branch doesn't exist on remote
             return True
 
-        return cast("Commit", remote_commit_object) != local_commit_object
+        return remote_commit_object != local_commit_object
 
     @property
     def current_commit(self) -> str:
@@ -173,4 +188,4 @@ class LocalGitRepositoryContext(LocalRepositoryContext):
         Returns:
             The current commit sha.
         """
-        return cast(str, self.git_repo.head.object.hexsha)
+        return self.git_repo.head.object.hexsha

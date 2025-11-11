@@ -21,6 +21,7 @@ from typing import (
     List,
     Optional,
     Type,
+    TypeVar,
     Union,
 )
 from uuid import UUID
@@ -31,22 +32,22 @@ from zenml.constants import STR_FIELD_MAX_LENGTH
 from zenml.enums import LogicalOperators, StackComponentType
 from zenml.models.v2.base.base import BaseUpdate
 from zenml.models.v2.base.scoped import (
-    WorkspaceScopedFilter,
-    WorkspaceScopedRequest,
-    WorkspaceScopedResponse,
-    WorkspaceScopedResponseBody,
-    WorkspaceScopedResponseMetadata,
-    WorkspaceScopedResponseResources,
+    UserScopedFilter,
+    UserScopedRequest,
+    UserScopedResponse,
+    UserScopedResponseBody,
+    UserScopedResponseMetadata,
+    UserScopedResponseResources,
 )
 from zenml.utils import secret_utils
 
 if TYPE_CHECKING:
     from sqlalchemy.sql.elements import ColumnElement
-    from sqlmodel import SQLModel
 
-    from zenml.models.v2.core.service_connector import (
-        ServiceConnectorResponse,
-    )
+    from zenml.models import FlavorResponse, ServiceConnectorResponse
+    from zenml.zen_stores.schemas.base_schemas import BaseSchema
+
+    AnySchema = TypeVar("AnySchema", bound=BaseSchema)
 
 # ------------------ Base Model ------------------
 
@@ -67,6 +68,14 @@ class ComponentBase(BaseModel):
         title="The flavor of the stack component.",
         max_length=STR_FIELD_MAX_LENGTH,
     )
+    environment: Optional[Dict[str, str]] = Field(
+        default=None,
+        title="Environment variables to set when running on this component.",
+    )
+    secrets: Optional[List[Union[UUID, str]]] = Field(
+        default=None,
+        title="Secrets to set as environment variables when running on this component.",
+    )
 
     configuration: Dict[str, Any] = Field(
         title="The stack component configuration.",
@@ -83,17 +92,12 @@ class ComponentBase(BaseModel):
         title="The stack component labels.",
     )
 
-    component_spec_path: Optional[str] = Field(
-        default=None,
-        title="The path to the component spec used for mlstacks deployments.",
-    )
-
 
 # ------------------ Request Model ------------------
 
 
-class ComponentRequest(ComponentBase, WorkspaceScopedRequest):
-    """Request model for components."""
+class ComponentRequest(ComponentBase, UserScopedRequest):
+    """Request model for stack components."""
 
     ANALYTICS_FIELDS: ClassVar[List[str]] = ["type", "flavor"]
 
@@ -124,13 +128,8 @@ class ComponentRequest(ComponentBase, WorkspaceScopedRequest):
         return name
 
 
-class InternalComponentRequest(ComponentRequest):
-    """Internal component request model."""
-
-    user: Optional[UUID] = Field(  # type: ignore[assignment]
-        title="The id of the user that created this resource.",
-        default=None,
-    )
+class DefaultComponentRequest(ComponentRequest):
+    """Internal component request model used only for default stack components."""
 
 
 # ------------------ Update Model ------------------
@@ -139,25 +138,18 @@ class InternalComponentRequest(ComponentRequest):
 class ComponentUpdate(BaseUpdate):
     """Update model for stack components."""
 
-    ANALYTICS_FIELDS: ClassVar[List[str]] = ["type", "flavor"]
-
     name: Optional[str] = Field(
         title="The name of the stack component.",
-        max_length=STR_FIELD_MAX_LENGTH,
-        default=None,
-    )
-    type: Optional[StackComponentType] = Field(
-        title="The type of the stack component.",
-        default=None,
-    )
-    flavor: Optional[str] = Field(
-        title="The flavor of the stack component.",
         max_length=STR_FIELD_MAX_LENGTH,
         default=None,
     )
     configuration: Optional[Dict[str, Any]] = Field(
         title="The stack component configuration.",
         default=None,
+    )
+    environment: Optional[Dict[str, str]] = Field(
+        default=None,
+        title="Environment variables to set when running on this component.",
     )
     connector_resource_id: Optional[str] = Field(
         description="The ID of a specific resource instance to "
@@ -168,44 +160,64 @@ class ComponentUpdate(BaseUpdate):
         title="The stack component labels.",
         default=None,
     )
-    component_spec_path: Optional[str] = Field(
-        title="The path to the component spec used for mlstacks deployments.",
-        default=None,
-    )
     connector: Optional[UUID] = Field(
         title="The service connector linked to this stack component.",
         default=None,
+    )
+    add_secrets: Optional[List[Union[UUID, str]]] = Field(
+        default=None,
+        title="New secrets to add to the stack component.",
+    )
+    remove_secrets: Optional[List[Union[UUID, str]]] = Field(
+        default=None,
+        title="Secrets to remove from the stack component.",
     )
 
 
 # ------------------ Response Model ------------------
 
 
-class ComponentResponseBody(WorkspaceScopedResponseBody):
-    """Response body for components."""
+class ComponentResponseBody(UserScopedResponseBody):
+    """Response body for stack components."""
 
     type: StackComponentType = Field(
         title="The type of the stack component.",
     )
-    flavor: str = Field(
+    flavor_name: str = Field(
         title="The flavor of the stack component.",
         max_length=STR_FIELD_MAX_LENGTH,
     )
+    integration: Optional[str] = Field(
+        default=None,
+        title="The name of the integration that the component's flavor "
+        "belongs to.",
+        max_length=STR_FIELD_MAX_LENGTH,
+    )
+    logo_url: Optional[str] = Field(
+        default=None,
+        title="Optionally, a url pointing to a png,"
+        "svg or jpg can be attached.",
+    )
 
 
-class ComponentResponseMetadata(WorkspaceScopedResponseMetadata):
-    """Response metadata for components."""
+class ComponentResponseMetadata(UserScopedResponseMetadata):
+    """Response metadata for stack components."""
 
     configuration: Dict[str, Any] = Field(
         title="The stack component configuration.",
     )
+    environment: Dict[str, str] = Field(
+        default={},
+        title="Environment variables to set when running on this component.",
+    )
+    secrets: List[UUID] = Field(
+        default=[],
+        title="Secrets to set as environment variables when running on this "
+        "component.",
+    )
     labels: Optional[Dict[str, Any]] = Field(
         default=None,
         title="The stack component labels.",
-    )
-    component_spec_path: Optional[str] = Field(
-        default=None,
-        title="The path to the component spec used for mlstacks deployments.",
     )
     connector_resource_id: Optional[str] = Field(
         default=None,
@@ -218,20 +230,24 @@ class ComponentResponseMetadata(WorkspaceScopedResponseMetadata):
     )
 
 
-class ComponentResponseResources(WorkspaceScopedResponseResources):
-    """Class for all resource models associated with the component entity."""
+class ComponentResponseResources(UserScopedResponseResources):
+    """Response resources for stack components."""
+
+    flavor: "FlavorResponse" = Field(
+        title="The flavor of this stack component.",
+    )
 
 
 class ComponentResponse(
-    WorkspaceScopedResponse[
+    UserScopedResponse[
         ComponentResponseBody,
         ComponentResponseMetadata,
         ComponentResponseResources,
     ]
 ):
-    """Response model for components."""
+    """Response model for stack components."""
 
-    ANALYTICS_FIELDS: ClassVar[List[str]] = ["type", "flavor"]
+    ANALYTICS_FIELDS: ClassVar[List[str]] = ["type"]
 
     name: str = Field(
         title="The name of the stack component.",
@@ -254,6 +270,8 @@ class ComponentResponse(
                     if label.startswith("zenml:")
                 }
             )
+        metadata["flavor"] = self.flavor_name
+
         return metadata
 
     def get_hydrated_version(self) -> "ComponentResponse":
@@ -277,13 +295,31 @@ class ComponentResponse(
         return self.get_body().type
 
     @property
-    def flavor(self) -> str:
-        """The `flavor` property.
+    def flavor_name(self) -> str:
+        """The `flavor_name` property.
 
         Returns:
             the value of the property.
         """
-        return self.get_body().flavor
+        return self.get_body().flavor_name
+
+    @property
+    def integration(self) -> Optional[str]:
+        """The `integration` property.
+
+        Returns:
+            the value of the property.
+        """
+        return self.get_body().integration
+
+    @property
+    def logo_url(self) -> Optional[str]:
+        """The `logo_url` property.
+
+        Returns:
+            the value of the property.
+        """
+        return self.get_body().logo_url
 
     @property
     def configuration(self) -> Dict[str, Any]:
@@ -295,6 +331,24 @@ class ComponentResponse(
         return self.get_metadata().configuration
 
     @property
+    def environment(self) -> Dict[str, str]:
+        """The `environment` property.
+
+        Returns:
+            the value of the property.
+        """
+        return self.get_metadata().environment
+
+    @property
+    def secrets(self) -> List[UUID]:
+        """The `secrets` property.
+
+        Returns:
+            the value of the property.
+        """
+        return self.get_metadata().secrets
+
+    @property
     def labels(self) -> Optional[Dict[str, Any]]:
         """The `labels` property.
 
@@ -302,15 +356,6 @@ class ComponentResponse(
             the value of the property.
         """
         return self.get_metadata().labels
-
-    @property
-    def component_spec_path(self) -> Optional[str]:
-        """The `component_spec_path` property.
-
-        Returns:
-            the value of the property.
-        """
-        return self.get_metadata().component_spec_path
 
     @property
     def connector_resource_id(self) -> Optional[str]:
@@ -330,33 +375,35 @@ class ComponentResponse(
         """
         return self.get_metadata().connector
 
+    @property
+    def flavor(self) -> "FlavorResponse":
+        """The `flavor` property.
+
+        Returns:
+            the value of the property.
+        """
+        return self.get_resources().flavor
+
 
 # ------------------ Filter Model ------------------
 
 
-class ComponentFilter(WorkspaceScopedFilter):
-    """Model to enable advanced filtering of all ComponentModels.
-
-    The Component Model needs additional scoping. As such the `_scope_user`
-    field can be set to the user that is doing the filtering. The
-    `generate_filter()` method of the baseclass is overwritten to include the
-    scoping.
-    """
+class ComponentFilter(UserScopedFilter):
+    """Model to enable advanced stack component filtering."""
 
     FILTER_EXCLUDE_FIELDS: ClassVar[List[str]] = [
-        *WorkspaceScopedFilter.FILTER_EXCLUDE_FIELDS,
+        *UserScopedFilter.FILTER_EXCLUDE_FIELDS,
         "scope_type",
         "stack_id",
     ]
     CLI_EXCLUDE_FIELDS: ClassVar[List[str]] = [
-        *WorkspaceScopedFilter.CLI_EXCLUDE_FIELDS,
+        *UserScopedFilter.CLI_EXCLUDE_FIELDS,
         "scope_type",
     ]
     scope_type: Optional[str] = Field(
         default=None,
         description="The type to scope this query to.",
     )
-
     name: Optional[str] = Field(
         default=None,
         description="Name of the stack component",
@@ -368,16 +415,6 @@ class ComponentFilter(WorkspaceScopedFilter):
     type: Optional[str] = Field(
         default=None,
         description="Type of the stack component",
-    )
-    workspace_id: Optional[Union[UUID, str]] = Field(
-        default=None,
-        description="Workspace of the stack component",
-        union_mode="left_to_right",
-    )
-    user_id: Optional[Union[UUID, str]] = Field(
-        default=None,
-        description="User of the stack component",
-        union_mode="left_to_right",
     )
     connector_id: Optional[Union[UUID, str]] = Field(
         default=None,
@@ -399,7 +436,7 @@ class ComponentFilter(WorkspaceScopedFilter):
         self.scope_type = component_type
 
     def generate_filter(
-        self, table: Type["SQLModel"]
+        self, table: Type["AnySchema"]
     ) -> Union["ColumnElement[bool]"]:
         """Generate the filter for the query.
 

@@ -14,11 +14,13 @@
 """SQLModel implementation of pipeline build tables."""
 
 import json
-from typing import Any, Optional
+from typing import Any, Optional, Sequence
 from uuid import UUID
 
 from sqlalchemy import Column, String
 from sqlalchemy.dialects.mysql import MEDIUMTEXT
+from sqlalchemy.orm import joinedload
+from sqlalchemy.sql.base import ExecutableOption
 from sqlmodel import Field, Relationship
 
 from zenml.constants import MEDIUMTEXT_MAX_LENGTH
@@ -27,14 +29,16 @@ from zenml.models import (
     PipelineBuildResponse,
     PipelineBuildResponseBody,
     PipelineBuildResponseMetadata,
+    PipelineBuildResponseResources,
 )
 from zenml.utils.json_utils import pydantic_encoder
 from zenml.zen_stores.schemas.base_schemas import BaseSchema
 from zenml.zen_stores.schemas.pipeline_schemas import PipelineSchema
+from zenml.zen_stores.schemas.project_schemas import ProjectSchema
 from zenml.zen_stores.schemas.schema_utils import build_foreign_key_field
 from zenml.zen_stores.schemas.stack_schemas import StackSchema
 from zenml.zen_stores.schemas.user_schemas import UserSchema
-from zenml.zen_stores.schemas.workspace_schemas import WorkspaceSchema
+from zenml.zen_stores.schemas.utils import jl_arg
 
 
 class PipelineBuildSchema(BaseSchema, table=True):
@@ -52,15 +56,15 @@ class PipelineBuildSchema(BaseSchema, table=True):
     )
     user: Optional["UserSchema"] = Relationship(back_populates="builds")
 
-    workspace_id: UUID = build_foreign_key_field(
+    project_id: UUID = build_foreign_key_field(
         source=__tablename__,
-        target=WorkspaceSchema.__tablename__,
-        source_column="workspace_id",
+        target=ProjectSchema.__tablename__,
+        source_column="project_id",
         target_column="id",
         ondelete="CASCADE",
         nullable=False,
     )
-    workspace: "WorkspaceSchema" = Relationship(back_populates="builds")
+    project: "ProjectSchema" = Relationship(back_populates="builds")
 
     stack_id: Optional[UUID] = build_foreign_key_field(
         source=__tablename__,
@@ -84,7 +88,6 @@ class PipelineBuildSchema(BaseSchema, table=True):
         back_populates="builds"
     )
 
-    template_deployment_id: Optional[UUID] = None
     images: str = Field(
         sa_column=Column(
             String(length=MEDIUMTEXT_MAX_LENGTH).with_variant(
@@ -100,6 +103,47 @@ class PipelineBuildSchema(BaseSchema, table=True):
     zenml_version: Optional[str]
     python_version: Optional[str]
     checksum: Optional[str]
+    stack_checksum: Optional[str]
+    # Build duration in seconds
+    duration: Optional[int] = None
+
+    @classmethod
+    def get_query_options(
+        cls,
+        include_metadata: bool = False,
+        include_resources: bool = False,
+        **kwargs: Any,
+    ) -> Sequence[ExecutableOption]:
+        """Get the query options for the schema.
+
+        Args:
+            include_metadata: Whether metadata will be included when converting
+                the schema to a model.
+            include_resources: Whether resources will be included when
+                converting the schema to a model.
+            **kwargs: Keyword arguments to allow schema specific logic
+
+        Returns:
+            A list of query options.
+        """
+        options = []
+
+        if include_metadata:
+            options.extend(
+                [
+                    joinedload(jl_arg(PipelineBuildSchema.pipeline)),
+                    joinedload(jl_arg(PipelineBuildSchema.stack)),
+                ]
+            )
+
+        if include_resources:
+            options.extend(
+                [
+                    joinedload(jl_arg(PipelineBuildSchema.user)),
+                ]
+            )
+
+        return options
 
     @classmethod
     def from_request(
@@ -115,7 +159,7 @@ class PipelineBuildSchema(BaseSchema, table=True):
         """
         return cls(
             stack_id=request.stack,
-            workspace_id=request.workspace,
+            project_id=request.project,
             user_id=request.user,
             pipeline_id=request.pipeline,
             images=json.dumps(request.images, default=pydantic_encoder),
@@ -124,7 +168,8 @@ class PipelineBuildSchema(BaseSchema, table=True):
             zenml_version=request.zenml_version,
             python_version=request.python_version,
             checksum=request.checksum,
-            template_deployment_id=request.template_deployment_id,
+            stack_checksum=request.stack_checksum,
+            duration=request.duration,
         )
 
     def to_model(
@@ -145,26 +190,35 @@ class PipelineBuildSchema(BaseSchema, table=True):
             The created `PipelineBuildResponse`.
         """
         body = PipelineBuildResponseBody(
-            user=self.user.to_model() if self.user else None,
+            user_id=self.user_id,
+            project_id=self.project_id,
             created=self.created,
             updated=self.updated,
         )
         metadata = None
         if include_metadata:
             metadata = PipelineBuildResponseMetadata(
-                workspace=self.workspace.to_model(),
                 pipeline=self.pipeline.to_model() if self.pipeline else None,
                 stack=self.stack.to_model() if self.stack else None,
                 images=json.loads(self.images),
                 zenml_version=self.zenml_version,
                 python_version=self.python_version,
                 checksum=self.checksum,
+                stack_checksum=self.stack_checksum,
                 is_local=self.is_local,
                 contains_code=self.contains_code,
-                template_deployment_id=self.template_deployment_id,
+                duration=self.duration,
             )
+
+        resources = None
+        if include_resources:
+            resources = PipelineBuildResponseResources(
+                user=self.user.to_model() if self.user else None,
+            )
+
         return PipelineBuildResponse(
             id=self.id,
             body=body,
             metadata=metadata,
+            resources=resources,
         )

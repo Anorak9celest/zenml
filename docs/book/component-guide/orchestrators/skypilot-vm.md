@@ -7,11 +7,7 @@ description: Orchestrating your pipelines to run on VMs using SkyPilot.
 The SkyPilot VM Orchestrator is an integration provided by ZenML that allows you to provision and manage virtual machines (VMs) on any cloud provider supported by the [SkyPilot framework](https://skypilot.readthedocs.io/en/latest/index.html). This integration is designed to simplify the process of running machine learning workloads on the cloud, offering cost savings, high GPU availability, and managed execution, We recommend using the SkyPilot VM Orchestrator if you need access to GPUs for your workloads, but don't want to deal with the complexities of managing cloud infrastructure or expensive managed solutions.
 
 {% hint style="warning" %}
-This component is only meant to be used within the context of a [remote ZenML deployment scenario](../../getting-started/deploying-zenml/README.md). Usage with a local ZenML deployment may lead to unexpected behavior!
-{% endhint %}
-
-{% hint style="warning" %}
-SkyPilot VM Orchestrator is currently supported only for Python 3.8 and 3.9.
+This component is only meant to be used within the context of a [remote ZenML deployment scenario](https://docs.zenml.io/getting-started/deploying-zenml/). Usage with a local ZenML deployment may lead to unexpected behavior!
 {% endhint %}
 
 ## When to use it
@@ -32,7 +28,7 @@ You can configure the SkyPilot VM Orchestrator to use a specific VM type, and re
 {% endhint %}
 
 {% hint style="warning" %}
-The SkyPilot VM Orchestrator does not currently support the ability to [schedule pipelines runs](../../how-to/build-pipelines/schedule-a-pipeline.md)
+The SkyPilot VM Orchestrator does not currently support the ability to [schedule pipelines runs](https://docs.zenml.io/user-guides/tutorial/managing-scheduled-pipelines)
 {% endhint %}
 
 {% hint style="info" %}
@@ -41,53 +37,42 @@ All ZenML pipeline runs are executed using Docker containers within the VMs prov
 
 ## How to deploy it
 
-You don't need to do anything special to deploy the SkyPilot VM Orchestrator. As the SkyPilot integration itself takes care of provisioning VMs, you can simply use the orchestrator as you would any other ZenML orchestrator. However, you will need to ensure that you have the appropriate permissions to provision VMs on your cloud provider of choice and to configure your SkyPilot orchestrator accordingly using the [service connectors](../../how-to/auth-management/service-connectors-guide.md) feature.
+You don't need to do anything special to deploy the SkyPilot VM Orchestrator. As the SkyPilot integration itself takes care of provisioning VMs, you can simply use the orchestrator as you would any other ZenML orchestrator. However, you will need to ensure that you have the appropriate permissions to provision VMs on your cloud provider of choice and to configure your SkyPilot orchestrator accordingly using the [service connectors](https://docs.zenml.io/how-to/infrastructure-deployment/auth-management/service-connectors-guide) feature.
 
 {% hint style="info" %}
-The SkyPilot VM Orchestrator currently only supports the AWS, GCP, and Azure cloud platforms.
+The SkyPilot VM Orchestrator currently only supports the AWS, GCP, Azure, Lambda Labs and Kubernetes platforms.
 {% endhint %}
 
 ## How to use it
 
 To use the SkyPilot VM Orchestrator, you need:
 
-*   One of the SkyPilot integrations installed. You can install the SkyPilot integration for your cloud provider of choice using the following command:
-
-    ```shell
-      # For AWS
-      pip install "zenml[connectors-aws]"
-      zenml integration install aws skypilot_aws 
-
-      # for GCP
-      pip install "zenml[connectors-gcp]"
-      zenml integration install gcp skypilot_gcp # for GCP
-
-      # for Azure
-      pip install "zenml[connectors-azure]"
-      zenml integration install azure skypilot_azure # for Azure
-    ```
 * [Docker](https://www.docker.com) installed and running.
-* A [remote artifact store](../artifact-stores/artifact-stores.md) as part of your stack.
-* A [remote container registry](../container-registries/container-registries.md) as part of your stack.
-* A [remote ZenML deployment](../../getting-started/deploying-zenml/README.md).
+* A [remote artifact store](https://docs.zenml.io/stacks/artifact-stores/) as part of your stack.
+* A [remote container registry](https://docs.zenml.io/stacks/container-registries/) as part of your stack.
+* A [remote ZenML deployment](https://docs.zenml.io/getting-started/deploying-zenml/).
 * The appropriate permissions to provision VMs on your cloud provider of choice.
-* A [service connector](../../how-to/auth-management/service-connectors-guide.md) configured to authenticate with your cloud provider of choice.
+* A [service connector](https://docs.zenml.io/how-to/infrastructure-deployment/auth-management/service-connectors-guide) configured to authenticate with your cloud provider of choice.
 
 {% tabs %}
 {% tab title="AWS" %}
-We need first to install the SkyPilot integration for AWS and the AWS connectors extra, using the following two commands:
+We need first to install the SkyPilot integration for AWS and the AWS connectors extra, using the following commands:
 
 ```shell
+  # Installs dependencies for Skypilot AWS, AWS Container Registry, and S3 Artifact Store
   pip install "zenml[connectors-aws]"
-  zenml integration install aws skypilot_aws 
+  zenml integration install aws skypilot_aws  # We recommend using the --uv option here
 ```
 
-To provision VMs on AWS, your VM Orchestrator stack component needs to be configured to authenticate with [AWS Service Connector](../../how-to/auth-management/aws-service-connector.md). To configure the AWS Service Connector, you need to register a new service connector configured with AWS credentials that have at least the minimum permissions required by SkyPilot as documented [here](https://skypilot.readthedocs.io/en/latest/cloud-setup/cloud-permissions/aws.html).
+To provision VMs on AWS, your VM Orchestrator stack component needs to be configured to authenticate with [AWS Service Connector](https://docs.zenml.io/how-to/infrastructure-deployment/auth-management/aws-service-connector). To configure the AWS Service Connector, you need to register a new service connector configured with AWS credentials that have at least the minimum permissions required by SkyPilot as documented [here](https://skypilot.readthedocs.io/en/latest/cloud-setup/cloud-permissions/aws.html).
 
 First, check that the AWS service connector type is available using the following command:
 
-```
+```shell
 zenml service-connector list-types --type aws
+```
+
+```shell
 ┏━━━━━━━━━━━━━━━━━━━━━━━┯━━━━━━━━┯━━━━━━━━━━━━━━━━━━━━━━━┯━━━━━━━━━━━━━━━━━━┯━━━━━━━┯━━━━━━━━┓
 ┃         NAME          │ TYPE   │ RESOURCE TYPES        │ AUTH METHODS     │ LOCAL │ REMOTE ┃
 ┠───────────────────────┼────────┼───────────────────────┼──────────────────┼───────┼────────┨
@@ -127,12 +112,15 @@ We need first to install the SkyPilot integration for GCP and the GCP extra for 
   zenml integration install gcp skypilot_gcp
 ```
 
-To provision VMs on GCP, your VM Orchestrator stack component needs to be configured to authenticate with [GCP Service Connector](../../how-to/auth-management/gcp-service-connector.md)
+To provision VMs on GCP, your VM Orchestrator stack component needs to be configured to authenticate with [GCP Service Connector](https://docs.zenml.io/how-to/infrastructure-deployment/auth-management/gcp-service-connector)
 
 To configure the GCP Service Connector, you need to register a new service connector, but first let's check the available service connectors types using the following command:
 
-```
+```shell
 zenml service-connector list-types --type gcp
+```
+
+```shell
 ┏━━━━━━━━━━━━━━━━━━━━━━━┯━━━━━━━━┯━━━━━━━━━━━━━━━━━━━━━━━┯━━━━━━━━━━━━━━━━━┯━━━━━━━┯━━━━━━━━┓
 ┃         NAME          │ TYPE   │ RESOURCE TYPES        │ AUTH METHODS    │ LOCAL │ REMOTE ┃
 ┠───────────────────────┼────────┼───────────────────────┼─────────────────┼───────┼────────┨
@@ -170,22 +158,51 @@ zenml orchestrator connect <ORCHESTRATOR_NAME> --connector gcp-skypilot-vm
 # Register and activate a stack with the new orchestrator
 zenml stack register <STACK_NAME> -o <ORCHESTRATOR_NAME> ... --set
 ```
+
+{% hint style="warning" %}
+If you are running a pipeline, where at least one step has different Skypilot settings than the pipeline, the orchestrator will try to run this step in a separate VM. In order to do this properly, you will need to provide it with a parent image through your DockerSettings where both `ZenML` and `gcloud` CLI is installed (currently not available in the default ZenML parent image).
+
+docker_settings = DockerSettings(parent_image="your/custom-image:with-zenml-and-gcloud")
+{% endhint %}
+
 {% endtab %}
 
 {% tab title="Azure" %}
-We need first to install the SkyPilot integration for Azure and the Azure extra for ZenML, using the following two commands
+We need first to install the SkyPilot integration for Azure and the extra requirements that are needed from additional Azure components, using the following two commands
+
+{% hint style="warning" %}
+Currently, the ZenML Skypilot integration is **pip-incompatible** with the ZenML Azure integration, therefore executing `zenml integration install azure skypilot_azure` will not work.
+
+Since working with a skypilot stack requires you to use a remote artifact store and container registry, please install the requirements of these components with pip to avoid any installation problems.
+{% endhint %}
 
 ```shell
-  pip install "zenml[connectors-azure]"
-  zenml integration install azure skypilot_azure 
+  pip install "zenml[connectors-azure]" adlfs azure-mgmt-containerservice azure-storage-blob
 ```
 
-To provision VMs on Azure, your VM Orchestrator stack component needs to be configured to authenticate with [Azure Service Connector](../../how-to/auth-management/azure-service-connector.md)
+{% hint style="warning" %}
+If you would like to use `uv` to install the stack requirements for an Azure Skypilot Stack, you need to use `python_package_installer_args={"prerelease": "allow"}`:
+
+```python
+docker_settings = DockerSettings(
+    python_package_installer_args={"prerelease": "allow"},
+)
+
+@pipeline(settings={"docker": docker_settings})
+def basic_pipeline():
+    ...
+```
+{% endhint %}
+
+To provision VMs on Azure, your VM Orchestrator stack component needs to be configured to authenticate with [Azure Service Connector](https://docs.zenml.io/how-to/infrastructure-deployment/auth-management/azure-service-connector)
 
 To configure the Azure Service Connector, you need to register a new service connector, but first let's check the available service connectors types using the following command:
 
-```
+```shell
 zenml service-connector list-types --type azure
+```
+
+```shell
 ┏━━━━━━━━━━━━━━━━━━━━━━━━━┯━━━━━━━━━━━┯━━━━━━━━━━━━━━━━━━━━━━━┯━━━━━━━━━━━━━━━━━━━┯━━━━━━━┯━━━━━━━━┓
 ┃          NAME           │ TYPE      │ RESOURCE TYPES        │ AUTH METHODS      │ LOCAL │ REMOTE ┃
 ┠─────────────────────────┼───────────┼───────────────────────┼───────────────────┼───────┼────────┨
@@ -211,7 +228,7 @@ zenml stack register <STACK_NAME> -o <ORCHESTRATOR_NAME> ... --set
 {% endtab %}
 
 {% tab title="Lambda Labs" %}
-[Lambda Labs](https://lambdalabs.com/service/gpu-cloud) is a cloud provider that offers GPU instances for machine learning workloads. Unlike the major cloud providers, with Lambda Labs we don't need to configure a service connector to authenticate with the cloud provider. Instead, we can directly use API keys to authenticate with the Lambda Labs API.
+Lambda Labs is a cloud provider that offers GPU instances for machine learning workloads. Unlike the major cloud providers, with Lambda Labs we don't need to configure a service connector to authenticate with the cloud provider. Instead, we can directly use API keys to authenticate with the Lambda Labs API.
 
 ```shell
   zenml integration install skypilot_lambda
@@ -236,6 +253,55 @@ The Lambda Labs orchestrator does not support some of the features like `job_rec
 While testing the orchestrator, we noticed that the Lambda Labs orchestrator does not support the `down` flag. This means the orchestrator will not automatically tear down the cluster after all jobs finish. We recommend manually tearing down the cluster after all jobs finish to avoid unnecessary costs.
 {% endhint %}
 {% endtab %}
+
+{% tab title="Kubernetes" %}
+We need first to install the SkyPilot integration for Kubernetes, using the following two commands:
+
+```shell
+  zenml integration install skypilot_kubernetes
+```
+
+To provision skypilot on kubernetes cluster, your orchestrator stack components needs to be configured to authenticate with a[Service Connector](https://docs.zenml.io/how-to/infrastructure-deployment/auth-management/service-connectors-guide). To configure the Service Connector, you need to register a new service connector configured with the appropriate credentials and permissions to access the K8s cluster. You can then use the service connector to configure your registered the Orchestrator stack component using the following command:
+
+First, check that the Kubernetes service connector type is available using the following command:
+
+```shell
+zenml service-connector list-types --type kubernetes
+```
+
+```shell
+┏━━━━━━━━━━━━┯━━━━━━━━━━━━┯━━━━━━━━━━━━┯━━━━━━━━━━━┯━━━━━━━┯━━━━━━━━┓
+┃            │            │ RESOURCE   │ AUTH      │       │        ┃
+┃    NAME    │ TYPE       │ TYPES      │ METHODS   │ LOCAL │ REMOTE ┃
+┠────────────┼────────────┼────────────┼───────────┼───────┼────────┨
+┃ Kubernetes │ 🌀         │ 🌀          │ password  │ ✅    │ ✅     ┃
+┃  Service   │ kubernetes │ kubernetes │ token     │       │        ┃
+┃ Connector  │            │ -cluster   │           │       │        ┃
+┗━━━━━━━━━━━━┷━━━━━━━━━━━━┷━━━━━━━━━━━━┷━━━━━━━━━━━┷━━━━━━━┷━━━━━━━━┛
+```
+
+Next, configure a service connector using the CLI or the dashboard with the AWS credentials. For example, the following command uses the local AWS CLI credentials to auto-configure the service connector:
+
+```shell
+zenml service-connector register kubernetes-skypilot --type kubernetes -i
+```
+
+This will automatically configure the service connector with the appropriate credentials and permissions to provision VMs on AWS. You can then use the service connector to configure your registered VM Orchestrator stack component using the following command:
+
+```shell
+# Register the orchestrator
+zenml orchestrator register <ORCHESTRATOR_NAME> --flavor sky_kubernetes
+# Connect the orchestrator to the service connector
+zenml orchestrator connect <ORCHESTRATOR_NAME> --connector kubernetes-skypilot
+
+# Register and activate a stack with the new orchestrator
+zenml stack register <STACK_NAME> -o <ORCHESTRATOR_NAME> ... --set
+```
+
+{% hint style="warning" %}
+Some of the features like `job_recovery`, `disk_tier`, `image_id`, `zone`, `idle_minutes_to_autostop`, `disk_size`, `use_spot` are not supported by the Kubernetes orchestrator. It is recommended not to use these features with the Kubernetes orchestrator and not to use [step-specific settings](skypilot-vm.md#configuring-step-specific-resources).
+{% endhint %}
+{% endtab %}
 {% endtabs %}
 
 #### Additional Configuration
@@ -248,7 +314,7 @@ For additional configuration of the Skypilot orchestrator, you can pass `Setting
 * `accelerators`: The accelerators required. If a string, must be a string of the form `'V100'` or `'V100:2'`, where the `:2` indicates that the task requires 2 V100 GPUs. If a dict, must be a dict of the form `{'V100': 2}` or `{'tpu-v2-8': 1}`.
 * `accelerator_args`: Accelerator-specific arguments. For example, `{'tpu_vm': True, 'runtime_version': 'tpu-vm-base'}` for TPUs.
 * `use_spot`: Whether to use spot instances. If None, defaults to False.
-* `job_recovery`: The spot recovery strategy to use for the managed spot to recover the cluster from preemption. Read more about the available strategies [here](https://skypilot.readthedocs.io/en/latest/reference/api.html?highlight=instance\_type#resources)
+* `job_recovery`: The spot recovery strategy to use for the managed spot to recover the cluster from preemption. Read more about the available strategies [here](https://skypilot.readthedocs.io/en/latest/reference/api.html?highlight=instance_type#resources)
 * `region`: The cloud region to use.
 * `zone`: The cloud zone to use within the region.
 * `image_id`: The image ID to use. If a string, must be a string of the image id from the cloud, such as AWS: `'ami-1234567890abcdef0'`, GCP: `'projects/my-project-id/global/images/my-image-name'`; Or, a image tag provided by SkyPilot, such as AWS: `'skypilot:gpu-ubuntu-2004'`. If a dict, must be a dict mapping from region to image ID.
@@ -260,6 +326,17 @@ For additional configuration of the Skypilot orchestrator, you can pass `Setting
 * `down`: Tear down the cluster after all jobs finish (successfully or abnormally). If `idle_minutes_to_autostop` is also set, the cluster will be torn down after the specified idle time. Note that if errors occur during provisioning/data syncing/setting up, the cluster will not be torn down for debugging purposes.
 * `stream_logs`: If True, show the logs in the terminal as they are generated while the cluster is running.
 * `docker_run_args`: Additional arguments to pass to the `docker run` command. For example, `['--gpus=all']` to use all GPUs available on the VM.
+* `ports`: Ports to expose. Could be an integer, a range, or a list of integers and ranges. All ports will be exposed to the public internet.
+* `labels`: Labels to apply to instances as key-value pairs. These are mapped to cloud-specific implementations (instance tags in AWS, instance labels in GCP, etc.).
+* `any_of`: List of candidate resources to try in order of preference based on cost (determined by the SkyPilot optimizer).
+* `ordered`: List of candidate resources to try in the specified order.
+* `workdir`: Working directory on the local machine to sync to the VM. This is synced to `~/sky_workdir` inside the VM.
+* `task_name`: Human-readable task name shown in SkyPilot for display purposes.
+* `file_mounts`: File and storage mounts configuration to make local or cloud storage paths available inside the remote cluster.
+* `envs`: Environment variables for the task. Accessible in the VMs that Skypilot launches, not in Docker continaers that the steps and pipeline is running on.
+* `task_settings`: Dictionary of arbitrary settings forwarded to `sky.Task()`. This allows passing future parameters added by SkyPilot without requiring updates to ZenML.
+* `resources_settings`: Dictionary of arbitrary settings forwarded to `sky.Resources()`. This allows passing future parameters added by SkyPilot without requiring updates to ZenML.
+* `launch_settings`: Dictionary of arbitrary settings forwarded to `sky.launch()`. This allows passing future parameters added by SkyPilot without requiring updates to ZenML.
 
 The following code snippets show how to configure the orchestrator settings for each cloud provider:
 
@@ -276,7 +353,10 @@ skypilot_settings = SkypilotAWSOrchestratorSettings(
     accelerators="V100:2",
     accelerator_args={"tpu_vm": True, "runtime_version": "tpu-vm-base"},
     use_spot=True,
-    job_recovery="recovery_strategy",
+    job_recovery={
+        "strategy": "failover",
+        "max_restarts_on_errors": 3,
+    },
     region="us-west-1",
     zone="us-west1-a",
     image_id="ami-1234567890abcdef0",
@@ -286,14 +366,14 @@ skypilot_settings = SkypilotAWSOrchestratorSettings(
     retry_until_up=True,
     idle_minutes_to_autostop=60,
     down=True,
-    stream_logs=True
+    stream_logs=True,
     docker_run_args=["--gpus=all"]
 )
 
 
 @pipeline(
     settings={
-        "orchestrator.vm_aws": skypilot_settings
+        "orchestrator": skypilot_settings
     }
 )
 ```
@@ -312,7 +392,10 @@ skypilot_settings = SkypilotGCPOrchestratorSettings(
     accelerators="V100:2",
     accelerator_args={"tpu_vm": True, "runtime_version": "tpu-vm-base"},
     use_spot=True,
-    job_recovery="recovery_strategy",
+    job_recovery={
+        "strategy": "failover",
+        "max_restarts_on_errors": 3,
+    },
     region="us-west1",
     zone="us-west1-a",
     image_id="ubuntu-pro-2004-focal-v20231101",
@@ -322,13 +405,14 @@ skypilot_settings = SkypilotGCPOrchestratorSettings(
     retry_until_up=True,
     idle_minutes_to_autostop=60,
     down=True,
-    stream_logs=True
+    stream_logs=True,
+    docker_run_args=["--gpus=all"]
 )
 
 
 @pipeline(
     settings={
-        "orchestrator.vm_gcp": skypilot_settings
+        "orchestrator": skypilot_settings
     }
 )
 ```
@@ -347,7 +431,10 @@ skypilot_settings = SkypilotAzureOrchestratorSettings(
     accelerators="V100:2",
     accelerator_args={"tpu_vm": True, "runtime_version": "tpu-vm-base"},
     use_spot=True,
-    job_recovery="recovery_strategy",
+    job_recovery={
+        "strategy": "failover",
+        "max_restarts_on_errors": 3,
+    },
     region="West Europe",
     image_id="Canonical:0001-com-ubuntu-server-jammy:22_04-lts-gen2:latest",
     disk_size=100,
@@ -356,13 +443,14 @@ skypilot_settings = SkypilotAzureOrchestratorSettings(
     retry_until_up=True,
     idle_minutes_to_autostop=60,
     down=True,
-    stream_logs=True
+    stream_logs=True,
+    docker_run_args=["--gpus=all"]
 )
 
 
 @pipeline(
     settings={
-        "orchestrator.vm_azure": skypilot_settings
+        "orchestrator": skypilot_settings
     }
 )
 ```
@@ -388,7 +476,34 @@ skypilot_settings = SkypilotLambdaOrchestratorSettings(
 
 @pipeline(
     settings={
-        "orchestrator.vm_lambda": skypilot_settings
+        "orchestrator": skypilot_settings
+    }
+)
+```
+{% endtab %}
+
+{% tab title="Kubernetes" %}
+**Code Example:**
+
+```python
+from zenml.integrations.skypilot_kubernetes.flavors.skypilot_orchestrator_kubernetes_vm_flavor import SkypilotKubernetesOrchestratorSettings
+
+skypilot_settings = SkypilotKubernetesOrchestratorSettings(
+    cpus="2",
+    memory="16",
+    accelerators="V100:2",
+    image_id="ami-1234567890abcdef0",
+    disk_size=100,
+    cluster_name="my_cluster",
+    retry_until_up=True,
+    stream_logs=True,
+    docker_run_args=["--gpus=all"]
+)
+
+
+@pipeline(
+    settings={
+        "orchestrator": skypilot_settings
     }
 )
 ```
@@ -401,7 +516,7 @@ One of the key features of the SkyPilot VM Orchestrator is the ability to run ea
 
 The SkyPilot VM Orchestrator allows you to configure resources for each step individually. This means you can specify different VM types, CPU and memory requirements, and even use spot instances for certain steps while using on-demand instances for others.
 
-If no step-specific settings are specified, the orchestrator will use the resources specified in the orchestrator settings for each step and run the entire pipeline in one VM. If step-specific settings are specified, an orchestrator VM will be spun up first, which will subsequently spin out new VMs dependant on the step settings. You can disable this behavior by setting the `disable_step_based_settings` parameter to `True` in the orchestrator configuration, using the following command:
+If no step-specific settings are specified, the orchestrator will use the resources specified in the orchestrator settings for each step and run the entire pipeline in one VM. If step-specific settings are specified, an orchestrator VM will be spun up first, which will subsequently spin out new VMs dependent on the step settings. You can disable this behavior by setting the `disable_step_based_settings` parameter to `True` in the orchestrator configuration, using the following command:
 
 ```shell
 zenml orchestrator update <ORCHESTRATOR_NAME> --disable_step_based_settings=True
@@ -422,18 +537,18 @@ high_resource_settings = SkypilotAWSOrchestratorSettings(
     # ... other settings
 )
 
-@step(settings={"orchestrator.vm_aws": high_resource_settings})
+@step(settings={"orchestrator": high_resource_settings})
 def my_resource_intensive_step():
     # Step implementation
     pass
 ```
 
 {% hint style="warning" %}
-When configuring pipeline or step-specific resources, you can use the `settings` parameter to specifically target the orchestrator flavor you want to use `orchestrator.STACK_COMPONENT_FLAVOR` and not orchestrator component name `orchestrator.STACK_COMPONENT_NAME`. For example, if you want to configure resources for the `vm_gcp` flavor, you can use `settings={"orchestrator.vm_gcp": ...}`.
+When configuring pipeline or step-specific resources, you can use the `settings` parameter to specifically target the orchestrator flavor you want to use `orchestrator.STACK_COMPONENT_FLAVOR` and not orchestrator component name `orchestrator.STACK_COMPONENT_NAME`. For example, if you want to configure resources for the `vm_gcp` flavor, you can use `settings={"orchestrator": ...}`.
 {% endhint %}
 
 By using the `settings` parameter, you can tailor the resources for each step according to its specific needs. This flexibility allows you to optimize your pipeline execution for both performance and cost.
 
-Check out the [SDK docs](https://sdkdocs.zenml.io/latest/integration\_code\_docs/integrations-skypilot/#zenml.integrations.skypilot.flavors.skypilot\_orchestrator\_base\_vm\_flavor.SkypilotBaseOrchestratorSettings) for a full list of available attributes and [this docs page](../../how-to/use-configuration-files/runtime-configuration.md) for more information on how to specify settings.
+Check out the [SDK docs](https://sdkdocs.zenml.io/latest/integration_code_docs/integrations-skypilot.html#zenml.integrations.skypilot) for a full list of available attributes and [this docs page](https://docs.zenml.io/concepts/steps_and_pipelines/configuration) for more information on how to specify settings.
 
 <figure><img src="https://static.scarf.sh/a.png?x-pxid=f0b4f458-0a54-4fcd-aa95-d5ee424815bc" alt="ZenML Scarf"><figcaption></figcaption></figure>

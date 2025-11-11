@@ -36,21 +36,6 @@ def test_stack_component_default_method_implementations(stub_component):
     assert stub_component.settings_class is None
     assert stub_component.requirements == set()
 
-    assert stub_component.is_provisioned is True
-    assert stub_component.is_running is True
-
-    with pytest.raises(NotImplementedError):
-        stub_component.provision()
-
-    with pytest.raises(NotImplementedError):
-        stub_component.deprovision()
-
-    with pytest.raises(NotImplementedError):
-        stub_component.resume()
-
-    with pytest.raises(NotImplementedError):
-        stub_component.suspend()
-
 
 def test_stack_component_dict_only_contains_public_attributes(
     stub_component_config,
@@ -73,14 +58,14 @@ def test_stack_component_public_attributes_are_immutable(
         stub_component_config._some_private_attribute_name = "Woof"
 
 
-def test_stack_component_prevents_extra_attributes(stub_component_config):
-    """Tests that passing extra attributes to a StackComponent fails."""
+def test_stack_component_allows_extra_attributes(stub_component_config):
+    """Tests that passing extra attributes to a StackComponent is allowed."""
     component_class = stub_component_config.__class__
 
     with does_not_raise():
         component_class(some_public_attribute_name="test")
 
-    with pytest.raises(ValidationError):
+    with does_not_raise():
         component_class(not_an_attribute_name="test")
 
 
@@ -98,9 +83,6 @@ class StubOrchestrator(BaseOrchestrator):
     @property
     def config(self) -> StubOrchestratorConfig:
         return self._config
-
-    def prepare_or_run_pipeline(self, **kwargs):
-        pass
 
     def get_orchestrator_run_id(self) -> str:
         return "some_run_id"
@@ -127,7 +109,6 @@ def _get_stub_orchestrator(name, repo=None, **kwargs) -> ComponentRequest:
         flavor="TEST",
         type=StackComponentType.ORCHESTRATOR,
         user=uuid4() if repo is None else repo.active_user.id,
-        workspace=uuid4() if repo is None else repo.active_workspace.id,
     )
 
 

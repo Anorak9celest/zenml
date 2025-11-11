@@ -15,11 +15,12 @@
 
 import base64
 import json
-from datetime import datetime
-from typing import TYPE_CHECKING, Any, List, Optional, cast
+from typing import TYPE_CHECKING, Any, List, Optional, Sequence, cast
 from uuid import UUID
 
-from sqlalchemy import TEXT, Column
+from sqlalchemy import TEXT, Column, UniqueConstraint
+from sqlalchemy.orm import joinedload
+from sqlalchemy.sql.base import ExecutableOption
 from sqlmodel import Field, Relationship
 
 from zenml import EventSourceResponseMetadata
@@ -32,11 +33,15 @@ from zenml.models import (
     Page,
 )
 from zenml.utils.json_utils import pydantic_encoder
+from zenml.utils.time_utils import utc_now
 from zenml.zen_stores.schemas.base_schemas import NamedSchema
+from zenml.zen_stores.schemas.project_schemas import ProjectSchema
 from zenml.zen_stores.schemas.schema_utils import build_foreign_key_field
 from zenml.zen_stores.schemas.user_schemas import UserSchema
-from zenml.zen_stores.schemas.utils import get_page_from_list
-from zenml.zen_stores.schemas.workspace_schemas import WorkspaceSchema
+from zenml.zen_stores.schemas.utils import (
+    get_page_from_list,
+    jl_arg,
+)
 
 if TYPE_CHECKING:
     from zenml.zen_stores.schemas import TriggerSchema
@@ -46,16 +51,23 @@ class EventSourceSchema(NamedSchema, table=True):
     """SQL Model for tag."""
 
     __tablename__ = "event_source"
+    __table_args__ = (
+        UniqueConstraint(
+            "name",
+            "project_id",
+            name="unique_event_source_name_in_project",
+        ),
+    )
 
-    workspace_id: UUID = build_foreign_key_field(
+    project_id: UUID = build_foreign_key_field(
         source=__tablename__,
-        target=WorkspaceSchema.__tablename__,
-        source_column="workspace_id",
+        target=ProjectSchema.__tablename__,
+        source_column="project_id",
         target_column="id",
         ondelete="CASCADE",
         nullable=False,
     )
-    workspace: "WorkspaceSchema" = Relationship(back_populates="event_sources")
+    project: "ProjectSchema" = Relationship(back_populates="event_sources")
 
     user_id: Optional[UUID] = build_foreign_key_field(
         source=__tablename__,
@@ -79,6 +91,37 @@ class EventSourceSchema(NamedSchema, table=True):
     is_active: bool = Field(nullable=False)
 
     @classmethod
+    def get_query_options(
+        cls,
+        include_metadata: bool = False,
+        include_resources: bool = False,
+        **kwargs: Any,
+    ) -> Sequence[ExecutableOption]:
+        """Get the query options for the schema.
+
+        Args:
+            include_metadata: Whether metadata will be included when converting
+                the schema to a model.
+            include_resources: Whether resources will be included when
+                converting the schema to a model.
+            **kwargs: Keyword arguments to allow schema specific logic
+
+        Returns:
+            A list of query options.
+        """
+        options = []
+
+        if include_resources:
+            options.extend(
+                [
+                    joinedload(jl_arg(EventSourceSchema.user)),
+                    # joinedload(jl_arg(EventSourceSchema.triggers)),
+                ]
+            )
+
+        return options
+
+    @classmethod
     def from_request(cls, request: EventSourceRequest) -> "EventSourceSchema":
         """Convert an `EventSourceRequest` to an `EventSourceSchema`.
 
@@ -89,7 +132,7 @@ class EventSourceSchema(NamedSchema, table=True):
             The converted schema.
         """
         return cls(
-            workspace_id=request.workspace,
+            project_id=request.project,
             user_id=request.user,
             flavor=request.flavor,
             plugin_subtype=request.plugin_subtype,
@@ -126,9 +169,10 @@ class EventSourceSchema(NamedSchema, table=True):
         from zenml.models import TriggerResponse
 
         body = EventSourceResponseBody(
+            user_id=self.user_id,
+            project_id=self.project_id,
             created=self.created,
             updated=self.updated,
-            user=self.user.to_model() if self.user else None,
             flavor=self.flavor,
             plugin_subtype=self.plugin_subtype,
             is_active=self.is_active,
@@ -145,12 +189,12 @@ class EventSourceSchema(NamedSchema, table=True):
                 ),
             )
             resources = EventSourceResponseResources(
+                user=self.user.to_model() if self.user else None,
                 triggers=triggers,
             )
         metadata = None
         if include_metadata:
             metadata = EventSourceResponseMetadata(
-                workspace=self.workspace.to_model(),
                 description=self.description,
                 configuration=json.loads(
                     base64.b64decode(self.configuration).decode()
@@ -184,5 +228,5 @@ class EventSourceSchema(NamedSchema, table=True):
                 )
             else:
                 setattr(self, field, value)
-        self.updated = datetime.utcnow()
+        self.updated = utc_now()
         return self

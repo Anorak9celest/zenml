@@ -14,45 +14,65 @@
 """SQL Model Implementations for Pipeline Schedules."""
 
 from datetime import datetime, timedelta
-from typing import TYPE_CHECKING, Any, Optional
+from typing import TYPE_CHECKING, Any, List, Optional, Sequence
 from uuid import UUID
 
+from sqlalchemy import UniqueConstraint
+from sqlalchemy.orm import joinedload
+from sqlalchemy.sql.base import ExecutableOption
 from sqlmodel import Field, Relationship
 
+from zenml.enums import MetadataResourceTypes
 from zenml.models import (
     ScheduleRequest,
     ScheduleResponse,
     ScheduleResponseBody,
     ScheduleResponseMetadata,
+    ScheduleResponseResources,
     ScheduleUpdate,
 )
+from zenml.utils.time_utils import utc_now
 from zenml.zen_stores.schemas.base_schemas import NamedSchema
 from zenml.zen_stores.schemas.component_schemas import StackComponentSchema
 from zenml.zen_stores.schemas.pipeline_schemas import PipelineSchema
+from zenml.zen_stores.schemas.project_schemas import ProjectSchema
 from zenml.zen_stores.schemas.schema_utils import build_foreign_key_field
 from zenml.zen_stores.schemas.user_schemas import UserSchema
-from zenml.zen_stores.schemas.workspace_schemas import WorkspaceSchema
+from zenml.zen_stores.schemas.utils import (
+    RunMetadataInterface,
+    jl_arg,
+)
 
 if TYPE_CHECKING:
-    from zenml.zen_stores.schemas.pipeline_deployment_schemas import (
-        PipelineDeploymentSchema,
+    from zenml.zen_stores.schemas.pipeline_snapshot_schemas import (
+        PipelineSnapshotSchema,
+    )
+    from zenml.zen_stores.schemas.run_metadata_schemas import (
+        RunMetadataSchema,
     )
 
 
-class ScheduleSchema(NamedSchema, table=True):
+class ScheduleSchema(NamedSchema, RunMetadataInterface, table=True):
     """SQL Model for schedules."""
 
     __tablename__ = "schedule"
+    __table_args__ = (
+        UniqueConstraint(
+            "name",
+            "project_id",
+            name="unique_schedule_name_in_project",
+        ),
+    )
 
-    workspace_id: UUID = build_foreign_key_field(
+    project_id: UUID = build_foreign_key_field(
         source=__tablename__,
-        target=WorkspaceSchema.__tablename__,
-        source_column="workspace_id",
+        target=ProjectSchema.__tablename__,
+        source_column="project_id",
         target_column="id",
         ondelete="CASCADE",
         nullable=False,
     )
-    workspace: "WorkspaceSchema" = Relationship(back_populates="schedules")
+    project: "ProjectSchema" = Relationship(back_populates="schedules")
 
     user_id: Optional[UUID] = build_foreign_key_field(
         source=__tablename__,
@@ -73,7 +93,7 @@ class ScheduleSchema(NamedSchema, table=True):
         nullable=True,
     )
     pipeline: "PipelineSchema" = Relationship(back_populates="schedules")
-    deployment: Optional["PipelineDeploymentSchema"] = Relationship(
+    snapshot: Optional["PipelineSnapshotSchema"] = Relationship(
         back_populates="schedule"
     )
 
@@ -89,6 +109,15 @@ class ScheduleSchema(NamedSchema, table=True):
         back_populates="schedules"
     )
 
+    run_metadata: List["RunMetadataSchema"] = Relationship(
+        sa_relationship_kwargs=dict(
+            secondary="run_metadata_resource",
+            primaryjoin=f"and_(foreign(RunMetadataResourceSchema.resource_type)=='{MetadataResourceTypes.SCHEDULE.value}', foreign(RunMetadataResourceSchema.resource_id)==ScheduleSchema.id)",
+            secondaryjoin="RunMetadataSchema.id==foreign(RunMetadataResourceSchema.run_metadata_id)",
+            overlaps="run_metadata",
+        ),
+    )
+
     active: bool
     cron_expression: Optional[str] = Field(nullable=True)
     start_time: Optional[datetime] = Field(nullable=True)
@@ -96,6 +125,39 @@ class ScheduleSchema(NamedSchema, table=True):
     interval_second: Optional[float] = Field(nullable=True)
     catchup: bool
     run_once_start_time: Optional[datetime] = Field(nullable=True)
+
+    @classmethod
+    def get_query_options(
+        cls,
+        include_metadata: bool = False,
+        include_resources: bool = False,
+        **kwargs: Any,
+    ) -> Sequence[ExecutableOption]:
+        """Get the query options for the schema.
+
+        Args:
+            include_metadata: Whether metadata will be included when converting
+                the schema to a model.
+            include_resources: Whether resources will be included when
+                converting the schema to a model.
+            **kwargs: Keyword arguments to allow schema specific logic
+
+        Returns:
+            A list of query options.
+        """
+        options = []
+
+        # if include_metadata:
+        #     options.extend(
+        #         [
+        #             joinedload(jl_arg(ScheduleSchema.run_metadata)),
+        #         ]
+        #     )
+
+        if include_resources:
+            options.extend([joinedload(jl_arg(ScheduleSchema.user))])
+
+        return options
 
     @classmethod
     def from_request(
@@ -115,7 +177,7 @@ class ScheduleSchema(NamedSchema, table=True):
             interval_second = None
         return cls(
             name=schedule_request.name,
-            workspace_id=schedule_request.workspace,
+            project_id=schedule_request.project,
             user_id=schedule_request.user,
             pipeline_id=schedule_request.pipeline_id,
             orchestrator_id=schedule_request.orchestrator_id,
@@ -139,21 +201,11 @@ class ScheduleSchema(NamedSchema, table=True):
         """
         if schedule_update.name is not None:
             self.name = schedule_update.name
-        if schedule_update.active is not None:
-            self.active = schedule_update.active
-        if schedule_update.cron_expression is not None:
+
+        if schedule_update.cron_expression:
             self.cron_expression = schedule_update.cron_expression
-        if schedule_update.start_time is not None:
-            self.start_time = schedule_update.start_time
-        if schedule_update.end_time is not None:
-            self.end_time = schedule_update.end_time
-        if schedule_update.interval_second is not None:
-            self.interval_second = (
-                schedule_update.interval_second.total_seconds()
-            )
-        if schedule_update.catchup is not None:
-            self.catchup = schedule_update.catchup
-        self.updated = datetime.utcnow()
+
+        self.updated = utc_now()
         return self
 
     def to_model(
@@ -179,7 +231,8 @@ class ScheduleSchema(NamedSchema, table=True):
             interval_second = None
 
         body = ScheduleResponseBody(
-            user=self.user.to_model() if self.user else None,
+            user_id=self.user_id,
+            project_id=self.project_id,
             active=self.active,
             cron_expression=self.cron_expression,
             start_time=self.start_time,
@@ -193,9 +246,15 @@ class ScheduleSchema(NamedSchema, table=True):
         metadata = None
         if include_metadata:
             metadata = ScheduleResponseMetadata(
-                workspace=self.workspace.to_model(),
                 pipeline_id=self.pipeline_id,
                 orchestrator_id=self.orchestrator_id,
+                run_metadata=self.fetch_metadata(),
+            )
+
+        resources = None
+        if include_resources:
+            resources = ScheduleResponseResources(
+                user=self.user.to_model() if self.user else None,
             )
 
         return ScheduleResponse(
@@ -203,4 +262,5 @@ class ScheduleSchema(NamedSchema, table=True):
             name=self.name,
             body=body,
             metadata=metadata,
+            resources=resources,
         )

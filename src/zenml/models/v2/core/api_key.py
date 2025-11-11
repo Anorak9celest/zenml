@@ -17,7 +17,6 @@ from datetime import datetime, timedelta
 from typing import TYPE_CHECKING, ClassVar, List, Optional, Type, Union
 from uuid import UUID
 
-from passlib.context import CryptContext
 from pydantic import BaseModel, Field
 
 from zenml.constants import (
@@ -35,6 +34,7 @@ from zenml.models.v2.base.base import (
 )
 from zenml.models.v2.base.filter import AnyQuery, BaseFilter
 from zenml.utils.string_utils import b64_decode, b64_encode
+from zenml.utils.time_utils import utc_now
 
 if TYPE_CHECKING:
     from zenml.models.v2.base.filter import AnySchema
@@ -96,7 +96,7 @@ class APIKeyRequest(BaseRequest):
     )
 
 
-class APIKeyRotateRequest(BaseModel):
+class APIKeyRotateRequest(BaseRequest):
     """Request model for API key rotation."""
 
     retain_period_minutes: int = Field(
@@ -301,6 +301,8 @@ class APIKeyInternalResponse(APIKeyResponse):
         Returns:
             True if the keys match.
         """
+        from passlib.context import CryptContext
+
         # even when the hashed key is not set, we still want to execute
         # the hash verification to protect against response discrepancy
         # attacks (https://cwe.mitre.org/data/definitions/204.html)
@@ -319,7 +321,9 @@ class APIKeyInternalResponse(APIKeyResponse):
             and self.retain_period_minutes > 0
         ):
             # check if the previous key is still valid
-            if datetime.utcnow() - self.last_rotated < timedelta(
+            if utc_now(
+                tz_aware=self.last_rotated
+            ) - self.last_rotated < timedelta(
                 minutes=self.retain_period_minutes
             ):
                 key_hash = self.previous_key

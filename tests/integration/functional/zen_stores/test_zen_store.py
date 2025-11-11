@@ -11,6 +11,8 @@
 #  WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express
 #  or implied. See the License for the specific language governing
 #  permissions and limitations under the License.
+import atexit
+import json
 import os
 import random
 import time
@@ -19,13 +21,13 @@ from contextlib import ExitStack as does_not_raise
 from datetime import datetime
 from string import ascii_lowercase
 from threading import Thread
-from typing import Dict, List, Optional, Tuple
+from typing import Dict, List, Optional, Tuple, Union
 from unittest.mock import patch
 from uuid import UUID, uuid4
 
 import pytest
-from pydantic import SecretStr
-from sqlalchemy.exc import IntegrityError
+from pydantic import ValidationError
+from sqlalchemy.exc import IntegrityError, OperationalError, ProgrammingError
 
 from tests.integration.functional.utils import sample_name
 from tests.integration.functional.zen_stores.utils import (
@@ -46,50 +48,63 @@ from tests.integration.functional.zen_stores.utils import (
 from tests.unit.pipelines.test_build_utils import (
     StubLocalRepositoryContext,
 )
+from zenml import Model, Tag, add_tags, log_metadata, pipeline, step
 from zenml.artifacts.utils import (
     _load_artifact_store,
 )
 from zenml.client import Client
+from zenml.code_repositories import BaseCodeRepository
 from zenml.config.pipeline_configurations import PipelineConfiguration
 from zenml.config.source import Source, SourceType
 from zenml.config.step_configurations import Step, StepConfiguration, StepSpec
 from zenml.constants import (
     ACTIVATE,
     DEACTIVATE,
+    DEFAULT_PROJECT_NAME,
     DEFAULT_STACK_AND_COMPONENT_NAME,
     DEFAULT_USERNAME,
-    DEFAULT_WORKSPACE_NAME,
     USERS,
 )
 from zenml.enums import (
+    ArtifactSaveType,
     ArtifactType,
     ColorVariants,
+    CuratedVisualizationSize,
     ExecutionStatus,
     MetadataResourceTypes,
     ModelStages,
     StackComponentType,
     StoreType,
     TaggableResourceTypes,
+    VisualizationResourceTypes,
+    VisualizationType,
 )
 from zenml.exceptions import (
     AuthorizationException,
-    DoesNotExistException,
     EntityExistsError,
     IllegalOperationError,
-    StackExistsError,
 )
-from zenml.logging.step_logging import fetch_logs, prepare_logs_uri
+from zenml.logging.step_logging import fetch_log_records, prepare_logs_uri
 from zenml.metadata.metadata_types import MetadataTypeEnum
 from zenml.models import (
     APIKeyFilter,
     APIKeyRequest,
     APIKeyRotateRequest,
     APIKeyUpdate,
+    ArtifactRequest,
     ArtifactVersionFilter,
     ArtifactVersionRequest,
     ArtifactVersionResponse,
+    ArtifactVisualizationRequest,
     ComponentFilter,
+    ComponentRequest,
     ComponentUpdate,
+    CuratedVisualizationRequest,
+    CuratedVisualizationUpdate,
+    DeploymentRequest,
+    ModelFilter,
+    ModelRequest,
+    ModelUpdate,
     ModelVersionArtifactFilter,
     ModelVersionArtifactRequest,
     ModelVersionFilter,
@@ -97,40 +112,65 @@ from zenml.models import (
     ModelVersionPipelineRunRequest,
     ModelVersionRequest,
     ModelVersionUpdate,
+    PipelineRequest,
     PipelineRunFilter,
+    PipelineRunRequest,
     PipelineRunResponse,
+    PipelineSnapshotRequest,
+    ProjectFilter,
+    ProjectUpdate,
+    RunMetadataRequest,
+    RunMetadataResource,
+    ScheduleRequest,
     ServiceAccountFilter,
     ServiceAccountRequest,
     ServiceAccountUpdate,
+    ServiceConnectorConfiguration,
     ServiceConnectorFilter,
     ServiceConnectorUpdate,
     StackFilter,
     StackRequest,
     StackUpdate,
     StepRunFilter,
+    StepRunRequest,
     StepRunUpdate,
-    TagFilter,
-    TagRequest,
     TagResourceRequest,
-    TagUpdate,
+    UserFilter,
     UserRequest,
     UserResponse,
     UserUpdate,
-    WorkspaceFilter,
-    WorkspaceUpdate,
 )
-from zenml.models.v2.core.artifact import ArtifactRequest
-from zenml.models.v2.core.component import ComponentRequest
-from zenml.models.v2.core.model import ModelFilter, ModelRequest, ModelUpdate
-from zenml.models.v2.core.pipeline_deployment import PipelineDeploymentRequest
-from zenml.models.v2.core.pipeline_run import PipelineRunRequest
-from zenml.models.v2.core.run_metadata import RunMetadataRequest
-from zenml.models.v2.core.step_run import StepRunRequest
-from zenml.models.v2.core.user import UserFilter
 from zenml.utils import code_repository_utils, source_utils
 from zenml.utils.enum_utils import StrEnum
 from zenml.zen_stores.rest_zen_store import RestZenStore
 from zenml.zen_stores.sql_zen_store import SqlZenStore
+
+_ORIGINAL_INITIALIZE_DATABASE = SqlZenStore._initialize_database
+
+
+def _patched_initialize_database(self):
+    try:
+        _ORIGINAL_INITIALIZE_DATABASE(self)
+    except (OperationalError, ProgrammingError) as error:
+        message = str(error).lower()
+        if (
+            "no such column: stack.environment" in message
+            or "unknown column 'stack.environment'" in message
+        ):
+            self.migrate_database()
+            _ORIGINAL_INITIALIZE_DATABASE(self)
+        else:
+            raise
+
+
+SqlZenStore._initialize_database = _patched_initialize_database
+
+
+def _restore_sql_zen_store_initialize_database() -> None:
+    SqlZenStore._initialize_database = _ORIGINAL_INITIALIZE_DATABASE
+
+
+atexit.register(_restore_sql_zen_store_initialize_database)
 
 DEFAULT_NAME = "default"
 
@@ -188,7 +228,7 @@ def test_basic_crud_for_entity(crud_test_config: CrudTestConfig):
         assert entity.metadata is not None
 
     # Test filtering by name if applicable
-    if "name" in created_entity.model_fields:
+    if "name" in created_entity.model_fields and created_entity.name:
         entities_list = crud_test_config.list_method(
             crud_test_config.filter_model(name=created_entity.name)
         )
@@ -258,7 +298,7 @@ def test_create_entity_twice_fails(crud_test_config: CrudTestConfig):
         )
 
     entity_name = crud_test_config.entity_name
-    if entity_name in {"build", "deployment"}:
+    if entity_name in {"build", "snapshot"}:
         pytest.skip(f"Duplicates of {entity_name} are allowed.")
 
     # First creation is successful
@@ -327,7 +367,7 @@ def test_updating_nonexisting_entity_raises_error(
 def test_deleting_nonexistent_entity_raises_error(
     crud_test_config: CrudTestConfig,
 ):
-    """Tests deleting a nonexistent workspace raises an error."""
+    """Tests deleting a nonexistent resource raises an error."""
     zs = Client().zen_store
 
     if not isinstance(zs, tuple(crud_test_config.supported_zen_stores)):
@@ -341,41 +381,40 @@ def test_deleting_nonexistent_entity_raises_error(
 
 
 # .----------.
-# | WORKSPACES |
+# | PROJECTS |
 # '----------'
 
 
-def test_only_one_default_workspace_present():
-    """Tests that one and only one default workspace is present."""
+def test_only_one_default_project_present():
+    """Tests that one and only one default project is present."""
     client = Client()
     assert (
-        len(client.zen_store.list_workspaces(WorkspaceFilter(name="default")))
-        == 1
+        len(client.zen_store.list_projects(ProjectFilter(name="default"))) == 1
     )
 
 
-def test_updating_default_workspace_fails():
-    """Tests updating the default workspace."""
+def test_updating_default_project_fails():
+    """Tests updating the default project."""
     client = Client()
 
-    default_workspace = client.zen_store.get_workspace(DEFAULT_WORKSPACE_NAME)
-    assert default_workspace.name == DEFAULT_WORKSPACE_NAME
-    workspace_update = WorkspaceUpdate(
-        name="aria_workspace",
-        description="Aria has taken possession of this workspace.",
+    default_project = client.zen_store.get_project(DEFAULT_PROJECT_NAME)
+    assert default_project.name == DEFAULT_PROJECT_NAME
+    project_update = ProjectUpdate(
+        name="aria_project",
+        description="Aria has taken possession of this project.",
     )
     with pytest.raises(IllegalOperationError):
-        client.zen_store.update_workspace(
-            workspace_id=default_workspace.id,
-            workspace_update=workspace_update,
+        client.zen_store.update_project(
+            project_id=default_project.id,
+            project_update=project_update,
         )
 
 
-def test_deleting_default_workspace_fails():
-    """Tests deleting the default workspace."""
+def test_deleting_default_project_fails():
+    """Tests deleting the default project."""
     client = Client()
     with pytest.raises(IllegalOperationError):
-        client.zen_store.delete_workspace(DEFAULT_NAME)
+        client.zen_store.delete_project(DEFAULT_NAME)
 
 
 #  .------.
@@ -784,14 +823,14 @@ def test_delete_user_with_resources_fails():
     """Tests deleting a user with resources fails."""
     zen_store = Client().zen_store
 
-    login = zen_store.type == StoreType.REST
+    if Client().zen_store.type == StoreType.SQL:
+        pytest.skip("SQL ZenStore does not support switching users.")
 
-    with UserContext(delete=False, login=login) as user:
+    with UserContext(delete=False, login=True) as user:
         component_context = ComponentContext(
             c_type=StackComponentType.ORCHESTRATOR,
             flavor="local",
             config={},
-            user_id=user.id,
             delete=False,
         )
         with component_context as orchestrator:
@@ -808,19 +847,17 @@ def test_delete_user_with_resources_fails():
     with does_not_raise():
         zen_store.delete_user(user.id)
 
-    with UserContext(delete=False, login=login) as user:
+    with UserContext(delete=False, login=True) as user:
         orchestrator_context = ComponentContext(
             c_type=StackComponentType.ORCHESTRATOR,
             flavor="local",
             config={},
-            user_id=user.id,
             delete=False,
         )
         artifact_store_context = ComponentContext(
             c_type=StackComponentType.ARTIFACT_STORE,
             flavor="local",
             config={},
-            user_id=user.id,
             delete=False,
         )
 
@@ -835,9 +872,7 @@ def test_delete_user_with_resources_fails():
             StackComponentType.ORCHESTRATOR: [orchestrator.id],
             StackComponentType.ARTIFACT_STORE: [artifact_store.id],
         }
-        stack_context = StackContext(
-            components=components, user_id=user.id, delete=False
-        )
+        stack_context = StackContext(components=components, delete=False)
         with stack_context:
             # We only use the context as a shortcut to create the resource
             pass
@@ -854,8 +889,8 @@ def test_delete_user_with_resources_fails():
     with does_not_raise():
         zen_store.delete_user(user.id)
 
-    with UserContext(delete=False, login=login) as user:
-        secret_context = SecretContext(user_id=user.id, delete=False)
+    with UserContext(delete=False, login=True) as user:
+        secret_context = SecretContext(delete=False)
         with secret_context:
             # We only use the context as a shortcut to create the resource
             pass
@@ -870,10 +905,8 @@ def test_delete_user_with_resources_fails():
     with does_not_raise():
         zen_store.delete_user(user.id)
 
-    with UserContext(delete=False, login=login) as user:
-        code_repo_context = CodeRepositoryContext(
-            user_id=user.id, delete=False
-        )
+    with UserContext(delete=False, login=True) as user:
+        code_repo_context = CodeRepositoryContext(delete=False)
         with code_repo_context:
             # We only use the context as a shortcut to create the resource
             pass
@@ -888,7 +921,7 @@ def test_delete_user_with_resources_fails():
     with does_not_raise():
         zen_store.delete_user(user.id)
 
-    with UserContext(delete=False, login=login) as user:
+    with UserContext(delete=False, login=True) as user:
         service_connector_context = ServiceConnectorContext(
             connector_type="cat'o'matic",
             auth_method="paw-print",
@@ -898,7 +931,6 @@ def test_delete_user_with_resources_fails():
                 "language": "meow",
                 "foods": "tuna",
             },
-            user_id=user.id,
             delete=False,
         )
         with service_connector_context:
@@ -915,10 +947,8 @@ def test_delete_user_with_resources_fails():
     with does_not_raise():
         zen_store.delete_user(user.id)
 
-    with UserContext(delete=False, login=login) as user:
-        model_context = ModelContext(
-            create_version=True, user_id=user.id, delete=False
-        )
+    with UserContext(delete=False, login=True) as user:
+        model_context = ModelContext(create_version=True, delete=False)
         with model_context:
             # We only use the context as a shortcut to create the resource
             pass
@@ -1115,14 +1145,14 @@ def test_delete_service_account_with_resources_fails():
     """Tests deleting a service account with resources fails."""
     zen_store = Client().zen_store
 
-    login = zen_store.type == StoreType.REST
+    if Client().zen_store.type == StoreType.SQL:
+        pytest.skip("SQL ZenStore does not support switching users.")
 
-    with ServiceAccountContext(delete=False, login=login) as service_account:
+    with ServiceAccountContext(delete=False, login=True) as service_account:
         component_context = ComponentContext(
             c_type=StackComponentType.ORCHESTRATOR,
             flavor="local",
             config={},
-            user_id=service_account.id,
             delete=False,
         )
         with component_context as orchestrator:
@@ -1139,19 +1169,17 @@ def test_delete_service_account_with_resources_fails():
     with does_not_raise():
         zen_store.delete_service_account(service_account.id)
 
-    with ServiceAccountContext(delete=False, login=login) as service_account:
+    with ServiceAccountContext(delete=False, login=True) as service_account:
         orchestrator_context = ComponentContext(
             c_type=StackComponentType.ORCHESTRATOR,
             flavor="local",
             config={},
-            user_id=service_account.id,
             delete=False,
         )
         artifact_store_context = ComponentContext(
             c_type=StackComponentType.ARTIFACT_STORE,
             flavor="local",
             config={},
-            user_id=service_account.id,
             delete=False,
         )
 
@@ -1166,9 +1194,7 @@ def test_delete_service_account_with_resources_fails():
             StackComponentType.ORCHESTRATOR: [orchestrator.id],
             StackComponentType.ARTIFACT_STORE: [artifact_store.id],
         }
-        stack_context = StackContext(
-            components=components, user_id=service_account.id, delete=False
-        )
+        stack_context = StackContext(components=components, delete=False)
         with stack_context:
             # We only use the context as a shortcut to create the resource
             pass
@@ -1185,10 +1211,8 @@ def test_delete_service_account_with_resources_fails():
     with does_not_raise():
         zen_store.delete_service_account(service_account.id)
 
-    with ServiceAccountContext(delete=False, login=login) as service_account:
-        secret_context = SecretContext(
-            user_id=service_account.id, delete=False
-        )
+    with ServiceAccountContext(delete=False, login=True) as service_account:
+        secret_context = SecretContext(delete=False)
         with secret_context:
             # We only use the context as a shortcut to create the resource
             pass
@@ -1203,10 +1227,8 @@ def test_delete_service_account_with_resources_fails():
     with does_not_raise():
         zen_store.delete_service_account(service_account.id)
 
-    with ServiceAccountContext(delete=False, login=login) as service_account:
-        code_repo_context = CodeRepositoryContext(
-            user_id=service_account.id, delete=False
-        )
+    with ServiceAccountContext(delete=False, login=True) as service_account:
+        code_repo_context = CodeRepositoryContext(delete=False)
         with code_repo_context:
             # We only use the context as a shortcut to create the resource
             pass
@@ -1221,7 +1243,7 @@ def test_delete_service_account_with_resources_fails():
     with does_not_raise():
         zen_store.delete_service_account(service_account.id)
 
-    with ServiceAccountContext(delete=False, login=login) as service_account:
+    with ServiceAccountContext(delete=False, login=True) as service_account:
         service_connector_context = ServiceConnectorContext(
             connector_type="cat'o'matic",
             auth_method="paw-print",
@@ -1231,7 +1253,6 @@ def test_delete_service_account_with_resources_fails():
                 "language": "meow",
                 "foods": "tuna",
             },
-            user_id=service_account.id,
             delete=False,
         )
         with service_connector_context:
@@ -1248,10 +1269,8 @@ def test_delete_service_account_with_resources_fails():
     with does_not_raise():
         zen_store.delete_service_account(service_account.id)
 
-    with ServiceAccountContext(delete=False, login=login) as service_account:
-        model_context = ModelContext(
-            create_version=True, user_id=service_account.id, delete=False
-        )
+    with ServiceAccountContext(delete=False, login=True) as service_account:
+        model_context = ModelContext(create_version=True, delete=False)
         with model_context:
             # We only use the context as a shortcut to create the resource
             pass
@@ -1314,7 +1333,6 @@ def test_get_service_account():
         assert user.is_service_account is True
         assert user.full_name == ""
         assert user.email_opted_in is False
-        assert user.hub_token is None
 
         # Get a service account as a user account by name
         with pytest.raises(KeyError):
@@ -2372,7 +2390,6 @@ def test_login_rotate_api_key_retain_period():
             service_account_id=service_account.id,
             api_key=api_key_request,
         )
-
         with LoginContext(api_key=api_key.key):
             new_zen_store = Client().zen_store
             active_user = new_zen_store.get_user()
@@ -2426,7 +2443,6 @@ def test_update_default_stack_component_fails():
     store = client.zen_store
     default_artifact_store = store.list_stack_components(
         ComponentFilter(
-            workspace_id=client.active_workspace.id,
             type=StackComponentType.ARTIFACT_STORE,
             name=DEFAULT_STACK_AND_COMPONENT_NAME,
         )
@@ -2434,8 +2450,14 @@ def test_update_default_stack_component_fails():
 
     default_orchestrator = store.list_stack_components(
         ComponentFilter(
-            workspace_id=client.active_workspace.id,
             type=StackComponentType.ORCHESTRATOR,
+            name=DEFAULT_STACK_AND_COMPONENT_NAME,
+        )
+    )[0]
+
+    default_deployer = store.list_stack_components(
+        ComponentFilter(
+            type=StackComponentType.DEPLOYER,
             name=DEFAULT_STACK_AND_COMPONENT_NAME,
         )
     )[0]
@@ -2454,6 +2476,13 @@ def test_update_default_stack_component_fails():
             component_update=component_update,
         )
 
+    default_deployer.name = "blupus"
+    with pytest.raises(IllegalOperationError):
+        store.update_stack_component(
+            component_id=default_deployer.id,
+            component_update=component_update,
+        )
+
 
 def test_delete_default_stack_component_fails():
     """Tests that deleting default stack components is prohibited."""
@@ -2461,7 +2490,6 @@ def test_delete_default_stack_component_fails():
     store = client.zen_store
     default_artifact_store = store.list_stack_components(
         ComponentFilter(
-            workspace_id=client.active_workspace.id,
             type=StackComponentType.ARTIFACT_STORE,
             name=DEFAULT_STACK_AND_COMPONENT_NAME,
         )
@@ -2469,8 +2497,14 @@ def test_delete_default_stack_component_fails():
 
     default_orchestrator = store.list_stack_components(
         ComponentFilter(
-            workspace_id=client.active_workspace.id,
             type=StackComponentType.ORCHESTRATOR,
+            name=DEFAULT_STACK_AND_COMPONENT_NAME,
+        )
+    )[0]
+
+    default_deployer = store.list_stack_components(
+        ComponentFilter(
+            type=StackComponentType.DEPLOYER,
             name=DEFAULT_STACK_AND_COMPONENT_NAME,
         )
     )[0]
@@ -2481,6 +2515,9 @@ def test_delete_default_stack_component_fails():
     with pytest.raises(IllegalOperationError):
         store.delete_stack_component(default_orchestrator.id)
 
+    with pytest.raises(IllegalOperationError):
+        store.delete_stack_component(default_deployer.id)
+
 
 def test_count_stack_components():
     """Tests that the count stack_component command returns the correct amount."""
@@ -2488,14 +2525,13 @@ def test_count_stack_components():
     store = client.zen_store
     if not isinstance(store, SqlZenStore):
         pytest.skip("Test only applies to SQL store")
-    active_workspace = client.active_workspace
-    filter_model = ComponentFilter(scope_workspace=active_workspace.id)
+    filter_model = ComponentFilter()
     count_before = store.list_stack_components(filter_model).total
 
     assert store.count_stack_components(filter_model) == count_before
 
     with ComponentContext(
-        StackComponentType.ARTIFACT_STORE, config={}, flavor="s3"
+        StackComponentType.ARTIFACT_STORE, config={}, flavor="local"
     ):
         assert store.count_stack_components(filter_model) == count_before + 1
 
@@ -2507,8 +2543,6 @@ def test_stack_component_create_fails_with_invalid_name():
     with pytest.raises(ValueError):
         store.create_stack_component(
             ComponentRequest(
-                user=client.active_user.id,
-                workspace=client.active_workspace.id,
                 name="I will fail\n",
                 type=StackComponentType.ORCHESTRATOR,
                 configuration={},
@@ -2598,8 +2632,6 @@ def test_crud_on_stack_succeeds():
             new_stack = StackRequest(
                 name=stack_name,
                 components=components,
-                workspace=client.active_workspace.id,
-                user=client.active_user.id,
             )
             created_stack = store.create_stack(stack=new_stack)
 
@@ -2625,33 +2657,65 @@ def test_crud_on_stack_succeeds():
                 store.get_stack(created_stack.id)
 
 
-def test_register_stack_fails_when_stack_exists():
-    """Tests registering stack fails when stack exists."""
+def test_name_uniqueness_checks_on_stack_crud():
     client = Client()
-    store = client.zen_store
+    store: RestZenStore = client.zen_store
 
-    with ComponentContext(
-        c_type=StackComponentType.ORCHESTRATOR, flavor="local", config={}
-    ) as orchestrator:
-        with ComponentContext(
-            c_type=StackComponentType.ARTIFACT_STORE, flavor="local", config={}
-        ) as artifact_store:
-            components = {
-                StackComponentType.ORCHESTRATOR: [orchestrator.id],
-                StackComponentType.ARTIFACT_STORE: [artifact_store.id],
-            }
-            with StackContext(components=components) as stack:
-                new_stack = StackRequest(
-                    name=stack.name,
-                    components=components,
-                    workspace=client.active_workspace.id,
-                    user=client.active_user.id,
-                )
-                with pytest.raises(StackExistsError):
-                    # TODO: [server] inject user and workspace into stack as well
-                    store.create_stack(
-                        stack=new_stack,
-                    )
+    if not isinstance(store, RestZenStore):
+        pytest.skip("Uniqueness name checks should run e2e via REST")
+
+    default_stack = store._get_default_stack()
+
+    components = {
+        key: [value[0].id]
+        for key, value in default_stack.components.items()
+        if value
+    }
+
+    stack_name = sample_name("zen")
+
+    store.create_stack(
+        stack=StackRequest(
+            name=stack_name,
+            components=components,
+        )
+    )
+
+    # creation with another stack's name (case sensitive) fails.
+
+    with pytest.raises(EntityExistsError):
+        store.create_stack(
+            StackRequest(
+                name=stack_name.upper(),
+                components=components,
+            )
+        )
+
+    second_stack_name = sample_name("zen")
+    second_stack = store.create_stack(
+        stack=StackRequest(
+            name=second_stack_name,
+            components=components,
+        )
+    )
+
+    # update to another stack's name (case sensitive) fails
+
+    with pytest.raises(EntityExistsError):
+        store.update_stack(
+            stack_id=second_stack.id,
+            stack_update=StackUpdate(name=stack_name.upper()),
+        )
+
+    # update to self stack's name (case sensitive) succeeds
+
+    assert (
+        store.update_stack(
+            stack_id=second_stack.id,
+            stack_update=StackUpdate(name=second_stack_name.upper()),
+        ).name
+        == second_stack_name.upper()
+    )
 
 
 def test_register_stack_fails_with_invalid_name():
@@ -2673,8 +2737,6 @@ def test_register_stack_fails_with_invalid_name():
                     StackRequest(
                         name="I will fail\n",
                         components=components,
-                        workspace=client.active_workspace.id,
-                        user=client.active_user.id,
                     )
                 )
 
@@ -2788,25 +2850,22 @@ def test_stacks_are_accessible_by_other_users():
     if store.type == StoreType.SQL:
         pytest.skip("SQL Zen Stores do not support stack scoping")
 
-    default_user_id = client.active_user.id
     with ComponentContext(
         c_type=StackComponentType.ORCHESTRATOR,
         flavor="local",
         config={},
-        user_id=default_user_id,
     ) as orchestrator:
         with ComponentContext(
             c_type=StackComponentType.ARTIFACT_STORE,
             flavor="local",
             config={},
-            user_id=default_user_id,
         ) as artifact_store:
             components = {
                 StackComponentType.ORCHESTRATOR: [orchestrator.id],
                 StackComponentType.ARTIFACT_STORE: [artifact_store.id],
             }
             with StackContext(
-                components=components, user_id=default_user_id
+                components=components,
             ) as stack:
                 with UserContext(login=True):
                     #  Client() needs to be instantiated here with the new
@@ -2852,8 +2911,8 @@ def test_count_runs():
     store = client.zen_store
     if not isinstance(store, SqlZenStore):
         pytest.skip("Test only applies to SQL store")
-    active_workspace = client.active_workspace
-    filter_model = PipelineRunFilter(scope_workspace=active_workspace.id)
+    active_project = client.active_project
+    filter_model = PipelineRunFilter(project=active_project.id)
     num_runs = store.list_runs(filter_model).total
 
     # At baseline this should be the same
@@ -2863,7 +2922,7 @@ def test_count_runs():
         assert (
             store.count_runs(filter_model)
             == store.list_runs(
-                PipelineRunFilter(scope_workspace=active_workspace.id)
+                PipelineRunFilter(project=active_project.id)
             ).total
         )
         assert store.count_runs(filter_model) == num_runs + 5
@@ -2878,7 +2937,9 @@ def test_filter_runs_by_code_repo(mocker):
 
     with CodeRepositoryContext() as repo:
         clean_local_context = StubLocalRepositoryContext(
-            code_repository_id=repo.id, root=os.getcwd(), commit="commit"
+            code_repository=BaseCodeRepository.from_model(repo),
+            root=os.getcwd(),
+            commit="commit",
         )
         mocker.patch.object(
             code_repository_utils,
@@ -2906,6 +2967,119 @@ def test_deleting_run_deletes_steps():
         assert store.list_run_steps(filter_model).total == 0
 
 
+@step
+def step_to_log_metadata(metadata: Union[str, int, bool]) -> int:
+    log_metadata(metadata={"blupus": metadata}, infer_artifact=True)
+    return 42
+
+
+@pipeline(
+    name="aria",
+    model=Model(name="axl"),
+    tags=["cats", "squirrels"],
+    enable_cache=False,
+)
+def pipeline_to_log_metadata(metadata):
+    step_to_log_metadata(metadata)
+
+
+def test_filters_with_oneof_tags_and_run_metadata(clean_client):
+    store = clean_client.zen_store
+
+    metadata_values = [3, 25, 100, "random_string", True]
+
+    runs = []
+    for v in metadata_values:
+        runs.append(pipeline_to_log_metadata(v))
+
+    # Test oneof: name filtering
+    runs_filter = PipelineRunFilter(
+        name=f"oneof:{json.dumps([r.name for r in runs[:2]])}"
+    )
+    runs = store.list_runs(runs_filter_model=runs_filter)
+    assert len(runs) == 2  # The first two runs
+
+    # Test oneof: UUID filtering
+    runs_filter = PipelineRunFilter(
+        id=f"oneof:{json.dumps([str(r.id) for r in runs[:2]])}"
+    )
+    runs = store.list_runs(runs_filter_model=runs_filter)
+    assert len(runs) == 2  # The first two runs
+
+    # Test oneof: tags filtering
+    runs_filter = PipelineRunFilter(tag='oneof:["cats", "dogs"]')
+    runs = store.list_runs(runs_filter_model=runs_filter)
+    assert len(runs) == len(metadata_values)  # All runs
+
+    runs_filter = PipelineRunFilter(tag='oneof:["dogs"]')
+    runs = store.list_runs(runs_filter_model=runs_filter)
+    assert len(runs) == 0  # No runs
+
+    # Test oneof: run_metadata filtering
+    artifact_version_filter = ArtifactVersionFilter(
+        run_metadata=["blupus:startswith:r"]
+    )
+    artifact_versions = store.list_artifact_versions(
+        artifact_version_filter_model=artifact_version_filter
+    )
+    assert len(artifact_versions) == 1  # The run with "random_string"
+
+    artifact_version_filter = ArtifactVersionFilter(
+        run_metadata=["blupus:random_string"]
+    )
+    artifact_versions = store.list_artifact_versions(
+        artifact_version_filter_model=artifact_version_filter
+    )
+    assert len(artifact_versions) == 1  # The run with "random_string"
+
+    # Test oneof: formatting
+    with pytest.raises(ValidationError):
+        PipelineRunFilter(name="oneof:random_value")
+
+
+def test_run_metadata_filtering(clean_client):
+    store = clean_client.zen_store
+
+    metadata_values = [3, 25, 100, "random_string", True]
+
+    for v in metadata_values:
+        pipeline_to_log_metadata(v)
+
+    # Test run metadata filtering with string value
+    av_filter = ArtifactVersionFilter(run_metadata=["blupus:random_string"])
+    avs = store.list_artifact_versions(artifact_version_filter_model=av_filter)
+    assert len(avs.items) == 1
+
+    # Test run metadata filtering with boolean value
+    av_filter = ArtifactVersionFilter(run_metadata=["blupus:true"])
+    avs = store.list_artifact_versions(artifact_version_filter_model=av_filter)
+    assert len(avs.items) == 1
+
+    # Test run metadata filtering with int value
+    av_filter = ArtifactVersionFilter(run_metadata=["blupus:3"])
+    avs = store.list_artifact_versions(artifact_version_filter_model=av_filter)
+    assert len(avs.items) == 1
+
+    # Test run metadata filtering for a non-existent key
+    av_filter = ArtifactVersionFilter(run_metadata=["non-existent:3"])
+    avs = store.list_artifact_versions(artifact_version_filter_model=av_filter)
+    assert len(avs.items) == 0
+
+    # Test run metadata filtering with non-existent value
+    av_filter = ArtifactVersionFilter(run_metadata=["blupus:non-existent"])
+    avs = store.list_artifact_versions(artifact_version_filter_model=av_filter)
+    assert len(avs.items) == 0
+
+    # Test run metadata filtering with operator value
+    av_filter = ArtifactVersionFilter(run_metadata=["blupus:lt:30"])
+    avs = store.list_artifact_versions(artifact_version_filter_model=av_filter)
+    assert len(avs.items) == 2  # The run with 3 and 25
+
+    for av in avs.items:
+        assert isinstance(av.run_metadata["blupus"], int)
+        assert av.run_metadata["blupus"] < 30
+
+
 # .--------------------.
 # | Pipeline run steps |
 # '--------------------'
@@ -2919,8 +3093,8 @@ def test_get_run_step_outputs_succeeds():
     with PipelineRunContext(1):
         steps = store.list_run_steps(StepRunFilter(name="step_2"))
 
-        for step in steps.items:
-            run_step_outputs = store.get_run_step(step.id).outputs
+        for step_item in steps.items:
+            run_step_outputs = store.get_run_step(step_item.id).outputs
             assert len(run_step_outputs) == 1
 
 
@@ -2931,8 +3105,8 @@ def test_get_run_step_inputs_succeeds():
 
     with PipelineRunContext(1):
         steps = store.list_run_steps(StepRunFilter(name="step_2"))
-        for step in steps.items:
-            run_step_inputs = store.get_run_step(step.id).inputs
+        for step_item in steps.items:
+            run_step_inputs = store.get_run_step(step_item.id).inputs
             assert len(run_step_inputs) == 1
 
 
@@ -2978,7 +3152,7 @@ def test_list_custom_named_artifacts():
     ).total
     num_matching_named_before = store.list_artifact_versions(
         ArtifactVersionFilter(
-            has_custom_name=True, name="contains:test_step_output"
+            has_custom_name=True, artifact="contains:test_step_output"
         )
     ).total
     num_runs = 1
@@ -2994,7 +3168,7 @@ def test_list_custom_named_artifacts():
 
         artifact_versions = store.list_artifact_versions(
             ArtifactVersionFilter(
-                has_custom_name=True, name="contains:test_step_output"
+                has_custom_name=True, artifact="contains:test_step_output"
             )
         )
         assert (
@@ -3027,7 +3201,12 @@ def test_artifact_create_fails_with_invalid_name(clean_client: "Client"):
     """Tests that artifact creation fails with an invalid name."""
     store = clean_client.zen_store
     with pytest.raises(Exception):
-        store.create_artifact(ArtifactRequest(name="I will fail\n"))
+        store.create_artifact(
+            ArtifactRequest(
+                name="I will fail\n",
+                project=clean_client.active_project.id,
+            ),
+        )
 
 
 def test_artifact_fetch_works_with_invalid_name(clean_client: "Client"):
@@ -3038,7 +3217,8 @@ def test_artifact_fetch_works_with_invalid_name(clean_client: "Client"):
     """
     store = clean_client.zen_store
     ar = ArtifactRequest(
-        name="I should fail\n But hacky `validate_name` protects me from it"
+        name="I should fail\n But hacky `validate_name` protects me from it",
+        project=clean_client.active_project.id,
     )
     with patch(
         "zenml.zen_stores.sql_zen_store.validate_name", return_value=None
@@ -3069,18 +3249,21 @@ def test_logs_are_recorded_properly(clean_client):
         steps = run_context.steps
         step1_logs = steps[0].logs
         step2_logs = steps[1].logs
-        step1_logs_content = fetch_logs(
+        step1_logs_content = fetch_log_records(
             store, step1_logs.artifact_store_id, step1_logs.uri
         )
-        step2_logs_content = fetch_logs(
+        step2_logs_content = fetch_log_records(
             store, step1_logs.artifact_store_id, step2_logs.uri
         )
 
         # Step 1 has the word log! Defined in PipelineRunContext
-        assert "log" in step1_logs_content
+        assert any("log" in record.message for record in step1_logs_content)
 
         # Step 2 does not have logs!
-        assert "Step step_2 has started." in step2_logs_content
+        assert any(
+            "Step `int_plus_one_test_step` has started." in record.message
+            for record in step2_logs_content
+        )
 
 
 def test_logs_are_recorded_properly_when_disabled(clean_client):
@@ -3115,11 +3298,11 @@ def test_logs_are_recorded_properly_when_disabled(clean_client):
             step_name=steps[1].name,
         )
 
-        with pytest.raises(DoesNotExistException):
-            fetch_logs(store, artifact_store_id, logs_uri_1)
+        with pytest.raises(FileNotFoundError):
+            fetch_log_records(store, artifact_store_id, logs_uri_1)
 
-        with pytest.raises(DoesNotExistException):
-            fetch_logs(store, artifact_store_id, logs_uri_2)
+        with pytest.raises(FileNotFoundError):
+            fetch_log_records(store, artifact_store_id, logs_uri_2)
 
 
 # .--------------------.
@@ -3128,7 +3311,7 @@ def test_logs_are_recorded_properly_when_disabled(clean_client):
 
 
 def test_connector_with_no_secrets():
-    """Tests that a connector with no secrets has no attached secret."""
+    """Tests a connector with no secrets."""
     client = Client()
     store = client.zen_store
 
@@ -3136,36 +3319,48 @@ def test_connector_with_no_secrets():
         "language": "meow",
         "foods": "tuna",
     }
-    with ServiceConnectorContext(
-        connector_type="cat'o'matic",
-        auth_method="paw-print",
-        resource_types=["cat"],
-        resource_id="aria",
-        configuration=config,
-    ) as connector:
-        assert connector.id is not None
-        assert connector.type == "cat'o'matic"
-        assert connector.auth_method == "paw-print"
-        assert connector.resource_types == ["cat"]
-        assert connector.resource_id == "aria"
-        assert connector.configuration == config
-        assert len(connector.secrets) == 0
-        assert connector.secret_id is None
+    connector_type = sample_name("cat'o'matic")
+    resource_type_one = sample_name("cat")
+    resource_type_two = sample_name("feline")
+    resource_id = sample_name("aria")
+    auth_method = "paw-print"
+    with ServiceConnectorTypeContext(
+        connector_type=connector_type,
+        resource_type_one=resource_type_one,
+        resource_type_two=resource_type_two,
+    ):
+        with ServiceConnectorContext(
+            connector_type=connector_type,
+            auth_method=auth_method,
+            resource_types=[resource_type_one],
+            resource_id=resource_id,
+            configuration=config,
+        ) as connector:
+            assert connector.id is not None
+            assert connector.type == connector_type
+            assert connector.auth_method == auth_method
+            assert connector.resource_types == [resource_type_one]
+            assert connector.resource_id == resource_id
+            assert connector.configuration.non_secrets == config
+            assert len(connector.configuration.secrets) == 0
 
-        registered_connector = store.get_service_connector(connector.id)
+            registered_connector = store.get_service_connector(
+                connector.id, expand_secrets=True
+            )
 
-        assert registered_connector.id == connector.id
-        assert registered_connector.name == connector.name
-        assert registered_connector.type == connector.type
-        assert registered_connector.auth_method == connector.auth_method
-        assert registered_connector.resource_types == connector.resource_types
-        assert registered_connector.configuration == config
-        assert len(registered_connector.secrets) == 0
-        assert registered_connector.secret_id is None
+            assert registered_connector.id == connector.id
+            assert registered_connector.name == connector.name
+            assert registered_connector.type == connector.type
+            assert registered_connector.auth_method == connector.auth_method
+            assert (
+                registered_connector.resource_types == connector.resource_types
+            )
+            assert registered_connector.configuration.non_secrets == config
+            assert len(registered_connector.configuration.secrets) == 0
 
 
 def test_connector_with_secrets():
-    """Tests that a connector with secrets has an attached secret."""
+    """Tests a connector with secrets."""
     client = Client()
     store = client.zen_store
 
@@ -3174,41 +3369,48 @@ def test_connector_with_secrets():
         "foods": "tuna",
     }
     secrets = {
-        "hiding-place": SecretStr("thatsformetoknowandyouneverfindout"),
-        "dreams": SecretStr("notyourbusiness"),
+        "hiding_place": "thatsformetoknowandyouneverfindout",
+        "dreams": "notyourbusiness",
     }
-    with ServiceConnectorContext(
-        connector_type="cat'o'matic",
-        auth_method="paw-print",
-        resource_types=["cat"],
-        resource_id="blupus",
-        configuration=config,
-        secrets=secrets,
-    ) as connector:
-        assert connector.id is not None
-        assert connector.type == "cat'o'matic"
-        assert connector.auth_method == "paw-print"
-        assert connector.resource_types == ["cat"]
-        assert connector.resource_id == "blupus"
-        assert connector.configuration == config
-        assert len(connector.secrets) == 0
-        assert connector.secret_id is not None
+    connector_type = sample_name("cat'o'matic")
+    resource_type_one = sample_name("cat")
+    resource_type_two = sample_name("feline")
+    resource_id = sample_name("blupus")
+    auth_method = "paw-print"
+    with ServiceConnectorTypeContext(
+        connector_type=connector_type,
+        resource_type_one=resource_type_one,
+        resource_type_two=resource_type_two,
+    ):
+        with ServiceConnectorContext(
+            connector_type=connector_type,
+            auth_method=auth_method,
+            resource_types=[resource_type_one],
+            resource_id=resource_id,
+            configuration=config,
+            secrets=secrets,
+        ) as connector:
+            assert connector.id is not None
+            assert connector.type == connector_type
+            assert connector.auth_method == auth_method
+            assert connector.resource_types == [resource_type_one]
+            assert connector.resource_id == resource_id
+            assert connector.configuration.non_secrets == config
+            assert connector.configuration.plain_secrets == secrets
 
-        secret = store.get_secret(connector.secret_id)
-        assert secret.id == connector.secret_id
-        assert secret.name.startswith(f"connector-{connector.name}")
-        assert secret.values == secrets
+            registered_connector = store.get_service_connector(
+                connector.id, expand_secrets=True
+            )
 
-        registered_connector = store.get_service_connector(connector.id)
-
-        assert registered_connector.id == connector.id
-        assert registered_connector.name == connector.name
-        assert registered_connector.type == connector.type
-        assert registered_connector.auth_method == connector.auth_method
-        assert registered_connector.resource_types == connector.resource_types
-        assert registered_connector.configuration == config
-        assert len(registered_connector.secrets) == 0
-        assert registered_connector.secret_id == connector.secret_id
+            assert registered_connector.id == connector.id
+            assert registered_connector.name == connector.name
+            assert registered_connector.type == connector.type
+            assert registered_connector.auth_method == connector.auth_method
+            assert (
+                registered_connector.resource_types == connector.resource_types
+            )
+            assert registered_connector.configuration.non_secrets == config
+            assert registered_connector.configuration.plain_secrets == secrets
 
 
 def test_connector_with_no_config_no_secrets():
@@ -3228,19 +3430,21 @@ def test_connector_with_no_config_no_secrets():
         assert connector.resource_types == ["spacecat"]
         assert connector.resource_id == "axl"
         assert len(connector.configuration) == 0
-        assert len(connector.secrets) == 0
-        assert connector.secret_id is None
+        assert len(connector.configuration.non_secrets) == 0
+        assert len(connector.configuration.secrets) == 0
 
-        registered_connector = store.get_service_connector(connector.id)
+        registered_connector = store.get_service_connector(
+            connector.id, expand_secrets=True
+        )
 
         assert registered_connector.id == connector.id
         assert registered_connector.name == connector.name
         assert registered_connector.type == connector.type
         assert registered_connector.auth_method == connector.auth_method
         assert registered_connector.resource_types == connector.resource_types
-        assert len(connector.configuration) == 0
-        assert len(registered_connector.secrets) == 0
-        assert registered_connector.secret_id is None
+        assert len(registered_connector.configuration) == 0
+        assert len(registered_connector.configuration.non_secrets) == 0
+        assert len(registered_connector.configuration.secrets) == 0
 
 
 def test_connector_with_labels():
@@ -3253,48 +3457,55 @@ def test_connector_with_labels():
         "foods": "tuna",
     }
     secrets = {
-        "hiding-place": SecretStr("thatsformetoknowandyouneverfindout"),
-        "dreams": SecretStr("notyourbusiness"),
+        "hiding_place": "thatsformetoknowandyouneverfindout",
+        "dreams": "notyourbusiness",
     }
     labels = {
         "whereabouts": "unknown",
         "age": "eternal",
     }
-    with ServiceConnectorContext(
-        connector_type="cat'o'matic",
-        auth_method="tail-print",
-        resource_types=["cat"],
-        resource_id="aria",
-        configuration=config,
-        secrets=secrets,
-        labels=labels,
-    ) as connector:
-        assert connector.id is not None
-        assert connector.type == "cat'o'matic"
-        assert connector.auth_method == "tail-print"
-        assert connector.resource_types == ["cat"]
-        assert connector.resource_id == "aria"
-        assert connector.configuration == config
-        assert len(connector.secrets) == 0
-        assert connector.secret_id is not None
-        assert connector.labels == labels
+    connector_type = sample_name("cat'o'matic")
+    resource_type_one = sample_name("cat")
+    resource_type_two = sample_name("feline")
+    resource_id = sample_name("aria")
+    auth_method = "tail-print"
+    with ServiceConnectorTypeContext(
+        connector_type=connector_type,
+        resource_type_one=resource_type_one,
+        resource_type_two=resource_type_two,
+    ):
+        with ServiceConnectorContext(
+            connector_type=connector_type,
+            auth_method=auth_method,
+            resource_types=[resource_type_one],
+            resource_id=resource_id,
+            configuration=config,
+            secrets=secrets,
+            labels=labels,
+        ) as connector:
+            assert connector.id is not None
+            assert connector.type == connector_type
+            assert connector.auth_method == auth_method
+            assert connector.resource_types == [resource_type_one]
+            assert connector.resource_id == resource_id
+            assert connector.configuration.non_secrets == config
+            assert connector.configuration.plain_secrets == secrets
+            assert connector.labels == labels
 
-        secret = store.get_secret(connector.secret_id)
-        assert secret.id == connector.secret_id
-        assert secret.name.startswith(f"connector-{connector.name}")
-        assert secret.values == secrets
+            registered_connector = store.get_service_connector(
+                connector.id, expand_secrets=True
+            )
 
-        registered_connector = store.get_service_connector(connector.id)
-
-        assert registered_connector.id == connector.id
-        assert registered_connector.name == connector.name
-        assert registered_connector.type == connector.type
-        assert registered_connector.auth_method == connector.auth_method
-        assert registered_connector.resource_types == connector.resource_types
-        assert registered_connector.configuration == config
-        assert len(registered_connector.secrets) == 0
-        assert registered_connector.secret_id == connector.secret_id
-        assert registered_connector.labels == labels
+            assert registered_connector.id == connector.id
+            assert registered_connector.name == connector.name
+            assert registered_connector.type == connector.type
+            assert registered_connector.auth_method == connector.auth_method
+            assert (
+                registered_connector.resource_types == connector.resource_types
+            )
+            assert registered_connector.configuration.non_secrets == config
+            assert registered_connector.configuration.plain_secrets == secrets
+            assert registered_connector.labels == labels
 
 
 def test_connector_secret_share_lifespan():
@@ -3307,38 +3518,39 @@ def test_connector_secret_share_lifespan():
         "foods": "tuna",
     }
     secrets = {
-        "hiding-place": SecretStr("thatsformetoknowandyouneverfindout"),
-        "dreams": SecretStr("notyourbusiness"),
+        "hiding_place": "thatsformetoknowandyouneverfindout",
+        "dreams": "notyourbusiness",
     }
-    with ServiceConnectorContext(
-        connector_type="cat'o'matic",
-        auth_method="paw-print",
-        resource_types=["cat"],
-        resource_id="blupus",
-        configuration=config,
-        secrets=secrets,
-    ) as connector:
-        assert connector.id is not None
-        assert connector.type == "cat'o'matic"
-        assert connector.auth_method == "paw-print"
-        assert connector.resource_types == ["cat"]
-        assert connector.resource_id == "blupus"
-        assert connector.configuration == config
-        assert len(connector.secrets) == 0
-        assert connector.secret_id is not None
+    connector_type = sample_name("cat'o'matic")
+    resource_type_one = sample_name("cat")
+    resource_type_two = sample_name("feline")
+    resource_id = sample_name("blupus")
+    auth_method = "paw-print"
+    with ServiceConnectorTypeContext(
+        connector_type=connector_type,
+        resource_type_one=resource_type_one,
+        resource_type_two=resource_type_two,
+    ):
+        with ServiceConnectorContext(
+            connector_type=connector_type,
+            auth_method=auth_method,
+            resource_types=[resource_type_one],
+            resource_id=resource_id,
+            configuration=config,
+            secrets=secrets,
+        ) as connector:
+            assert connector.id is not None
+            assert connector.type == connector_type
+            assert connector.auth_method == auth_method
+            assert connector.resource_types == [resource_type_one]
+            assert connector.resource_id == resource_id
+            assert connector.configuration.non_secrets == config
+            assert connector.configuration.plain_secrets == secrets
 
-        secret = store.get_secret(connector.secret_id)
-        assert secret.id == connector.secret_id
-        assert secret.name.startswith(f"connector-{connector.name}")
-        assert secret.values == secrets
+            store.delete_service_connector(connector.id)
 
-        store.delete_service_connector(connector.id)
-
-        with pytest.raises(KeyError):
-            store.get_service_connector(connector.id)
-
-        with pytest.raises(KeyError):
-            store.get_secret(connector.secret_id)
+            with pytest.raises(KeyError):
+                store.get_service_connector(connector.id)
 
 
 def test_connector_name_reuse_for_same_user_fails():
@@ -3395,8 +3607,8 @@ def test_connector_list():
         "foods": "tuna",
     }
     secrets1 = {
-        "hiding-place": SecretStr("thatsformetoknowandyouneverfindout"),
-        "dreams": SecretStr("notyourbusiness"),
+        "hiding_place": "thatsformetoknowandyouneverfindout",
+        "dreams": "notyourbusiness",
     }
     labels1 = {
         "whereabouts": "unknown",
@@ -3407,8 +3619,8 @@ def test_connector_list():
         "foods": "everything",
     }
     secrets2 = {
-        "hiding-place": SecretStr("someplaceyouwillneverfindme"),
-        "dreams": SecretStr("milkandmiceandeverythingnice"),
+        "hiding_place": "someplaceyouwillneverfindme",
+        "dreams": "milkandmiceandeverythingnice",
     }
     labels2 = {
         "whereabouts": "everywhere",
@@ -3419,8 +3631,8 @@ def test_connector_list():
         "foods": "cheese",
     }
     secrets3 = {
-        "hiding-place": SecretStr("underthebed"),
-        "dreams": SecretStr("cheesecheesecheese"),
+        "hiding_place": "underthebed",
+        "dreams": "cheesecheesecheese",
     }
     labels3 = {
         "whereabouts": "unknown",
@@ -3594,7 +3806,7 @@ def _update_connector_and_test(
     new_resource_types: Optional[List[str]] = None,
     new_resource_id_or_not: Optional[Tuple[Optional[str]]] = None,
     new_config: Optional[Dict[str, str]] = None,
-    new_secrets: Optional[Dict[str, Optional[SecretStr]]] = None,
+    new_secrets: Optional[Dict[str, str]] = None,
     new_expires_at: Optional[datetime] = None,
     new_expiration_seconds_or_not: Optional[Tuple[Optional[int]]] = None,
     new_labels: Optional[Dict[str, str]] = None,
@@ -3608,150 +3820,169 @@ def _update_connector_and_test(
         "foods": "tuna",
     }
     secrets = {
-        "hiding-place": SecretStr("thatsformetoknowandyouneverfindout"),
-        "dreams": SecretStr("notyourbusiness"),
+        "hiding_place": "thatsformetoknowandyouneverfindout",
+        "dreams": "notyourbusiness",
     }
     labels = {
         "whereabouts": "unknown",
         "age": "eternal",
     }
     now = datetime.utcnow()
-    with ServiceConnectorContext(
-        connector_type="cat'o'matic",
-        auth_method="paw-print",
-        resource_types=["cat"],
-        resource_id="blupus",
-        configuration=config,
-        secrets=secrets,
-        expires_at=now,
-        expiration_seconds=60,
-        labels=labels,
-    ) as connector:
-        assert connector.id is not None
-        assert connector.type == "cat'o'matic"
-        assert connector.auth_method == "paw-print"
-        assert connector.resource_types == ["cat"]
-        assert connector.resource_id == "blupus"
-        assert connector.configuration == config
-        assert len(connector.secrets) == 0
-        assert connector.secret_id is not None
-        assert connector.labels == labels
 
-        secret = store.get_secret(connector.secret_id)
-        assert secret.id == connector.secret_id
-        assert secret.name.startswith(f"connector-{connector.name}")
-        assert secret.values == secrets
+    connector_type = sample_name("cat'o'matic")
+    resource_type_one = sample_name("cat")
+    resource_type_two = sample_name("feline")
+    resource_id = sample_name("blupus")
+    auth_method = "paw-print"
+    with ServiceConnectorTypeContext(
+        connector_type=connector_type,
+        resource_type_one=resource_type_one,
+        resource_type_two=resource_type_two,
+    ):
+        with ServiceConnectorContext(
+            connector_type=connector_type,
+            auth_method=auth_method,
+            resource_types=[resource_type_one],
+            resource_id=resource_id,
+            configuration=config,
+            secrets=secrets,
+            expires_at=now,
+            expiration_seconds=60,
+            labels=labels,
+        ) as connector:
+            assert connector.id is not None
+            assert connector.type == connector_type
+            assert connector.auth_method == auth_method
+            assert connector.resource_types == [resource_type_one]
+            assert connector.resource_id == resource_id
+            assert connector.configuration.non_secrets == config
+            assert connector.configuration.plain_secrets == secrets
+            assert connector.labels == labels
 
-        # Update the connector
-        # NOTE: we need to pass the `resource_id` and `expiration_seconds`
-        # fields in the update model, otherwise the update will remove them
-        # from the connector.
-        new_resource_id = (
-            new_resource_id_or_not[0]
-            if new_resource_id_or_not
-            else connector.resource_id
-        )
-        new_expiration_seconds = (
-            new_expiration_seconds_or_not[0]
-            if new_expiration_seconds_or_not
-            else connector.expiration_seconds
-        )
-        store.update_service_connector(
-            connector.id,
-            update=ServiceConnectorUpdate(
-                name=new_name,
-                connector_type=new_connector_type,
-                auth_method=new_auth_method,
-                resource_types=new_resource_types,
-                resource_id=new_resource_id,
-                configuration=new_config,
-                secrets=new_secrets,
-                expires_at=new_expires_at,
-                expiration_seconds=new_expiration_seconds,
-                labels=new_labels,
-            ),
-        )
+            # Update the connector
+            # NOTE: we need to pass the `resource_id` and `expiration_seconds`
+            # fields in the update model, otherwise the update will remove them
+            # from the connector.
+            new_resource_id = (
+                new_resource_id_or_not[0]
+                if new_resource_id_or_not
+                else connector.resource_id
+            )
+            new_expiration_seconds = (
+                new_expiration_seconds_or_not[0]
+                if new_expiration_seconds_or_not
+                else connector.expiration_seconds
+            )
+            if new_config is not None or new_secrets is not None:
+                new_sc_config = ServiceConnectorConfiguration(
+                    **new_config or {}
+                )
+                if new_secrets:
+                    new_sc_config.add_secrets(new_secrets)
+            else:
+                new_sc_config = None
 
-        # Check that the connector has been updated
-        registered_connector = store.get_service_connector(connector.id)
-
-        assert registered_connector.id == connector.id
-        assert registered_connector.name == new_name or connector.name
-        assert (
-            registered_connector.type == new_connector_type or connector.type
-        )
-        assert (
-            registered_connector.auth_method == new_auth_method
-            or connector.auth_method
-        )
-        assert (
-            registered_connector.resource_types == new_resource_types
-            or connector.resource_types
-        )
-        assert registered_connector.resource_id == new_resource_id
-        assert len(registered_connector.secrets) == 0
-
-        # the `configuration` and `secrets` fields represent a full
-        # valid configuration update, not just a partial update. If either is
-        # set (i.e. not None) in the update, their values
-        # will replace the existing configuration and secrets values.
-
-        if new_config is not None:
-            assert registered_connector.configuration == new_config or {}
-        else:
-            assert (
-                registered_connector.configuration == connector.configuration
+            updated_service_connector = store.update_service_connector(
+                connector.id,
+                update=ServiceConnectorUpdate(
+                    name=new_name,
+                    connector_type=new_connector_type,
+                    auth_method=new_auth_method,
+                    resource_types=new_resource_types,
+                    resource_id=new_resource_id,
+                    configuration=new_sc_config,
+                    expires_at=new_expires_at,
+                    expiration_seconds=new_expiration_seconds,
+                    labels=new_labels,
+                ),
             )
 
-        if new_secrets is not None:
-            if not new_secrets:
-                # Existing secret is deleted if no new secrets are provided
-                assert registered_connector.secret_id is None
-            else:
-                # New secret is created if secrets are updated
-                assert registered_connector.secret_id != connector.secret_id
-        else:
-            assert registered_connector.secret_id == connector.secret_id
+            assert updated_service_connector.id == connector.id
+            assert updated_service_connector.name == new_name or connector.name
+            assert (
+                updated_service_connector.type == new_connector_type
+                or connector.type
+            )
+            assert (
+                updated_service_connector.auth_method == new_auth_method
+                or connector.auth_method
+            )
+            assert (
+                updated_service_connector.resource_types == new_resource_types
+                or connector.resource_types
+            )
+            assert updated_service_connector.resource_id == new_resource_id
 
-        assert registered_connector.labels == new_labels or connector.labels
-
-        if new_secrets is not None:
-            if not new_secrets:
-                # Existing secret is deleted if secrets are removed
-                with pytest.raises(KeyError):
-                    store.get_secret(connector.secret_id)
-            else:
-                # Previous secret is deleted if secrets are updated
-                with pytest.raises(KeyError):
-                    store.get_secret(connector.secret_id)
-
-                # Check that a new secret has been created
-                new_secret = store.get_secret(registered_connector.secret_id)
-                assert new_secret.id == registered_connector.secret_id
-                # Secret name should have changed
-                assert new_secret.name.startswith(
-                    f"connector-{new_name or connector.name}"
+            # the `configuration` field represents a full
+            # valid configuration update, not just a partial update. If it is
+            # set (i.e. not None) in the update, its values will replace the
+            # existing configuration values.
+            if new_config is not None or new_secrets is not None:
+                assert updated_service_connector.configuration.non_secrets == (
+                    new_config or {}
                 )
-                assert new_secret.values == new_secrets
-        else:
-            new_secret = store.get_secret(connector.secret_id)
-            assert new_secret.id == connector.secret_id
-            # Secret name should not have changed
-            assert new_secret.name == secret.name
-            assert new_secret.values == secrets
+                assert (
+                    updated_service_connector.configuration.plain_secrets
+                    == (new_secrets or {})
+                )
+            else:
+                assert (
+                    updated_service_connector.configuration.non_secrets
+                    == connector.configuration.non_secrets
+                )
+                assert (
+                    updated_service_connector.configuration.plain_secrets
+                    == connector.configuration.plain_secrets
+                )
+
+            # Check that the connector has been updated
+            registered_connector = store.get_service_connector(
+                connector.id, expand_secrets=True
+            )
+
+            assert registered_connector.id == connector.id
+            assert registered_connector.name == new_name or connector.name
+            assert (
+                registered_connector.type == new_connector_type
+                or connector.type
+            )
+            assert (
+                registered_connector.auth_method == new_auth_method
+                or connector.auth_method
+            )
+            assert (
+                registered_connector.resource_types == new_resource_types
+                or connector.resource_types
+            )
+            assert registered_connector.resource_id == new_resource_id
+
+            # the `configuration` field represents a full
+            # valid configuration update, not just a partial update. If it is
+            # set (i.e. not None) in the update, its values will replace the
+            # existing configuration values.
+
+            if new_config is not None or new_secrets is not None:
+                assert registered_connector.configuration.non_secrets == (
+                    new_config or {}
+                )
+                assert registered_connector.configuration.plain_secrets == (
+                    new_secrets or {}
+                )
+            else:
+                assert (
+                    registered_connector.configuration.non_secrets
+                    == connector.configuration.non_secrets
+                )
+                assert (
+                    registered_connector.configuration.plain_secrets
+                    == connector.configuration.plain_secrets
+                )
 
 
 def test_connector_update_name():
     """Tests that a connector's name can be updated."""
     _update_connector_and_test(
         new_name="axl-incognito",
-    )
-
-
-def test_connector_update_type():
-    """Tests that a connector's type can be updated."""
-    _update_connector_and_test(
-        new_connector_type="dog'o'matic",
     )
 
 
@@ -3769,7 +4000,7 @@ def test_connector_update_resource_id():
 def test_connector_update_auth_method():
     """Tests that a connector's auth method can be updated."""
     _update_connector_and_test(
-        new_auth_method="collar",
+        new_auth_method="tail-print",
     )
 
 
@@ -3781,8 +4012,8 @@ def test_connector_update_config():
         "chase": "own-tail",
     }
     new_secrets = {
-        "hiding-place": SecretStr("anotherplaceyouwillneverfindme"),
-        "food": SecretStr("firebreathingdragon"),
+        "hiding_place": "anotherplaceyouwillneverfindme",
+        "dreams": "firebreathingdragon",
     }
 
     _update_connector_and_test(
@@ -3917,8 +4148,8 @@ def test_connector_validation():
             "name": "aria",
         }
         secrets = {
-            "hiding_spot": SecretStr("thatsformetoknowandyouneverfindout"),
-            "secret_word": SecretStr("meowmeowmeow"),
+            "hiding_spot": "thatsformetoknowandyouneverfindout",
+            "secret_word": "meowmeowmeow",
         }
         with ServiceConnectorContext(
             connector_type=connector_type,
@@ -3927,18 +4158,15 @@ def test_connector_validation():
             configuration=config,
             secrets=secrets,
         ) as connector:
-            assert connector.configuration == config
-            assert connector.secrets == {}
-            assert connector.secret_id is not None
-            secret = store.get_secret(connector.secret_id)
-            assert secret.values == secrets
+            assert connector.configuration.non_secrets == config
+            assert connector.configuration.plain_secrets == secrets
 
         # Only required attributes
         config = {
             "name": "aria",
         }
         secrets = {
-            "secret_word": SecretStr("meowmeowmeow"),
+            "secret_word": "meowmeowmeow",
         }
         with ServiceConnectorContext(
             connector_type=connector_type,
@@ -3947,16 +4175,13 @@ def test_connector_validation():
             configuration=config,
             secrets=secrets,
         ) as connector:
-            assert connector.configuration == config
-            assert connector.secrets == {}
-            assert connector.secret_id is not None
-            secret = store.get_secret(connector.secret_id)
-            assert secret.values == secrets
+            assert connector.configuration.non_secrets == config
+            assert connector.configuration.plain_secrets == secrets
 
         # Missing required configuration attribute
         config = {}
         secrets = {
-            "secret_word": SecretStr("meowmeowmeow"),
+            "secret_word": "meowmeowmeow",
         }
         with pytest.raises(ValueError):
             with ServiceConnectorContext(
@@ -3989,24 +4214,19 @@ def test_connector_validation():
             "name": "aria",
         }
         secrets = {
-            "hiding_spot": SecretStr("thatsformetoknowandyouneverfindout"),
-            "secret_word": SecretStr("meowmeowmeow"),
+            "hiding_spot": "thatsformetoknowandyouneverfindout",
+            "secret_word": "meowmeowmeow",
         }
         full_config = config.copy()
-        full_config.update(
-            {k: v.get_secret_value() for k, v in secrets.items()}
-        )
+        full_config.update(secrets)
         with ServiceConnectorContext(
             connector_type=connector_type,
             auth_method="voice-print",
             resource_types=[resource_type_one, resource_type_two],
             configuration=full_config,
         ) as connector:
-            assert connector.configuration == config
-            assert connector.secrets == {}
-            assert connector.secret_id is not None
-            secret = store.get_secret(connector.secret_id)
-            assert secret.values == secrets
+            assert connector.configuration.non_secrets == config
+            assert connector.configuration.plain_secrets == secrets
 
         # Different auth method
         with pytest.raises(ValueError):
@@ -4023,7 +4243,7 @@ def test_connector_validation():
         with pytest.raises(ValueError):
             with ServiceConnectorContext(
                 connector_type=connector_type,
-                auth_method="paw-print",
+                auth_method="retina-scan",
                 resource_types=[resource_type_one, resource_type_two],
                 configuration=config,
                 secrets=secrets,
@@ -4104,8 +4324,7 @@ class TestModel:
             for name in ["great one", "yet another one"]:
                 mv = zs.create_model_version(
                     ModelVersionRequest(
-                        user=created_model.user.id,
-                        workspace=created_model.workspace.id,
+                        project=created_model.project_id,
                         model=created_model.id,
                         name=name,
                     )
@@ -4140,17 +4359,17 @@ class TestModel:
         with ModelContext():
             zs = clean_client.zen_store
 
-            ms = zs.list_models(model_filter_model=ModelFilter(tag=""))
+            ms = zs.list_models(model_filter_model=ModelFilter(tags=[""]))
+            assert len(ms) == 0
+
+            ms = zs.list_models(model_filter_model=ModelFilter(tags=["foo"]))
             assert len(ms) == 1
 
-            ms = zs.list_models(model_filter_model=ModelFilter(tag="foo"))
-            assert len(ms) == 1
-
-            ms = zs.list_models(model_filter_model=ModelFilter(tag="bar"))
+            ms = zs.list_models(model_filter_model=ModelFilter(tags=["bar"]))
             assert len(ms) == 1
 
             ms = zs.list_models(
-                model_filter_model=ModelFilter(tag="non_existent_tag")
+                model_filter_model=ModelFilter(tags=["non_existent_tag"])
             )
             assert len(ms) == 0
 
@@ -4161,8 +4380,7 @@ class TestModel:
         with pytest.raises(ValueError):
             zs.create_model(
                 ModelRequest(
-                    user=c.active_user.id,
-                    workspace=c.active_workspace.id,
+                    project=c.active_project.id,
                     name="I will fail\n",
                 )
             )
@@ -4175,8 +4393,7 @@ class TestModelVersion:
             zs = Client().zen_store
             zs.create_model_version(
                 ModelVersionRequest(
-                    user=model.user.id,
-                    workspace=model.workspace.id,
+                    project=model.project_id,
                     model=model.id,
                     name="great one",
                 )
@@ -4189,8 +4406,7 @@ class TestModelVersion:
             with pytest.raises(ValueError):
                 zs.create_model_version(
                     ModelVersionRequest(
-                        user=model.user.id,
-                        workspace=model.workspace.id,
+                        project=model.project_id,
                         model=model.id,
                         name="I will fail\n",
                     )
@@ -4202,8 +4418,7 @@ class TestModelVersion:
             zs = Client().zen_store
             zs.create_model_version(
                 ModelVersionRequest(
-                    user=model.user.id,
-                    workspace=model.workspace.id,
+                    project=model.project_id,
                     model=model.id,
                     name="great one",
                 )
@@ -4211,8 +4426,7 @@ class TestModelVersion:
             with pytest.raises(EntityExistsError):
                 zs.create_model_version(
                     ModelVersionRequest(
-                        user=model.user.id,
-                        workspace=model.workspace.id,
+                        project=model.project_id,
                         model=model.id,
                         name="great one",
                     )
@@ -4225,8 +4439,7 @@ class TestModelVersion:
             with pytest.raises(KeyError):
                 zs.create_model_version(
                     ModelVersionRequest(
-                        user=model.user.id,
-                        workspace=model.workspace.id,
+                        project=model.project_id,
                         model=uuid4(),
                         name="great one",
                     )
@@ -4247,16 +4460,14 @@ class TestModelVersion:
             zs = Client().zen_store
             mv1 = zs.create_model_version(
                 ModelVersionRequest(
-                    user=model.user.id,
-                    workspace=model.workspace.id,
+                    project=model.project_id,
                     model=model.id,
                     name="great one",
                 )
             )
             mv2 = zs.list_model_versions(
-                model_name_or_id=model.id,
                 model_version_filter_model=ModelVersionFilter(
-                    name="great one"
+                    model=model.id, name="great one"
                 ),
             ).items[0]
             assert mv1.id == mv2.id
@@ -4266,8 +4477,9 @@ class TestModelVersion:
         with ModelContext() as model:
             zs = Client().zen_store
             mvs = zs.list_model_versions(
-                model_name_or_id=model.id,
-                model_version_filter_model=ModelVersionFilter(),
+                model_version_filter_model=ModelVersionFilter(
+                    model=model.id,
+                ),
             )
             assert len(mvs) == 0
 
@@ -4277,84 +4489,78 @@ class TestModelVersion:
             zs = Client().zen_store
             mv1 = zs.create_model_version(
                 ModelVersionRequest(
-                    user=model.user.id,
-                    workspace=model.workspace.id,
+                    project=model.project_id,
                     model=model.id,
                     name="great one",
                 )
             )
             mv2 = zs.create_model_version(
                 ModelVersionRequest(
-                    user=model.user.id,
-                    workspace=model.workspace.id,
+                    project=model.project_id,
                     model=model.id,
                     name="and yet another one",
                 )
             )
             mvs = zs.list_model_versions(
-                model_name_or_id=model.id,
-                model_version_filter_model=ModelVersionFilter(),
+                model_version_filter_model=ModelVersionFilter(
+                    model=model.id,
+                ),
             )
             assert len(mvs) == 2
             assert mv1 in mvs
             assert mv2 in mvs
 
-    def test_list_by_tags(self):
+    def test_list_by_tags(self, clean_client: "Client"):
         """Test list using tag filter."""
         with ModelContext() as model:
-            zs = Client().zen_store
-            mv1 = zs.create_model_version(
+            mv1 = clean_client.zen_store.create_model_version(
                 ModelVersionRequest(
-                    user=model.user.id,
-                    workspace=model.workspace.id,
+                    project=model.project_id,
                     model=model.id,
                     name="great one",
                     tags=["tag1", "tag2"],
                 )
             )
-            mv2 = zs.create_model_version(
+            mv2 = clean_client.zen_store.create_model_version(
                 ModelVersionRequest(
-                    user=model.user.id,
-                    workspace=model.workspace.id,
+                    project=model.project_id,
                     model=model.id,
                     name="and yet another one",
                     tags=["tag3", "tag2"],
                 )
             )
-            mvs = zs.list_model_versions(
-                model_name_or_id=model.id,
-                model_version_filter_model=ModelVersionFilter(tag=""),
-            )
-            assert len(mvs) == 2
-            assert mv1 in mvs
-            assert mv2 in mvs
-
-            mvs = zs.list_model_versions(
-                model_name_or_id=model.id,
-                model_version_filter_model=ModelVersionFilter(tag="tag2"),
-            )
-            assert len(mvs) == 2
-            assert mv1 in mvs
-            assert mv2 in mvs
-
-            mvs = zs.list_model_versions(
-                model_name_or_id=model.id,
-                model_version_filter_model=ModelVersionFilter(tag="tag1"),
-            )
-            assert len(mvs) == 1
-            assert mv1 in mvs
-
-            mvs = zs.list_model_versions(
-                model_name_or_id=model.id,
-                model_version_filter_model=ModelVersionFilter(tag="tag3"),
-            )
-            assert len(mvs) == 1
-            assert mv2 in mvs
-
-            mvs = zs.list_model_versions(
-                model_name_or_id=model.id,
+            mvs = clean_client.zen_store.list_model_versions(
                 model_version_filter_model=ModelVersionFilter(
-                    tag="non_existent_tag"
+                    tag="tag1",
+                    model=model.id,
+                ),
+            )
+            assert len(mvs) == 1
+            assert mv1 in mvs
+
+            mvs = clean_client.zen_store.list_model_versions(
+                model_version_filter_model=ModelVersionFilter(
+                    tag="tag2",
+                    model=model.id,
+                ),
+            )
+            assert len(mvs) == 2
+            assert mv1 in mvs
+            assert mv2 in mvs
+
+            mvs = clean_client.zen_store.list_model_versions(
+                model_version_filter_model=ModelVersionFilter(
+                    tag="tag3",
+                    model=model.id,
+                ),
+            )
+            assert len(mvs) == 1
+            assert mv2 in mvs
+
+            mvs = clean_client.zen_store.list_model_versions(
+                model_version_filter_model=ModelVersionFilter(
+                    tag="non_existent_tag",
+                    model=model.id,
                 ),
             )
             assert len(mvs) == 0
@@ -4374,8 +4580,7 @@ class TestModelVersion:
             zs = Client().zen_store
             mv = zs.create_model_version(
                 ModelVersionRequest(
-                    user=model.user.id,
-                    workspace=model.workspace.id,
+                    project=model.project_id,
                     model=model.id,
                     name="great one",
                 )
@@ -4384,22 +4589,21 @@ class TestModelVersion:
                 model_version_id=mv.id,
             )
             mvl = zs.list_model_versions(
-                model_name_or_id=model.id,
                 model_version_filter_model=ModelVersionFilter(
-                    name="great one"
+                    name="great one",
+                    model=model.id,
                 ),
             ).items
             assert len(mvl) == 0
 
     def test_update_not_found(self):
         """Test that update fails if not found."""
-        with ModelContext() as model:
+        with ModelContext():
             zs = Client().zen_store
             with pytest.raises(KeyError):
                 zs.update_model_version(
                     model_version_id=uuid4(),
                     model_version_update_model=ModelVersionUpdate(
-                        model=model.id,
                         stage="staging",
                         force=False,
                     ),
@@ -4411,16 +4615,14 @@ class TestModelVersion:
             zs = Client().zen_store
             mv1 = zs.create_model_version(
                 ModelVersionRequest(
-                    user=model.user.id,
-                    workspace=model.workspace.id,
+                    project=model.project_id,
                     model=model.id,
                     name="great one",
                 )
             )
             mv2 = zs.create_model_version(
                 ModelVersionRequest(
-                    user=model.user.id,
-                    workspace=model.workspace.id,
+                    project=model.project_id,
                     model=model.id,
                     name="yet another one",
                 )
@@ -4428,20 +4630,21 @@ class TestModelVersion:
             zs.update_model_version(
                 model_version_id=mv1.id,
                 model_version_update_model=ModelVersionUpdate(
-                    model=model.id,
                     stage="staging",
                     force=False,
                 ),
             )
             mv2 = zs.list_model_versions(
-                model_name_or_id=model.id,
-                model_version_filter_model=ModelVersionFilter(stage="staging"),
+                model_version_filter_model=ModelVersionFilter(
+                    stage="staging",
+                    model=model.id,
+                ),
             ).items[0]
             assert mv1.id == mv2.id
             mv3 = zs.list_model_versions(
-                model_name_or_id=model.id,
                 model_version_filter_model=ModelVersionFilter(
-                    stage=ModelStages.STAGING
+                    stage=ModelStages.STAGING,
+                    model=model.id,
                 ),
             ).items[0]
             assert mv1.id == mv3.id
@@ -4452,8 +4655,7 @@ class TestModelVersion:
             zs = clean_client.zen_store
             mv1 = zs.create_model_version(
                 ModelVersionRequest(
-                    user=model.user.id,
-                    workspace=model.workspace.id,
+                    project=model.project_id,
                     model=model.id,
                     name="great one",
                     description="this is great",
@@ -4466,7 +4668,6 @@ class TestModelVersion:
             zs.update_model_version(
                 model_version_id=mv1.id,
                 model_version_update_model=ModelVersionUpdate(
-                    model=mv1.model.id,
                     name="and yet another one",
                     description="this is great and better",
                 ),
@@ -4481,17 +4682,16 @@ class TestModelVersion:
             zs = Client().zen_store
             zs.create_model_version(
                 ModelVersionRequest(
-                    user=model.user.id,
-                    workspace=model.workspace.id,
+                    project=model.project_id,
                     model=model.id,
                     name="great one",
                 )
             )
 
             mvl = zs.list_model_versions(
-                model_name_or_id=model.id,
                 model_version_filter_model=ModelVersionFilter(
-                    stage=ModelStages.STAGING
+                    stage=ModelStages.STAGING,
+                    model=model.id,
                 ),
             ).items
 
@@ -4503,8 +4703,7 @@ class TestModelVersion:
             zs = Client().zen_store
             zs.create_model_version(
                 ModelVersionRequest(
-                    user=model.user.id,
-                    workspace=model.workspace.id,
+                    project=model.project_id,
                     model=model.id,
                     name="great one",
                 )
@@ -4512,8 +4711,7 @@ class TestModelVersion:
             time.sleep(1)  # thanks to MySQL way of storing datetimes
             latest = zs.create_model_version(
                 ModelVersionRequest(
-                    user=model.user.id,
-                    workspace=model.workspace.id,
+                    project=model.project_id,
                     model=model.id,
                     name="yet another one",
                 )
@@ -4529,16 +4727,14 @@ class TestModelVersion:
             zs = Client().zen_store
             mv1 = zs.create_model_version(
                 ModelVersionRequest(
-                    user=model.user.id,
-                    workspace=model.workspace.id,
+                    project=model.project_id,
                     model=model.id,
                     name="great one",
                 )
             )
             mv2 = zs.create_model_version(
                 ModelVersionRequest(
-                    user=model.user.id,
-                    workspace=model.workspace.id,
+                    project=model.project_id,
                     model=model.id,
                     name="yet another one",
                 )
@@ -4546,7 +4742,6 @@ class TestModelVersion:
             zs.update_model_version(
                 model_version_id=mv1.id,
                 model_version_update_model=ModelVersionUpdate(
-                    model=model.id,
                     stage="staging",
                     force=False,
                 ),
@@ -4560,7 +4755,6 @@ class TestModelVersion:
             zs.update_model_version(
                 model_version_id=mv2.id,
                 model_version_update_model=ModelVersionUpdate(
-                    model=model.id,
                     stage="staging",
                     force=True,
                     name="I changed that...",
@@ -4592,8 +4786,7 @@ class TestModelVersion:
             zs = Client().zen_store
             mv1 = zs.create_model_version(
                 ModelVersionRequest(
-                    user=model.user.id,
-                    workspace=model.workspace.id,
+                    project=model.project_id,
                     model=model.id,
                 )
             )
@@ -4620,8 +4813,7 @@ class TestModelVersion:
             zs = Client().zen_store
             mv1 = zs.create_model_version(
                 ModelVersionRequest(
-                    user=model.user.id,
-                    workspace=model.workspace.id,
+                    project=model.project_id,
                     model=model.id,
                     name="great one",
                 )
@@ -4633,11 +4825,11 @@ class TestModelVersion:
     def test_model_bad_stage(self):
         """Test that update fails on bad stage value."""
         with pytest.raises(ValueError):
-            ModelVersionUpdate(model=uuid4(), stage="my_super_stage")
+            ModelVersionUpdate(stage="my_super_stage")
 
     def test_model_ok_stage(self):
         """Test that update works on valid stage value."""
-        mvum = ModelVersionUpdate(model=uuid4(), stage="staging")
+        mvum = ModelVersionUpdate(stage="staging")
         assert mvum.stage == "staging"
 
     def test_increments_version_number(self):
@@ -4646,8 +4838,7 @@ class TestModelVersion:
             zs = Client().zen_store
             zs.create_model_version(
                 ModelVersionRequest(
-                    user=model.user.id,
-                    workspace=model.workspace.id,
+                    project=model.project_id,
                     model=model.id,
                     name="great one",
                 )
@@ -4655,16 +4846,16 @@ class TestModelVersion:
             time.sleep(1)  # thanks MySQL again!
             zs.create_model_version(
                 ModelVersionRequest(
-                    user=model.user.id,
-                    workspace=model.workspace.id,
+                    project=model.project_id,
                     model=model.id,
                     name="great second",
                 )
             )
 
             model_versions = zs.list_model_versions(
-                model_name_or_id=model.id,
-                model_version_filter_model=ModelVersionFilter(),
+                model_version_filter_model=ModelVersionFilter(
+                    model=model.id,
+                ),
             )
             assert len(model_versions) == 2
             assert model_versions[0].name == "great one"
@@ -4677,8 +4868,10 @@ class TestModelVersion:
         with ModelContext(create_version=True) as model_version:
             zs = Client().zen_store
             found = zs.list_model_versions(
-                model_name_or_id=model_version.model.id,
-                model_version_filter_model=ModelVersionFilter(number=1),
+                model_version_filter_model=ModelVersionFilter(
+                    number=1,
+                    model=model_version.model.id,
+                ),
             ).items[0]
             assert found.id == model_version.id
             assert found.number == 1
@@ -4690,8 +4883,10 @@ class TestModelVersion:
             zs = Client().zen_store
 
             found = zs.list_model_versions(
-                model_name_or_id=model_version.model.id,
-                model_version_filter_model=ModelVersionFilter(number=2),
+                model_version_filter_model=ModelVersionFilter(
+                    number=2,
+                    model=model_version.model.id,
+                ),
             ).items
 
             assert len(found) == 0
@@ -4706,9 +4901,6 @@ class TestModelVersionArtifactLinks:
             zs = Client().zen_store
             zs.create_model_version_artifact_link(
                 ModelVersionArtifactRequest(
-                    user=model_version.user.id,
-                    workspace=model_version.workspace.id,
-                    model=model_version.model.id,
                     model_version=model_version.id,
                     artifact_version=artifacts[0].id,
                 )
@@ -4722,9 +4914,6 @@ class TestModelVersionArtifactLinks:
             zs = Client().zen_store
             al1 = zs.create_model_version_artifact_link(
                 ModelVersionArtifactRequest(
-                    user=model_version.user.id,
-                    workspace=model_version.workspace.id,
-                    model=model_version.model.id,
                     model_version=model_version.id,
                     artifact_version=artifacts[0].id,
                 )
@@ -4732,9 +4921,6 @@ class TestModelVersionArtifactLinks:
             assert al1.artifact_version.id == artifacts[0].id
             al2 = zs.create_model_version_artifact_link(
                 ModelVersionArtifactRequest(
-                    user=model_version.user.id,
-                    workspace=model_version.workspace.id,
-                    model=model_version.model.id,
                     model_version=model_version.id,
                     artifact_version=artifacts[1].id,
                 )
@@ -4750,9 +4936,6 @@ class TestModelVersionArtifactLinks:
             zs = Client().zen_store
             link1 = zs.create_model_version_artifact_link(
                 ModelVersionArtifactRequest(
-                    user=model_version.user.id,
-                    workspace=model_version.workspace.id,
-                    model=model_version.model.id,
                     model_version=model_version.id,
                     artifact_version=artifacts[0].id,
                 )
@@ -4760,9 +4943,6 @@ class TestModelVersionArtifactLinks:
 
             link2 = zs.create_model_version_artifact_link(
                 ModelVersionArtifactRequest(
-                    user=model_version.user.id,
-                    workspace=model_version.workspace.id,
-                    model=model_version.model.id,
                     model_version=model_version.id,
                     artifact_version=artifacts[0].id,
                 )
@@ -4780,18 +4960,12 @@ class TestModelVersionArtifactLinks:
             zs = Client().zen_store
             zs.create_model_version_artifact_link(
                 ModelVersionArtifactRequest(
-                    user=model_version.user.id,
-                    workspace=model_version.workspace.id,
-                    model=model_version.model.id,
                     model_version=model_version.id,
                     artifact_version=artifacts[0].id,
                 )
             )
             zs.create_model_version_artifact_link(
                 ModelVersionArtifactRequest(
-                    user=model_version.user.id,
-                    workspace=model_version.workspace.id,
-                    model=model_version.model.id,
                     model_version=model_version.id,
                     artifact_version=artifacts[1].id,
                 )
@@ -4812,9 +4986,6 @@ class TestModelVersionArtifactLinks:
             zs = Client().zen_store
             link = zs.create_model_version_artifact_link(
                 ModelVersionArtifactRequest(
-                    user=model_version.user.id,
-                    workspace=model_version.workspace.id,
-                    model=model_version.model.id,
                     model_version=model_version.id,
                     artifact_version=artifacts[0].id,
                 )
@@ -4839,9 +5010,6 @@ class TestModelVersionArtifactLinks:
             for artifact in artifacts:
                 zs.create_model_version_artifact_link(
                     ModelVersionArtifactRequest(
-                        user=model_version.user.id,
-                        workspace=model_version.workspace.id,
-                        model=model_version.model.id,
                         model_version=model_version.id,
                         artifact_version=artifact.id,
                     )
@@ -4876,32 +5044,32 @@ class TestModelVersionArtifactLinks:
             assert len(mvls) == 0
 
     def test_link_list_populated(self):
-        with ModelContext(True, create_artifacts=4) as (
+        with ModelContext(
+            True,
+            create_artifacts=4,
+            artifact_types=[
+                ArtifactType.DATA,
+                ArtifactType.MODEL,
+                ArtifactType.SERVICE,
+                ArtifactType.DATA,
+            ],
+        ) as (
             model_version,
             artifacts,
         ):
-            zs = Client().zen_store
+            client = Client()
+            zs = client.zen_store
             mvls = zs.list_model_version_artifact_links(
                 model_version_artifact_link_filter_model=ModelVersionArtifactFilter(
                     model_version_id=model_version.id
                 ),
             )
             assert len(mvls) == 0
-            for mo, dep, artifact in [
-                (False, False, artifacts[0]),
-                (True, False, artifacts[1]),
-                (False, True, artifacts[2]),
-                (False, False, artifacts[3]),
-            ]:
+            for artifact in artifacts:
                 zs.create_model_version_artifact_link(
                     ModelVersionArtifactRequest(
-                        user=model_version.user.id,
-                        workspace=model_version.workspace.id,
-                        model=model_version.model.id,
                         model_version=model_version.id,
                         artifact_version=artifact.id,
-                        is_model_artifact=mo,
-                        is_deployment_artifact=dep,
                     )
                 )
             mvls = zs.list_model_version_artifact_links(
@@ -4977,9 +5145,6 @@ class TestModelVersionPipelineRunLinks:
             zs = Client().zen_store
             zs.create_model_version_pipeline_run_link(
                 ModelVersionPipelineRunRequest(
-                    user=model_version.user.id,
-                    workspace=model_version.workspace.id,
-                    model=model_version.model.id,
                     model_version=model_version.id,
                     pipeline_run=prs[0].id,
                 )
@@ -4994,23 +5159,48 @@ class TestModelVersionPipelineRunLinks:
             zs = Client().zen_store
             link_1 = zs.create_model_version_pipeline_run_link(
                 ModelVersionPipelineRunRequest(
-                    user=model_version.user.id,
-                    workspace=model_version.workspace.id,
-                    model=model_version.model.id,
                     model_version=model_version.id,
                     pipeline_run=prs[0].id,
                 )
             )
             link_2 = zs.create_model_version_pipeline_run_link(
                 ModelVersionPipelineRunRequest(
-                    user=model_version.user.id,
-                    workspace=model_version.workspace.id,
-                    model=model_version.model.id,
                     model_version=model_version.id,
                     pipeline_run=prs[0].id,
                 )
             )
             assert link_1.id == link_2.id
+
+    def test_linked_pipeline_run_fetching(self):
+        """Test that model version pipeline run links can be fetched using
+        the list_pipeline_runs method.
+        """
+        with ModelContext(True, create_prs=2) as (
+            model_version,
+            prs,
+        ):
+            zs = Client().zen_store
+            zs.create_model_version_pipeline_run_link(
+                ModelVersionPipelineRunRequest(
+                    model_version=model_version.id,
+                    pipeline_run=prs[0].id,
+                )
+            )
+            zs.create_model_version_pipeline_run_link(
+                ModelVersionPipelineRunRequest(
+                    model_version=model_version.id,
+                    pipeline_run=prs[1].id,
+                )
+            )
+
+            assert (
+                Client()
+                .list_pipeline_runs(
+                    linked_to_model_version_id=model_version.id
+                )
+                .total
+                == 2
+            )
 
     def test_link_delete_found(self):
         with ModelContext(True, create_prs=1) as (
@@ -5020,11 +5210,7 @@ class TestModelVersionPipelineRunLinks:
             zs = Client().zen_store
             link = zs.create_model_version_pipeline_run_link(
                 ModelVersionPipelineRunRequest(
-                    user=model_version.user.id,
-                    workspace=model_version.workspace.id,
-                    model=model_version.model.id,
                     model_version=model_version.id,
-                    name="link",
                     pipeline_run=prs[0].id,
                 )
             )
@@ -5072,9 +5258,6 @@ class TestModelVersionPipelineRunLinks:
             for pr in prs:
                 zs.create_model_version_pipeline_run_link(
                     ModelVersionPipelineRunRequest(
-                        user=model_version.user.id,
-                        workspace=model_version.workspace.id,
-                        model=model_version.model.id,
                         model_version=model_version.id,
                         pipeline_run=pr.id,
                     )
@@ -5104,47 +5287,38 @@ class TestModelVersionPipelineRunLinks:
             assert mv.pipeline_runs[prs[0].name].id == prs[0].id
             assert mv.pipeline_runs[prs[1].name].id == prs[1].id
 
-            assert (
-                mv.get_pipeline_run(prs[0].name)
-                == mv.pipeline_runs[prs[0].name]
-            )
-            assert (
-                mv.get_pipeline_run(prs[1].name)
-                == mv.pipeline_runs[prs[1].name]
-            )
-
 
 class TestTag:
     def test_create_pass(self, clean_client: "Client"):
         """Tests that tag creation passes."""
-        tag = clean_client.create_tag(TagRequest(name="foo"))
+        tag = clean_client.create_tag(name="foo")
         assert tag.name == "foo"
         assert tag.color is not None
-        tag = clean_client.create_tag(TagRequest(name="bar", color="yellow"))
+        tag = clean_client.create_tag(name="bar", color="yellow")
         assert tag.name == "bar"
         assert tag.color == ColorVariants.YELLOW.name.lower()
-        with pytest.raises(ValueError):
-            clean_client.create_tag(TagRequest(color="yellow"))
+        with pytest.raises(TypeError):
+            clean_client.create_tag(color="yellow")
 
     def test_create_bad_input(self, clean_client: "Client"):
         """Tests that tag creation fails without a name."""
-        with pytest.raises(ValueError):
-            clean_client.create_tag(TagRequest(color="yellow"))
+        with pytest.raises(TypeError):
+            clean_client.create_tag(color="yellow")
 
     def test_create_fails_with_invalid_name(self, clean_client: "Client"):
         """Tests that tag creation fails with invalid name."""
         with pytest.raises(ValueError):
-            clean_client.create_tag(TagRequest(name="I will fail\n"))
+            clean_client.create_tag(name="I will fail\n")
 
     def test_create_duplicate(self, clean_client: "Client"):
         """Tests that tag creation fails on duplicate."""
-        clean_client.create_tag(TagRequest(name="foo"))
+        clean_client.create_tag(name="foo")
         with pytest.raises(EntityExistsError):
-            clean_client.create_tag(TagRequest(name="foo", color="yellow"))
+            clean_client.create_tag(name="foo", color="yellow")
 
     def test_get_tag_found(self, clean_client: "Client"):
         """Tests that tag get pass if found."""
-        clean_client.create_tag(TagRequest(name="foo"))
+        clean_client.create_tag(name="foo")
         tag = clean_client.get_tag("foo")
         assert tag.name == "foo"
         assert tag.color is not None
@@ -5156,37 +5330,35 @@ class TestTag:
 
     def test_list_tags(self, clean_client: "Client"):
         """Tests various list scenarios."""
-        tags = clean_client.list_tags(TagFilter())
+        tags = clean_client.list_tags()
         assert len(tags) == 0
-        clean_client.create_tag(TagRequest(name="foo", color="red"))
-        clean_client.create_tag(TagRequest(name="bar", color="green"))
+        clean_client.create_tag(name="foo", color="red")
+        clean_client.create_tag(name="bar", color="green")
 
-        tags = clean_client.list_tags(TagFilter())
+        tags = clean_client.list_tags()
         assert len(tags) == 2
         assert {t.name for t in tags} == {"foo", "bar"}
         assert {t.color for t in tags} == {"red", "green"}
 
-        tags = clean_client.list_tags(TagFilter(name="foo"))
+        tags = clean_client.list_tags(name="foo")
         assert len(tags) == 1
         assert tags[0].name == "foo"
         assert tags[0].color == "red"
 
-        tags = clean_client.list_tags(TagFilter(color="green"))
+        tags = clean_client.list_tags(color="green")
         assert len(tags) == 1
         assert tags[0].name == "bar"
         assert tags[0].color == "green"
 
     def test_update_tag(self, clean_client: "Client"):
         """Tests various update scenarios."""
-        clean_client.create_tag(TagRequest(name="foo", color="red"))
-        tag = clean_client.create_tag(TagRequest(name="bar", color="green"))
+        clean_client.create_tag(name="foo", color="red")
+        tag = clean_client.create_tag(name="bar", color="green")
 
-        clean_client.update_tag("foo", TagUpdate(name="foo2"))
+        clean_client.update_tag("foo", name="foo2")
         assert clean_client.get_tag("foo2").color == "red"
-        with pytest.raises(KeyError):
-            clean_client.get_tag("foo")
 
-        clean_client.update_tag(tag.id, TagUpdate(color="yellow"))
+        clean_client.update_tag(tag.id, color="yellow")
         assert clean_client.get_tag(tag.id).color == "yellow"
         assert clean_client.get_tag("bar").color == "yellow"
 
@@ -5194,140 +5366,184 @@ class TestTag:
 class TestTagResource:
     def test_create_tag_resource_pass(self, clean_client: "Client"):
         """Tests creating tag<>resource mapping pass."""
-        if clean_client.zen_store.type != StoreType.SQL:
-            pytest.skip("Only SQL Zen Stores support tagging resources")
-        tag = clean_client.create_tag(TagRequest(name="foo", color="red"))
+        tag = clean_client.create_tag(name="foo", color="red")
+        model = clean_client.create_model(name="bar")
         mapping = clean_client.zen_store.create_tag_resource(
             TagResourceRequest(
                 tag_id=tag.id,
-                resource_id=uuid4(),
+                resource_id=model.id,
                 resource_type=TaggableResourceTypes.MODEL,
             )
         )
         assert isinstance(mapping.tag_id, UUID)
         assert isinstance(mapping.resource_id, UUID)
 
-    def test_create_tag_resource_fails_on_duplicate(
+    def test_create_tag_resource_pass_on_duplicate(
         self, clean_client: "Client"
     ):
         """Tests creating tag<>resource mapping fails on duplicate."""
-        if clean_client.zen_store.type != StoreType.SQL:
-            pytest.skip("Only SQL Zen Stores support tagging resources")
-        tag = clean_client.create_tag(TagRequest(name="foo", color="red"))
+        tag = clean_client.create_tag(name="foo", color="red")
+        model = clean_client.create_model(name="bar")
         mapping = clean_client.zen_store.create_tag_resource(
             TagResourceRequest(
                 tag_id=tag.id,
-                resource_id=uuid4(),
+                resource_id=model.id,
                 resource_type=TaggableResourceTypes.MODEL,
             )
         )
 
-        with pytest.raises(EntityExistsError):
-            clean_client.zen_store.create_tag_resource(
-                TagResourceRequest(
-                    tag_id=mapping.tag_id,
-                    resource_id=mapping.resource_id,
-                    resource_type=TaggableResourceTypes.MODEL,
-                )
+        # Creating a duplicate tag resource should not raise an error
+        clean_client.zen_store.create_tag_resource(
+            TagResourceRequest(
+                tag_id=mapping.tag_id,
+                resource_id=mapping.resource_id,
+                resource_type=TaggableResourceTypes.MODEL,
             )
+        )
+
+    def test_batch_create_tag_resource_pass(self, clean_client: "Client"):
+        """Tests batch creating tag<>resource mapping pass."""
+        tag1 = clean_client.create_tag(name="foo1", color="red")
+        tag2 = clean_client.create_tag(name="foo2", color="green")
+        model1 = clean_client.create_model(name="bar1")
+        model2 = clean_client.create_model(name="bar2")
+        clean_client.zen_store.batch_create_tag_resource(
+            [
+                TagResourceRequest(
+                    tag_id=tag1.id,
+                    resource_id=model1.id,
+                    resource_type=TaggableResourceTypes.MODEL,
+                ),
+                TagResourceRequest(
+                    tag_id=tag2.id,
+                    resource_id=model2.id,
+                    resource_type=TaggableResourceTypes.MODEL,
+                ),
+            ]
+        )
 
     def test_delete_tag_resource_pass(self, clean_client: "Client"):
         """Tests deleting tag<>resource mapping pass."""
         if clean_client.zen_store.type != StoreType.SQL:
             pytest.skip("Only SQL Zen Stores support tagging resources")
-        tag = clean_client.create_tag(TagRequest(name="foo", color="red"))
-        resource_id = uuid4()
+        tag = clean_client.create_tag(name="foo", color="red")
+        model = clean_client.create_model(name="bar")
+
         clean_client.zen_store.create_tag_resource(
             TagResourceRequest(
                 tag_id=tag.id,
-                resource_id=resource_id,
+                resource_id=model.id,
                 resource_type=TaggableResourceTypes.MODEL,
             )
         )
         clean_client.zen_store.delete_tag_resource(
-            tag_id=tag.id,
-            resource_id=resource_id,
-            resource_type=TaggableResourceTypes.MODEL,
-        )
-        with pytest.raises(KeyError):
-            clean_client.zen_store.delete_tag_resource(
+            TagResourceRequest(
                 tag_id=tag.id,
-                resource_id=resource_id,
+                resource_id=model.id,
                 resource_type=TaggableResourceTypes.MODEL,
             )
+        )
+
+    def test_delete_tag_resource_pass_on_non_existing(
+        self, clean_client: "Client"
+    ):
+        """Tests deleting tag<>resource mapping pass on non-existing resource."""
+        tag = clean_client.create_tag(name="foo", color="red")
+        model = clean_client.create_model(name="bar")
+
+        clean_client.zen_store.delete_tag_resource(
+            TagResourceRequest(
+                tag_id=tag.id,
+                resource_id=model.id,
+                resource_type=TaggableResourceTypes.MODEL,
+            )
+        )
+        # Removing a non-existing tag resource should not raise an error
+        clean_client.zen_store.delete_tag_resource(
+            TagResourceRequest(
+                tag_id=tag.id,
+                resource_id=model.id,
+                resource_type=TaggableResourceTypes.MODEL,
+            )
+        )
+
+    def test_batch_delete_tag_resource_pass(self, clean_client: "Client"):
+        """Tests batch deleting tag<>resource mapping pass."""
+        tag1 = clean_client.create_tag(name="foo1", color="red")
+        tag2 = clean_client.create_tag(name="foo2", color="green")
+        model1 = clean_client.create_model(name="bar1")
+        model2 = clean_client.create_model(name="bar2")
+        clean_client.zen_store.batch_create_tag_resource(
+            [
+                TagResourceRequest(
+                    tag_id=tag1.id,
+                    resource_id=model1.id,
+                    resource_type=TaggableResourceTypes.MODEL,
+                ),
+                TagResourceRequest(
+                    tag_id=tag2.id,
+                    resource_id=model2.id,
+                    resource_type=TaggableResourceTypes.MODEL,
+                ),
+            ]
+        )
+        clean_client.zen_store.batch_delete_tag_resource(
+            [
+                TagResourceRequest(
+                    tag_id=tag1.id,
+                    resource_id=model1.id,
+                    resource_type=TaggableResourceTypes.MODEL,
+                ),
+                TagResourceRequest(
+                    tag_id=tag2.id,
+                    resource_id=model2.id,
+                    resource_type=TaggableResourceTypes.MODEL,
+                ),
+            ]
+        )
 
     def test_delete_tag_resource_mismatch(self, clean_client: "Client"):
         """Tests deleting tag<>resource mapping pass."""
-        if clean_client.zen_store.type != StoreType.SQL:
-            pytest.skip("Only SQL Zen Stores support tagging resources")
 
         class MockTaggableResourceTypes(StrEnum):
             APPLE = "apple"
 
-        tag = clean_client.create_tag(TagRequest(name="foo", color="red"))
-        resource_id = uuid4()
+        tag = clean_client.create_tag(name="foo", color="red")
+        model = clean_client.create_model(name="bar")
         clean_client.zen_store.create_tag_resource(
             TagResourceRequest(
                 tag_id=tag.id,
-                resource_id=resource_id,
+                resource_id=model.id,
                 resource_type=TaggableResourceTypes.MODEL,
             )
         )
-        with pytest.raises(KeyError):
+        with pytest.raises(ValueError):
             clean_client.zen_store.delete_tag_resource(
-                tag_id=tag.id,
-                resource_id=resource_id,
-                resource_type=MockTaggableResourceTypes.APPLE,
+                TagResourceRequest(
+                    tag_id=tag.id,
+                    resource_id=model.id,
+                    resource_type=MockTaggableResourceTypes.APPLE,
+                )
             )
 
-    @pytest.mark.parametrize(
-        "use_model,use_tag",
-        [[True, False], [False, True]],
-        ids=["delete_model", "delete_tag"],
-    )
-    def test_cascade_deletion(
-        self, use_model, use_tag, clean_client: "Client"
-    ):
+    def test_cascade_deletion(self, clean_client: "Client"):
         """Test that link is deleted on tag deletion."""
-        if clean_client.zen_store.type != StoreType.SQL:
-            pytest.skip("Only SQL Zen Stores support tagging resources")
-        with ModelContext() as model:
-            tag = clean_client.create_tag(
-                TagRequest(name="test_cascade_deletion", color="red")
-            )
-            fake_model_id = uuid4() if not use_model else model.id
-            clean_client.zen_store.create_tag_resource(
-                TagResourceRequest(
-                    tag_id=tag.id,
-                    resource_id=fake_model_id,
-                    resource_type=TaggableResourceTypes.MODEL,
-                )
-            )
+        tag = clean_client.create_tag(
+            name="test_cascade_deletion", color="red"
+        )
+        model = clean_client.create_model(name="bar")
 
-            # duplicate
-            with pytest.raises(EntityExistsError):
-                clean_client.zen_store.create_tag_resource(
-                    TagResourceRequest(
-                        tag_id=tag.id,
-                        resource_id=fake_model_id,
-                        resource_type=TaggableResourceTypes.MODEL,
-                    )
-                )
-            if use_tag:
-                clean_client.delete_tag(tag.id)
-                tag = clean_client.create_tag(
-                    TagRequest(name="test_cascade_deletion", color="red")
-                )
-            else:
-                clean_client.delete_model(model.id)
-            # should pass
-            clean_client.zen_store.create_tag_resource(
-                TagResourceRequest(
-                    tag_id=tag.id,
-                    resource_id=fake_model_id,
-                    resource_type=TaggableResourceTypes.MODEL,
-                )
+        clean_client.zen_store.create_tag_resource(
+            TagResourceRequest(
+                tag_id=tag.id,
+                resource_id=model.id,
+                resource_type=TaggableResourceTypes.MODEL,
             )
+        )
+
+        clean_client.delete_tag(tag.id)
+        updated_model = clean_client.get_model(model.id)
+        assert tag.name not in [t.names for t in updated_model.tags]
 
 
 class TestRunMetadata:
@@ -5344,12 +5560,17 @@ class TestRunMetadata:
 
         sc = client.zen_store.create_stack_component(
             ComponentRequest(
-                user=client.active_user.id,
-                workspace=client.active_workspace.id,
                 name=sample_name("foo"),
                 type=StackComponentType.ORCHESTRATOR,
                 flavor="local",
                 configuration={},
+            )
+        )
+
+        pipeline_model = client.zen_store.create_pipeline(
+            PipelineRequest(
+                name=sample_name("pipeline"),
+                project=client.active_project.id,
             )
         )
 
@@ -5358,13 +5579,13 @@ class TestRunMetadata:
                 ArtifactRequest(
                     name=sample_name("foo"),
                     has_custom_name=True,
+                    project=client.active_project.id,
                 )
             )
             resource = client.zen_store.create_artifact_version(
                 ArtifactVersionRequest(
                     artifact_id=artifact.id,
-                    user=client.active_user.id,
-                    workspace=client.active_workspace.id,
+                    project=client.active_project.id,
                     version="1",
                     type=ArtifactType.DATA,
                     uri=sample_name("foo"),
@@ -5374,6 +5595,7 @@ class TestRunMetadata:
                     data_type=Source(
                         module="acme.foo", type=SourceType.INTERNAL
                     ),
+                    save_type=ArtifactSaveType.STEP_OUTPUT,
                 )
             )
         elif type_ == MetadataResourceTypes.MODEL_VERSION:
@@ -5387,14 +5609,74 @@ class TestRunMetadata:
             or type_ == MetadataResourceTypes.STEP_RUN
         ):
             step_name = sample_name("foo")
-            deployment = client.zen_store.create_deployment(
-                PipelineDeploymentRequest(
-                    user=client.active_user.id,
-                    workspace=client.active_workspace.id,
+            snapshot = client.zen_store.create_snapshot(
+                PipelineSnapshotRequest(
+                    project=client.active_project.id,
                     run_name_template=sample_name("foo"),
                     pipeline_configuration=PipelineConfiguration(
                         name=sample_name("foo")
                     ),
+                    stack=client.active_stack.id,
+                    pipeline=pipeline_model.id,
+                    client_version="0.1.0",
+                    server_version="0.1.0",
+                    step_configurations={
+                        step_name: Step(
+                            spec=StepSpec(
+                                source=Source(
+                                    module="acme.foo",
+                                    type=SourceType.INTERNAL,
+                                ),
+                                upstream_steps=[],
+                            ),
+                            config=StepConfiguration(name=step_name),
+                        )
+                    },
+                    is_dynamic=False,
+                )
+            )
+            pr, _ = client.zen_store.get_or_create_run(
+                PipelineRunRequest(
+                    project=client.active_project.id,
+                    id=uuid4(),
+                    name=sample_name("foo"),
+                    snapshot=snapshot.id,
+                    status=ExecutionStatus.RUNNING,
+                )
+            )
+            sr = client.zen_store.create_run_step(
+                StepRunRequest(
+                    project=client.active_project.id,
+                    name=step_name,
+                    status=ExecutionStatus.RUNNING,
+                    pipeline_run_id=pr.id,
+                    start_time=datetime.now(),
+                )
+            )
+            resource = (
+                pr if type_ == MetadataResourceTypes.PIPELINE_RUN else sr
+            )
+
+        elif type_ == MetadataResourceTypes.SCHEDULE:
+            step_name = sample_name("foo")
+            resource = client.zen_store.create_schedule(
+                ScheduleRequest(
+                    name="foo",
+                    cron_expression="*/5 * * * *",
+                    project=client.active_project.id,
+                    orchestrator_id=client.active_stack.orchestrator.id,
+                    active=False,
+                    pipeline_id=pipeline_model.id,
+                )
+            )
+            snapshot = client.zen_store.create_snapshot(
+                PipelineSnapshotRequest(
+                    project=client.active_project.id,
+                    run_name_template=sample_name("foo"),
+                    pipeline_configuration=PipelineConfiguration(
+                        name=sample_name("foo")
+                    ),
+                    pipeline=pipeline_model.id,
                     stack=client.active_stack.id,
                     client_version="0.1.0",
                     server_version="0.1.0",
@@ -5410,38 +5692,17 @@ class TestRunMetadata:
                             config=StepConfiguration(name=step_name),
                         )
                     },
+                    schedule=resource.id,
+                    is_dynamic=False,
                 )
             )
-            pr = client.zen_store.create_run(
-                PipelineRunRequest(
-                    user=client.active_user.id,
-                    workspace=client.active_workspace.id,
-                    id=uuid4(),
-                    name=sample_name("foo"),
-                    deployment=deployment.id,
-                    status=ExecutionStatus.RUNNING,
-                )
-            )
-            sr = client.zen_store.create_run_step(
-                StepRunRequest(
-                    user=client.active_user.id,
-                    workspace=client.active_workspace.id,
-                    name=step_name,
-                    status=ExecutionStatus.RUNNING,
-                    pipeline_run_id=pr.id,
-                    deployment=deployment.id,
-                )
-            )
-            resource = (
-                pr if type_ == MetadataResourceTypes.PIPELINE_RUN else sr
-            )
+        else:
+            raise ValueError("Unknown/untested MetadataResourceType.")
 
-        rm = client.zen_store.create_run_metadata(
+        client.zen_store.create_run_metadata(
             RunMetadataRequest(
-                user=client.active_user.id,
-                workspace=client.active_workspace.id,
-                resource_id=resource.id,
-                resource_type=type_,
+                project=client.active_project.id,
+                resources=[RunMetadataResource(id=resource.id, type=type_)],
                 values={"foo": "bar"},
                 types={"foo": MetadataTypeEnum.STRING},
                 stack_component_id=sc.id
@@ -5450,12 +5711,17 @@ class TestRunMetadata:
                 else None,
             )
         )
-        rm = client.zen_store.get_run_metadata(rm[0].id, True)
-        assert rm.key == "foo"
-        assert rm.value == "bar"
-        assert rm.resource_id == resource.id
-        assert rm.resource_type == type_
-        assert rm.type == MetadataTypeEnum.STRING
+        if type_ == MetadataResourceTypes.PIPELINE_RUN:
+            rm = client.zen_store.get_run(resource.id, True).run_metadata
+            assert rm["foo"] == "bar"
+
+        elif type_ == MetadataResourceTypes.STEP_RUN:
+            rm = client.zen_store.get_run_step(resource.id, True).run_metadata
+            assert rm["foo"] == "bar"
+
+        elif type_ == MetadataResourceTypes.SCHEDULE:
+            rm = client.zen_store.get_schedule(resource.id, True).run_metadata
+            assert rm["foo"] == "bar"
 
         if type_ == MetadataResourceTypes.ARTIFACT_VERSION:
             client.zen_store.delete_artifact_version(resource.id)
@@ -5467,11 +5733,12 @@ class TestRunMetadata:
             or type_ == MetadataResourceTypes.STEP_RUN
         ):
             client.zen_store.delete_run(pr.id)
-            client.zen_store.delete_deployment(deployment.id)
+            client.zen_store.delete_snapshot(snapshot.id)
+        elif type_ == MetadataResourceTypes.SCHEDULE:
+            client.zen_store.delete_snapshot(snapshot.id)
+            client.zen_store.delete_schedule(resource.id)
 
-        with pytest.raises(KeyError):
-            client.zen_store.get_run_metadata(rm.id)
-
+        client.zen_store.delete_pipeline(pipeline_model.id)
         client.zen_store.delete_stack_component(sc.id)
 
 
@@ -5494,3 +5761,447 @@ def test_updating_the_pipeline_run_status(step_status, expected_run_status):
         )
         run_status = Client().get_pipeline_run(run_context.runs[-1].id).status
         assert run_status == expected_run_status
+
+
+@step
+def produce_artifact() -> int:
+    """Produces an artifact and tags it."""
+    add_tags(tags=["tag2"], infer_artifact=True)
+    return 42
+
+
+@pipeline(tags=["tag3", Tag(name="tag4", cascade=True)])
+def tag_filter_test_pipeline():
+    """Pipeline that produces an artifact and tags it."""
+    _ = produce_artifact()
+
+
+def test_tag_filter_with_resource_type(clean_client: "Client"):
+    """Tests that tags can be filtered by resource type."""
+    # Create some tags to use
+    _ = clean_client.create_tag(name="tag1", color="red")
+
+    # Run the pipeline
+    tag_filter_test_pipeline()
+
+    # Test filtering tags by pipeline run resource type
+    tags = clean_client.list_tags(
+        resource_type=TaggableResourceTypes.PIPELINE_RUN
+    )
+    assert len(tags) == 2
+    assert {t.name for t in tags} == {"tag3", "tag4"}
+
+    # Test filtering tags by artifact version resource type
+    tags = clean_client.list_tags(
+        resource_type=TaggableResourceTypes.ARTIFACT_VERSION
+    )
+    assert len(tags) == 2
+    assert {t.name for t in tags} == {"tag2", "tag4"}
+
+    # Test default behavior (no resource type filter)
+    tags = clean_client.list_tags()
+    assert len(tags) == 4
+    assert {t.name for t in tags} == {"tag1", "tag2", "tag3", "tag4"}
+
+    # Test combining resource type filter with name filter
+    tags = clean_client.list_tags(
+        resource_type=TaggableResourceTypes.ARTIFACT_VERSION, name="tag2"
+    )
+    assert len(tags) == 1
+    assert tags[0].name == "tag2"
+
+    # Test filtering for a resource type that doesn't have tags
+    tags = clean_client.list_tags(resource_type=TaggableResourceTypes.MODEL)
+    assert len(tags) == 0
+
+
+class TestCuratedVisualizations:
+    """Test curated visualizations."""
+
+    def test_curated_visualizations_across_resources(self):
+        """Test creating, listing, updating, and deleting curated visualizations.
+
+        Each curated visualization is linked to exactly one resource. This test
+        creates separate visualizations for each supported resource type:
+
+        - **Deployments** (VisualizationResourceTypes.DEPLOYMENT)
+        - **Models** (VisualizationResourceTypes.MODEL)
+        - **Pipelines** (VisualizationResourceTypes.PIPELINE)
+        - **Pipeline Runs** (VisualizationResourceTypes.PIPELINE_RUN)
+        - **Pipeline Snapshots** (VisualizationResourceTypes.PIPELINE_SNAPSHOT)
+        - **Projects** (VisualizationResourceTypes.PROJECT)
+        """
+        client = Client()
+        project_id = client.active_project.id
+
+        resource_configs = [
+            {
+                "resource_type": VisualizationResourceTypes.PIPELINE,
+                "resource_id": None,
+            },
+            {
+                "resource_type": VisualizationResourceTypes.MODEL,
+                "resource_id": None,
+            },
+            {
+                "resource_type": VisualizationResourceTypes.PIPELINE_RUN,
+                "resource_id": None,
+            },
+            {
+                "resource_type": VisualizationResourceTypes.PIPELINE_SNAPSHOT,
+                "resource_id": None,
+            },
+            {
+                "resource_type": VisualizationResourceTypes.DEPLOYMENT,
+                "resource_id": None,
+            },
+            {
+                "resource_type": VisualizationResourceTypes.PROJECT,
+                "resource_id": None,
+            },
+        ]
+
+        def create_artifact_version():
+            artifact = client.zen_store.create_artifact(
+                ArtifactRequest(
+                    name=sample_name("artifact"),
+                    project=project_id,
+                    has_custom_name=True,
+                )
+            )
+            artifact_version = client.zen_store.create_artifact_version(
+                ArtifactVersionRequest(
+                    artifact_id=artifact.id,
+                    project=project_id,
+                    version="1",
+                    type=ArtifactType.DATA,
+                    uri=sample_name("artifact_uri"),
+                    materializer=Source(
+                        module="acme.foo", type=SourceType.INTERNAL
+                    ),
+                    data_type=Source(
+                        module="acme.foo", type=SourceType.INTERNAL
+                    ),
+                    save_type=ArtifactSaveType.STEP_OUTPUT,
+                    visualizations=[
+                        ArtifactVisualizationRequest(
+                            type=VisualizationType.HTML,
+                            uri=f"s3://visualizations/{config['resource_type'].value}_{index}.html",
+                        )
+                        for index, config in enumerate(resource_configs)
+                    ],
+                )
+            )
+
+            return artifact, artifact_version
+
+        artifact, artifact_version = create_artifact_version()
+
+        pipeline_model = client.zen_store.create_pipeline(
+            PipelineRequest(
+                name=sample_name("pipeline"),
+                project=project_id,
+            )
+        )
+
+        step_name = sample_name("step")
+        snapshot = client.zen_store.create_snapshot(
+            PipelineSnapshotRequest(
+                project=project_id,
+                run_name_template=sample_name("run"),
+                pipeline_configuration=PipelineConfiguration(
+                    name=sample_name("pipeline-config")
+                ),
+                pipeline=pipeline_model.id,
+                stack=client.active_stack.id,
+                client_version="0.1.0",
+                server_version="0.1.0",
+                step_configurations={
+                    step_name: Step(
+                        spec=StepSpec(
+                            source=Source(
+                                module="acme.step", type=SourceType.INTERNAL
+                            ),
+                            upstream_steps=[],
+                        ),
+                        config=StepConfiguration(name=step_name),
+                    )
+                },
+                is_dynamic=False,
+            )
+        )
+
+        pipeline_run, _ = client.zen_store.get_or_create_run(
+            PipelineRunRequest(
+                project=project_id,
+                id=uuid4(),
+                name=sample_name("run"),
+                snapshot=snapshot.id,
+                status=ExecutionStatus.RUNNING,
+            )
+        )
+        model = client.zen_store.create_model(
+            ModelRequest(
+                project=project_id,
+                name=sample_name("model"),
+            )
+        )
+
+        deployer = client.zen_store.create_stack_component(
+            ComponentRequest(
+                name=sample_name("foo"),
+                type=StackComponentType.DEPLOYER,
+                flavor="docker",
+                configuration={},
+            )
+        )
+
+        # Create a deployment
+        deployment = client.zen_store.create_deployment(
+            DeploymentRequest(
+                project=project_id,
+                name=sample_name("deployment"),
+                snapshot_id=snapshot.id,
+                deployer_id=deployer.id,
+            )
+        )
+
+        def create_visualizations(artifact_version):
+            visualizations = {}
+            artifact_visualizations = artifact_version.visualizations or []
+            for artifact_viz, config in zip(
+                artifact_visualizations, resource_configs
+            ):
+                resource_type = config["resource_type"]
+                resource_id = config["resource_id"]
+                viz = client.zen_store.create_curated_visualization(
+                    CuratedVisualizationRequest(
+                        project=project_id,
+                        artifact_visualization_id=artifact_viz.id,
+                        resource_id=resource_id,
+                        resource_type=resource_type,
+                        display_name=f"{resource_type.value} visualization",
+                    )
+                )
+                hydrated = client.zen_store.get_curated_visualization(
+                    visualization_id=viz.id,
+                    hydrate=True,
+                )
+                assert hydrated.resource_id == resource_id
+                assert hydrated.resource_type == resource_type
+                assert (
+                    hydrated.layout_size == CuratedVisualizationSize.FULL_WIDTH
+                )
+                visualizations[resource_type] = viz
+            return visualizations
+
+        try:
+            resource_configs[0]["resource_id"] = pipeline_model.id
+            resource_configs[1]["resource_id"] = model.id
+            resource_configs[2]["resource_id"] = pipeline_run.id
+            resource_configs[3]["resource_id"] = snapshot.id
+            resource_configs[4]["resource_id"] = deployment.id
+            resource_configs[5]["resource_id"] = project_id
+
+            visualizations = create_visualizations(artifact_version)
+
+            loaded = client.zen_store.get_curated_visualization(
+                visualizations[VisualizationResourceTypes.PIPELINE].id,
+                hydrate=True,
+            )
+            assert (
+                loaded.display_name
+                == f"{VisualizationResourceTypes.PIPELINE.value} visualization"
+            )
+            assert loaded.layout_size == CuratedVisualizationSize.FULL_WIDTH
+            assert loaded.resource_id == pipeline_model.id
+            assert loaded.resource_type == VisualizationResourceTypes.PIPELINE
+
+            # Test duplicate creation - same artifact visualization + resource should fail
+            with pytest.raises(EntityExistsError):
+                client.zen_store.create_curated_visualization(
+                    CuratedVisualizationRequest(
+                        project=project_id,
+                        artifact_visualization_id=loaded.artifact_visualization_id,
+                        resource_id=pipeline_model.id,
+                        resource_type=VisualizationResourceTypes.PIPELINE,
+                    )
+                )
+
+            # Test update
+            updated = client.zen_store.update_curated_visualization(
+                visualization_id=visualizations[
+                    VisualizationResourceTypes.MODEL
+                ].id,
+                visualization_update=CuratedVisualizationUpdate(
+                    display_name="Updated",
+                    display_order=5,
+                    layout_size=CuratedVisualizationSize.HALF_WIDTH,
+                ),
+            )
+            assert updated.display_name == "Updated"
+            assert updated.display_order == 5
+            assert updated.layout_size == CuratedVisualizationSize.HALF_WIDTH
+
+            # Delete all visualizations
+            for viz in visualizations.values():
+                client.zen_store.delete_curated_visualization(viz.id)
+
+            for viz in visualizations.values():
+                with pytest.raises(KeyError):
+                    client.zen_store.get_curated_visualization(viz.id)
+
+            visualizations = create_visualizations(artifact_version)
+
+            # Clean up artifact
+            client.zen_store.delete_artifact(artifact.id)
+
+            # Check that all visualizations have been auto-deleted
+            for viz in visualizations.values():
+                with pytest.raises(KeyError):
+                    client.zen_store.get_curated_visualization(viz.id)
+
+            artifact, artifact_version = create_artifact_version()
+            visualizations = create_visualizations(artifact_version)
+
+            # Clean up deployment
+            client.zen_store.delete_deployment(deployment.id)
+
+            with pytest.raises(KeyError):
+                client.zen_store.get_curated_visualization(
+                    visualizations[VisualizationResourceTypes.DEPLOYMENT].id
+                )
+
+            # Clean up pipeline run
+            client.zen_store.delete_run(pipeline_run.id)
+            with pytest.raises(KeyError):
+                client.zen_store.get_curated_visualization(
+                    visualizations[VisualizationResourceTypes.PIPELINE_RUN].id
+                )
+
+            # Clean up model
+            client.zen_store.delete_model(model.id)
+            with pytest.raises(KeyError):
+                client.zen_store.get_curated_visualization(
+                    visualizations[VisualizationResourceTypes.MODEL].id
+                )
+
+            # Clean up snapshot
+            client.zen_store.delete_snapshot(snapshot.id)
+            with pytest.raises(KeyError):
+                client.zen_store.get_curated_visualization(
+                    visualizations[
+                        VisualizationResourceTypes.PIPELINE_SNAPSHOT
+                    ].id
+                )
+
+            # Clean up pipeline
+            client.zen_store.delete_pipeline(pipeline_model.id)
+            with pytest.raises(KeyError):
+                client.zen_store.get_curated_visualization(
+                    visualizations[VisualizationResourceTypes.PIPELINE].id
+                )
+
+        finally:
+            # Clean up deployment
+            try:
+                client.zen_store.delete_deployment(deployment.id)
+            except KeyError:
+                pass
+
+            # Clean up pipeline run
+            try:
+                client.zen_store.delete_run(pipeline_run.id)
+            except KeyError:
+                pass
+
+            # Clean up model
+            try:
+                client.zen_store.delete_model(model.id)
+            except KeyError:
+                pass
+
+            # Clean up snapshot
+            try:
+                client.zen_store.delete_snapshot(snapshot.id)
+            except KeyError:
+                pass
+
+            # Clean up pipeline
+            try:
+                client.zen_store.delete_pipeline(pipeline_model.id)
+            except KeyError:
+                pass
+
+            # Clean up deployer
+            try:
+                client.zen_store.delete_stack_component(deployer.id)
+            except KeyError:
+                pass
+
+            # Clean up artifact
+            try:
+                client.zen_store.delete_artifact(artifact.id)
+            except KeyError:
+                pass
+
+    def test_curated_visualizations_project_only(self):
+        """Test project-level curated visualizations with single resource."""
+
+        client = Client()
+        project = client.active_project
+
+        artifact = client.zen_store.create_artifact(
+            ArtifactRequest(
+                name=sample_name("artifact"),
+                project=project.id,
+                has_custom_name=True,
+            )
+        )
+        artifact_version = client.zen_store.create_artifact_version(
+            ArtifactVersionRequest(
+                artifact_id=artifact.id,
+                project=project.id,
+                version="1",
+                type=ArtifactType.DATA,
+                uri=sample_name("artifact_uri"),
+                materializer=Source(
+                    module="acme.foo", type=SourceType.INTERNAL
+                ),
+                data_type=Source(module="acme.foo", type=SourceType.INTERNAL),
+                save_type=ArtifactSaveType.STEP_OUTPUT,
+                visualizations=[
+                    ArtifactVisualizationRequest(
+                        type=VisualizationType.HTML,
+                        uri="s3://visualizations/project.html",
+                    )
+                ],
+            )
+        )
+
+        artifact_visualization = (artifact_version.visualizations or [])[0]
+
+        visualization = client.create_curated_visualization(
+            artifact_visualization_id=artifact_visualization.id,
+            resource_id=project.id,
+            resource_type=VisualizationResourceTypes.PROJECT,
+            project_id=project.id,
+            display_name="Project visualization",
+        )
+
+        hydrated_visualization = client.zen_store.get_curated_visualization(
+            visualization.id, hydrate=True
+        )
+        assert hydrated_visualization.resource_id == project.id
+        assert (
+            hydrated_visualization.resource_type
+            == VisualizationResourceTypes.PROJECT
+        )
+        assert hydrated_visualization.display_name == "Project visualization"
+
+        client.delete_curated_visualization(visualization.id)
+        with pytest.raises(KeyError):
+            client.zen_store.get_curated_visualization(visualization.id)
+
+        client.delete_artifact_version(artifact_version.id)
+        client.delete_artifact(artifact.id)

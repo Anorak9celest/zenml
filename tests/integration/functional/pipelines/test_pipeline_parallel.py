@@ -54,10 +54,12 @@ class TestArtifactsManagement:
             res = clean_client.get_pipeline_run(f"{run_prefix}_{i}")
             assert res.status == "completed", "some pipeline failed"
 
-        res = clean_client.list_artifact_versions(size=1000, name="artifact")
-        assert (
-            len(res.items) == runs_count * steps_count
-        ), "not all artifacts are registered"
+        res = clean_client.list_artifact_versions(
+            size=1000, artifact="artifact"
+        )
+        assert len(res.items) == runs_count * steps_count, (
+            "not all artifacts are registered"
+        )
         assert {r.load() for r in res.items} == {
             100 * i + j for i in range(runs_count) for j in range(steps_count)
         }, "not all artifacts are registered with proper values"

@@ -14,20 +14,33 @@
 """Endpoint definitions for stack deployments."""
 
 import datetime
-from typing import Optional, Tuple
+from typing import Optional
 
 from fastapi import APIRouter, Request, Security
 
-from zenml.constants import API, INFO, STACK, STACK_DEPLOYMENT, URL, VERSION_1
+from zenml.constants import (
+    API,
+    CONFIG,
+    INFO,
+    STACK,
+    STACK_DEPLOYMENT,
+    STACK_DEPLOYMENT_API_TOKEN_EXPIRATION,
+    VERSION_1,
+)
 from zenml.enums import StackDeploymentProvider
-from zenml.models import DeployedStack, StackDeploymentInfo
+from zenml.models import (
+    DeployedStack,
+    StackDeploymentConfig,
+    StackDeploymentInfo,
+)
 from zenml.stack_deployments.utils import get_stack_deployment_class
-from zenml.zen_server.auth import AuthContext, authorize
+from zenml.zen_server.auth import AuthContext, authorize, generate_access_token
 from zenml.zen_server.exceptions import error_response
 from zenml.zen_server.rbac.models import Action, ResourceType
 from zenml.zen_server.rbac.utils import verify_permission
 from zenml.zen_server.utils import (
-    handle_exceptions,
+    async_fastapi_endpoint_wrapper,
+    server_config,
 )
 
 router = APIRouter(
@@ -40,7 +53,7 @@ router = APIRouter(
 @router.get(
     INFO,
 )
-@handle_exceptions
+@async_fastapi_endpoint_wrapper
 def get_stack_deployment_info(
     provider: StackDeploymentProvider,
     _: AuthContext = Security(authorize),
@@ -54,27 +67,21 @@ def get_stack_deployment_info(
         Information about the stack deployment provider.
     """
     stack_deployment_class = get_stack_deployment_class(provider)
-    return StackDeploymentInfo(
-        provider=provider,
-        description=stack_deployment_class.description(),
-        instructions=stack_deployment_class.instructions(),
-        post_deploy_instructions=stack_deployment_class.post_deploy_instructions(),
-        permissions=stack_deployment_class.permissions(),
-        locations=stack_deployment_class.locations(),
-    )
+    return stack_deployment_class.get_deployment_info()
 
 
 @router.get(
-    URL,
+    CONFIG,
 )
-@handle_exceptions
-def get_stack_deployment_url(
+@async_fastapi_endpoint_wrapper
+def get_stack_deployment_config(
     request: Request,
     provider: StackDeploymentProvider,
     stack_name: str,
     location: Optional[str] = None,
+    terraform: bool = False,
     auth_context: AuthContext = Security(authorize),
-) -> Tuple[str, str]:
+) -> StackDeploymentConfig:
     """Return the URL to deploy the ZenML stack to the specified cloud provider.
 
     Args:
@@ -82,11 +89,12 @@ def get_stack_deployment_url(
         provider: The stack deployment provider.
         stack_name: The name of the stack.
         location: The location where the stack should be deployed.
+        terraform: Whether the stack should be deployed using Terraform.
         auth_context: The authentication context.
 
     Returns:
-        The URL to deploy the ZenML stack to the specified cloud provider
-        and a text description of the URL.
+        The cloud provider console URL where the stack will be deployed and
+        the configuration for the stack deployment.
     """
     verify_permission(
         resource_type=ResourceType.SERVICE_CONNECTOR, action=Action.CREATE
@@ -98,32 +106,46 @@ def get_stack_deployment_url(
     verify_permission(resource_type=ResourceType.STACK, action=Action.CREATE)
 
     stack_deployment_class = get_stack_deployment_class(provider)
-    # Get the base server URL used to call this FastAPI endpoint
-    url = request.url.replace(path="").replace(query="")
-    # Use HTTPS for the URL
-    url = url.replace(scheme="https")
+
+    config = server_config()
+    if config.server_url:
+        url = config.server_url
+    else:
+        # Get the base server URL used to call this FastAPI endpoint
+        url = str(
+            request.url.replace(path="")
+            .replace(query="")
+            .replace(scheme="https")
+        )
 
     token = auth_context.access_token
     assert token is not None
 
     # A new API token is generated for the stack deployment
-    expires = datetime.datetime.utcnow() + datetime.timedelta(minutes=60)
-    api_token = token.encode(expires=expires)
+    api_token = generate_access_token(
+        user_id=token.user_id,
+        expires_in=STACK_DEPLOYMENT_API_TOKEN_EXPIRATION * 60,
+    ).access_token
 
     return stack_deployment_class(
-        stack_name=stack_name, location=location
-    ).deploy_url(zenml_server_url=str(url), zenml_server_api_token=api_token)
+        terraform=terraform,
+        stack_name=stack_name,
+        location=location,
+        zenml_server_url=str(url),
+        zenml_server_api_token=api_token,
+    ).get_deployment_config()
 
 
 @router.get(
     STACK,
 )
-@handle_exceptions
+@async_fastapi_endpoint_wrapper
 def get_deployed_stack(
     provider: StackDeploymentProvider,
     stack_name: str,
     location: Optional[str] = None,
     date_start: Optional[datetime.datetime] = None,
+    terraform: bool = False,
     _: AuthContext = Security(authorize),
 ) -> Optional[DeployedStack]:
     """Return a matching ZenML stack that was deployed and registered.
@@ -133,6 +155,7 @@ def get_deployed_stack(
         stack_name: The name of the stack.
         location: The location where the stack should be deployed.
         date_start: The date when the deployment started.
+        terraform: Whether the stack was deployed using Terraform.
 
     Returns:
         The ZenML stack that was deployed and registered or None if the stack
@@ -140,5 +163,10 @@ def get_deployed_stack(
     """
     stack_deployment_class = get_stack_deployment_class(provider)
     return stack_deployment_class(
-        stack_name=stack_name, location=location
+        terraform=terraform,
+        stack_name=stack_name,
+        location=location,
+        # These fields are not needed for this operation
+        zenml_server_url="",
+        zenml_server_api_token="",
     ).get_stack(date_start=date_start)

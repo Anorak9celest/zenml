@@ -30,13 +30,11 @@ from zenml.integrations.hyperai.flavors.hyperai_orchestrator_flavor import (
     HyperAIOrchestratorSettings,
 )
 from zenml.logger import get_logger
-from zenml.orchestrators import (
-    ContainerizedOrchestrator,
-)
+from zenml.orchestrators import ContainerizedOrchestrator, SubmissionResult
 from zenml.stack import Stack, StackValidator
 
 if TYPE_CHECKING:
-    from zenml.models import PipelineDeploymentResponse
+    from zenml.models import PipelineRunResponse, PipelineSnapshotResponse
 
 logger = get_logger(__name__)
 
@@ -159,13 +157,20 @@ class HyperAIOrchestrator(ContainerizedOrchestrator):
                 f"Failed to write {description} to HyperAI instance. Does the user have permissions to write?"
             )
 
-    def prepare_or_run_pipeline(
+    def submit_pipeline(
         self,
-        deployment: "PipelineDeploymentResponse",
+        snapshot: "PipelineSnapshotResponse",
         stack: "Stack",
-        environment: Dict[str, str],
-    ) -> Any:
-        """Sequentially runs all pipeline steps in Docker containers.
+        base_environment: Dict[str, str],
+        step_environments: Dict[str, Dict[str, str]],
+        placeholder_run: Optional["PipelineRunResponse"] = None,
+    ) -> Optional[SubmissionResult]:
+        """Submits a pipeline to the orchestrator.
+
+        This method should only submit the pipeline and not wait for it to
+        complete. If the orchestrator is configured to wait for the pipeline run
+        to complete, a function that waits for the pipeline run to complete can
+        be passed as part of the submission result.
 
         Assumes that:
         - A HyperAI (hyperai.ai) instance is running on the configured IP address.
@@ -178,41 +183,40 @@ class HyperAIOrchestrator(ContainerizedOrchestrator):
             orchestrator.
 
         Args:
-            deployment: The pipeline deployment to prepare or run.
+            snapshot: The pipeline snapshot to submit.
             stack: The stack the pipeline will run on.
-            environment: Environment variables to set in the orchestration
-                environment.
+            base_environment: Base environment shared by all steps. This should
+                be set if your orchestrator for example runs one container that
+                is responsible for starting all the steps.
+            step_environments: Environment variables to set when executing
+                specific steps.
+            placeholder_run: An optional placeholder run for the snapshot.
 
         Raises:
-            RuntimeError: If a step fails.
+            RuntimeError: If running the pipeline fails.
+
+        Returns:
+            Optional submission result.
         """
         from zenml.integrations.hyperai.service_connectors.hyperai_service_connector import (
             HyperAIServiceConnector,
         )
 
-        # Basic Docker Compose definition
         compose_definition: Dict[str, Any] = {"version": "3", "services": {}}
+        snapshot_id = snapshot.id
 
-        # Get deployment id
-        deployment_id = deployment.id
-
-        # Set environment
-        os.environ[ENV_ZENML_HYPERAI_RUN_ID] = str(deployment_id)
-        environment[ENV_ZENML_HYPERAI_RUN_ID] = str(deployment_id)
+        os.environ[ENV_ZENML_HYPERAI_RUN_ID] = str(snapshot_id)
 
         # Add each step as a service to the Docker Compose definition
         logger.info("Preparing pipeline steps for deployment.")
-        for step_name, step in deployment.step_configurations.items():
+        for step_name, step in snapshot.step_configurations.items():
             # Get image
-            image = self.get_image(deployment=deployment, step_name=step_name)
+            image = self.get_image(snapshot=snapshot, step_name=step_name)
 
-            # Get settings
             step_settings = cast(
                 HyperAIOrchestratorSettings, self.get_settings(step)
             )
-
-            # Define container name as combination between deployment id and step name
-            container_name = f"{deployment_id}-{step_name}"
+            container_name = f"{snapshot_id}-{step_name}"
 
             # Make Compose service definition for step
             compose_definition["services"][container_name] = {
@@ -221,7 +225,7 @@ class HyperAIOrchestrator(ContainerizedOrchestrator):
                 "network_mode": "host",
                 "entrypoint": StepEntrypointConfiguration.get_entrypoint_command(),
                 "command": StepEntrypointConfiguration.get_entrypoint_arguments(
-                    step_name=step_name, deployment_id=deployment.id
+                    step_name=step_name, snapshot_id=snapshot.id
                 ),
                 "volumes": [
                     "{}:{}".format(
@@ -244,18 +248,20 @@ class HyperAIOrchestrator(ContainerizedOrchestrator):
                     }
                 }
 
+            # Add run ID to step environment variables
+            step_env = step_environments[step_name].copy()
+
             # Depending on whether it is a scheduled or a realtime pipeline, add
             # potential .env file to service definition for deployment ID override.
-            if deployment.schedule:
-                # drop ZENML_HYPERAI_ORCHESTRATOR_RUN_ID from environment but only if it is set
-                if ENV_ZENML_HYPERAI_RUN_ID in environment:
-                    del environment[ENV_ZENML_HYPERAI_RUN_ID]
+            if snapshot.schedule:
                 compose_definition["services"][container_name]["env_file"] = [
                     ".env"
                 ]
+            else:
+                step_env[ENV_ZENML_HYPERAI_RUN_ID] = str(snapshot_id)
 
             compose_definition["services"][container_name]["environment"] = (
-                environment
+                step_env
             )
 
             # Add dependency on upstream steps if applicable
@@ -268,7 +274,7 @@ class HyperAIOrchestrator(ContainerizedOrchestrator):
 
                 for upstream_step_name in upstream_steps:
                     upstream_container_name = (
-                        f"{deployment_id}-{upstream_step_name}"
+                        f"{snapshot_id}-{upstream_step_name}"
                     )
                     compose_definition["services"][container_name][
                         "depends_on"
@@ -280,15 +286,12 @@ class HyperAIOrchestrator(ContainerizedOrchestrator):
                         }
                     )
 
-        # Convert into yaml
-        logger.info("Finalizing Docker Compose definition.")
         compose_definition_yaml: str = yaml.dump(compose_definition)
 
         # Connect to configured HyperAI instance
         logger.info(
             "Connecting to HyperAI instance and placing Docker Compose file."
         )
-        paramiko_client: paramiko.SSHClient
         if connector := self.get_connector():
             paramiko_client = connector.connect()
             if paramiko_client is None:
@@ -377,7 +380,7 @@ class HyperAIOrchestrator(ContainerizedOrchestrator):
         )
         directory_name = (
             nonscheduled_directory_name
-            if not deployment.schedule
+            if not snapshot.schedule
             else self._escape_shell_command(
                 f"/home/{username}/scheduled-pipeline-runs"
             )
@@ -423,7 +426,7 @@ class HyperAIOrchestrator(ContainerizedOrchestrator):
         with tempfile.NamedTemporaryFile(mode="w", delete=True) as f:
             # Define bash line and command line
             bash_line = "#!/bin/bash\n"
-            command_line = f'cd {directory_name} && echo {ENV_ZENML_HYPERAI_RUN_ID}="{deployment_id}_$(date +\%s)" > .env && docker compose up -d'
+            command_line = rf'cd {directory_name} && echo {ENV_ZENML_HYPERAI_RUN_ID}="{snapshot_id}_$(date +\%s)" > .env && docker compose up -d'
 
             # Write script to temporary file
             with f.file as f_:
@@ -440,7 +443,7 @@ class HyperAIOrchestrator(ContainerizedOrchestrator):
             )
 
         # Run or schedule Docker Compose file depending on settings
-        if not deployment.schedule:
+        if not snapshot.schedule:
             logger.info(
                 "Starting ZenML pipeline on HyperAI instance. Depending on the size of your container image, this may take a while..."
             )
@@ -451,9 +454,9 @@ class HyperAIOrchestrator(ContainerizedOrchestrator):
             # Log errors in case of failure
             for line in stderr.readlines():
                 logger.info(line)
-        elif deployment.schedule and deployment.schedule.cron_expression:
+        elif snapshot.schedule and snapshot.schedule.cron_expression:
             # Get cron expression for scheduled pipeline
-            cron_expression = deployment.schedule.cron_expression
+            cron_expression = snapshot.schedule.cron_expression
             if not cron_expression:
                 raise RuntimeError(
                     "A cron expression is required for scheduled pipelines."
@@ -476,9 +479,9 @@ class HyperAIOrchestrator(ContainerizedOrchestrator):
             logger.info(
                 f"Pipeline scheduled successfully in crontab with cron expression: {cron_expression}"
             )
-        elif deployment.schedule and deployment.schedule.run_once_start_time:
+        elif snapshot.schedule and snapshot.schedule.run_once_start_time:
             # Get start time for scheduled pipeline
-            start_time = deployment.schedule.run_once_start_time
+            start_time = snapshot.schedule.run_once_start_time
 
             # Log about scheduling
             logger.info(f"Requested start time: {start_time}")
@@ -508,3 +511,5 @@ class HyperAIOrchestrator(ContainerizedOrchestrator):
             raise RuntimeError(
                 "A cron expression or start time is required for scheduled pipelines."
             )
+
+        return None

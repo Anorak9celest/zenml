@@ -23,42 +23,49 @@ from typing import (
     Tuple,
     Union,
 )
+from uuid import UUID
 
 from pydantic import (
     ConfigDict,
+    Field,
     SerializeAsAny,
     field_validator,
     model_validator,
 )
 
+from zenml.artifacts.artifact_config import ArtifactConfig
 from zenml.artifacts.external_artifact_config import (
     ExternalArtifactConfiguration,
 )
 from zenml.client_lazy_loader import ClientLazyLoader
 from zenml.config.base_settings import BaseSettings, SettingsOrDict
+from zenml.config.cache_policy import CachePolicy, CachePolicyWithValidator
 from zenml.config.constants import DOCKER_SETTINGS_KEY, RESOURCE_SETTINGS_KEY
+from zenml.config.frozen_base_model import FrozenBaseModel
 from zenml.config.retry_config import StepRetryConfig
 from zenml.config.source import Source, SourceWithValidator
-from zenml.config.strict_base_model import StrictBaseModel
+from zenml.enums import StepRuntime
 from zenml.logger import get_logger
 from zenml.model.lazy_load import ModelVersionDataLazyLoader
 from zenml.model.model import Model
 from zenml.utils import deprecation_utils
-from zenml.utils.pydantic_utils import before_validator_handler
+from zenml.utils.pydantic_utils import before_validator_handler, update_model
 
 if TYPE_CHECKING:
     from zenml.config import DockerSettings, ResourceSettings
+    from zenml.config.pipeline_configurations import PipelineConfiguration
 
 logger = get_logger(__name__)
 
 
-class PartialArtifactConfiguration(StrictBaseModel):
+class PartialArtifactConfiguration(FrozenBaseModel):
     """Class representing a partial input/output artifact configuration."""
 
-    materializer_source: Optional[Tuple[Source, ...]] = None
-    # TODO: This could be moved to the `PipelineDeployment` as it's the same
+    materializer_source: Optional[Tuple[SourceWithValidator, ...]] = None
+    # TODO: This could be moved to the `PipelineSnapshot` as it's the same
     # for all steps/outputs
-    default_materializer_source: Optional[Source] = None
+    default_materializer_source: Optional[SourceWithValidator] = None
+    artifact_config: Optional[ArtifactConfig] = None
 
     @model_validator(mode="before")
     @classmethod
@@ -109,13 +116,14 @@ class PartialArtifactConfiguration(StrictBaseModel):
 class ArtifactConfiguration(PartialArtifactConfiguration):
     """Class representing a complete input/output artifact configuration."""
 
-    materializer_source: Tuple[Source, ...]
+    materializer_source: Tuple[SourceWithValidator, ...]
 
     @field_validator("materializer_source", mode="before")
     @classmethod
     def _convert_source(
-        cls, value: Union[Source, Dict[str, Any], str, Tuple[Source, ...]]
-    ) -> Tuple[Source, ...]:
+        cls,
+        value: Union[None, Source, Dict[str, Any], str, Tuple[Source, ...]],
+    ) -> Optional[Tuple[Source, ...]]:
         """Converts old source strings to tuples of source objects.
 
         Args:
@@ -134,40 +142,139 @@ class ArtifactConfiguration(PartialArtifactConfiguration):
         return value
 
 
-class StepConfigurationUpdate(StrictBaseModel):
+class StepConfigurationUpdate(FrozenBaseModel):
     """Class for step configuration updates."""
 
-    name: Optional[str] = None
-    enable_cache: Optional[bool] = None
-    enable_artifact_metadata: Optional[bool] = None
-    enable_artifact_visualization: Optional[bool] = None
-    enable_step_logs: Optional[bool] = None
-    step_operator: Optional[str] = None
-    experiment_tracker: Optional[str] = None
-    parameters: Dict[str, Any] = {}
-    settings: Dict[str, SerializeAsAny[BaseSettings]] = {}
-    extra: Dict[str, Any] = {}
-    failure_hook_source: Optional[SourceWithValidator] = None
-    success_hook_source: Optional[SourceWithValidator] = None
-    model: Optional[Model] = None
-    retry: Optional[StepRetryConfig] = None
+    enable_cache: Optional[bool] = Field(
+        default=None,
+        description="Whether to enable cache for the step.",
+    )
+    enable_artifact_metadata: Optional[bool] = Field(
+        default=None,
+        description="Whether to store metadata for the output artifacts of "
+        "the step.",
+    )
+    enable_artifact_visualization: Optional[bool] = Field(
+        default=None,
+        description="Whether to enable visualizations for the output "
+        "artifacts of the step.",
+    )
+    enable_step_logs: Optional[bool] = Field(
+        default=None,
+        description="Whether to enable logs for the step.",
+    )
+    step_operator: Optional[Union[bool, str]] = Field(
+        default=None,
+        description="The step operator to use for the step.",
+    )
+    experiment_tracker: Optional[Union[bool, str]] = Field(
+        default=None,
+        description="The experiment tracker to use for the step.",
+    )
+    parameters: Optional[Dict[str, Any]] = Field(
+        default=None,
+        description="Parameters for the step function.",
+    )
+    settings: Optional[Dict[str, SerializeAsAny[BaseSettings]]] = Field(
+        default=None,
+        description="Settings for the step.",
+    )
+    environment: Optional[Dict[str, str]] = Field(
+        default=None,
+        description="The environment for the step.",
+    )
+    secrets: Optional[List[Union[str, UUID]]] = Field(
+        default=None,
+        description="The secrets for the step.",
+    )
+    extra: Optional[Dict[str, Any]] = Field(
+        default=None,
+        description="Extra configurations for the step.",
+    )
+    failure_hook_source: Optional[SourceWithValidator] = Field(
+        default=None,
+        description="The failure hook source for the step.",
+    )
+    success_hook_source: Optional[SourceWithValidator] = Field(
+        default=None,
+        description="The success hook source for the step.",
+    )
+    model: Optional[Model] = Field(
+        default=None,
+        description="The model to use for the step.",
+    )
+    retry: Optional[StepRetryConfig] = Field(
+        default=None,
+        description="The retry configuration for the step.",
+    )
+    substitutions: Optional[Dict[str, str]] = Field(
+        default=None,
+        description="The substitutions for the step.",
+    )
+    cache_policy: Optional[CachePolicyWithValidator] = Field(
+        default=None,
+        description="The cache policy for the step.",
+    )
+    runtime: Optional[StepRuntime] = Field(
+        default=None,
+        description="The step runtime. If not configured, the step will "
+        "run inline unless a step operator or docker/resource settings "
+        "are configured. This is only applicable for dynamic pipelines.",
+    )
 
     outputs: Mapping[str, PartialArtifactConfiguration] = {}
 
-    _deprecation_validator = deprecation_utils.deprecate_pydantic_attributes(
-        "name"
-    )
+    def uses_step_operator(self, name: str) -> bool:
+        """Checks if the step configuration uses the given step operator.
+
+        Args:
+            name: The name of the step operator.
+
+        Returns:
+            If the step configuration uses the given step operator.
+        """
+        if self.step_operator is True:
+            return True
+        elif isinstance(self.step_operator, str):
+            return self.step_operator == name
+        else:
+            return False
+
+    def uses_experiment_tracker(self, name: str) -> bool:
+        """Checks if the step configuration uses the given experiment tracker.
+
+        Args:
+            name: The name of the experiment tracker.
+
+        Returns:
+            If the step configuration uses the given experiment tracker.
+        """
+        if self.experiment_tracker is True:
+            return True
+        elif isinstance(self.experiment_tracker, str):
+            return self.experiment_tracker == name
+        else:
+            return False
 
 
 class PartialStepConfiguration(StepConfigurationUpdate):
     """Class representing a partial step configuration."""
 
     name: str
+    # TODO: maybe move to spec?
+    template: Optional[str] = None
+    parameters: Dict[str, Any] = {}
+    settings: Dict[str, SerializeAsAny[BaseSettings]] = {}
+    environment: Dict[str, str] = {}
+    secrets: List[Union[str, UUID]] = []
+    extra: Dict[str, Any] = {}
+    substitutions: Dict[str, str] = {}
     caching_parameters: Mapping[str, Any] = {}
     external_input_artifacts: Mapping[str, ExternalArtifactConfiguration] = {}
     model_artifacts_or_metadata: Mapping[str, ModelVersionDataLazyLoader] = {}
     client_lazy_loaders: Mapping[str, ClientLazyLoader] = {}
     outputs: Mapping[str, PartialArtifactConfiguration] = {}
+    cache_policy: CachePolicyWithValidator = CachePolicy.default()
 
     # TODO: In Pydantic v2, the `model_` is a protected namespaces for all
     #  fields defined under base models. If not handled, this raises a warning.
@@ -240,22 +347,83 @@ class StepConfiguration(PartialStepConfiguration):
             model_or_dict = model_or_dict.model_dump()
         return DockerSettings.model_validate(model_or_dict)
 
+    def apply_pipeline_configuration(
+        self, pipeline_configuration: "PipelineConfiguration"
+    ) -> "StepConfiguration":
+        """Apply the pipeline configuration to this step configuration.
 
-class InputSpec(StrictBaseModel):
+        Args:
+            pipeline_configuration: The pipeline configuration to apply.
+
+        Returns:
+            The updated step configuration.
+        """
+        pipeline_values = pipeline_configuration.model_dump(
+            include={
+                "settings",
+                "extra",
+                "failure_hook_source",
+                "success_hook_source",
+                "retry",
+                "substitutions",
+                "environment",
+                "secrets",
+                "cache_policy",
+            },
+            exclude_none=True,
+        )
+        if pipeline_values:
+            original_values = self.model_dump(
+                include={
+                    "settings",
+                    "extra",
+                    "failure_hook_source",
+                    "success_hook_source",
+                    "retry",
+                    "substitutions",
+                    "environment",
+                    "secrets",
+                    "cache_policy",
+                },
+                exclude_none=True,
+            )
+
+            original_values["secrets"] = pipeline_values.get(
+                "secrets", []
+            ) + original_values.get("secrets", [])
+
+            updated_config_dict = {
+                **self.model_dump(),
+                **pipeline_values,
+            }
+            updated_config = self.model_validate(updated_config_dict)
+            return update_model(updated_config, original_values)
+        else:
+            return self.model_copy(deep=True)
+
+
+class InputSpec(FrozenBaseModel):
     """Step input specification."""
 
     step_name: str
     output_name: str
 
 
-class StepSpec(StrictBaseModel):
+class StepSpec(FrozenBaseModel):
     """Specification of a pipeline."""
 
     source: SourceWithValidator
     upstream_steps: List[str]
     inputs: Dict[str, InputSpec] = {}
-    # The default value is to ensure compatibility with specs of version <0.2
-    pipeline_parameter_name: str = ""
+    invocation_id: str
+
+    @model_validator(mode="before")
+    @classmethod
+    @before_validator_handler
+    def _migrate_invocation_id(cls, data: Dict[str, Any]) -> Dict[str, Any]:
+        if "invocation_id" not in data:
+            data["invocation_id"] = data.pop("pipeline_parameter_name", "")
+        return data
 
     def __eq__(self, other: Any) -> bool:
         """Returns whether the other object is referring to the same step.
@@ -279,7 +447,7 @@ class StepSpec(StrictBaseModel):
             if self.inputs != other.inputs:
                 return False
 
-            if self.pipeline_parameter_name != other.pipeline_parameter_name:
+            if self.invocation_id != other.invocation_id:
                 return False
 
             return self.source.import_path == other.source.import_path
@@ -287,8 +455,77 @@ class StepSpec(StrictBaseModel):
         return NotImplemented
 
 
-class Step(StrictBaseModel):
+class Step(FrozenBaseModel):
     """Class representing a ZenML step."""
 
     spec: StepSpec
     config: StepConfiguration
+    step_config_overrides: StepConfiguration
+
+    @model_validator(mode="before")
+    @classmethod
+    @before_validator_handler
+    def _add_step_config_overrides_if_missing(cls, data: Any) -> Any:
+        """Add step config overrides if missing.
+
+        This is to ensure backwards compatibility with data stored in the DB
+        before the `step_config_overrides` field was added. In that case, only
+        the `config` field, which contains the merged pipeline and step configs,
+        existed. We have no way to figure out which of those values were defined
+        on the step vs the pipeline level, so we just use the entire `config`
+        object as the `step_config_overrides`.
+
+        Args:
+            data: The values dict used to instantiate the model.
+
+        Returns:
+            The values dict with the step config overrides added if missing.
+        """
+        if "step_config_overrides" not in data:
+            data["step_config_overrides"] = data["config"]
+
+        return data
+
+    @classmethod
+    def from_dict(
+        cls,
+        data: Dict[str, Any],
+        pipeline_configuration: "PipelineConfiguration",
+    ) -> "Step":
+        """Create a step from a dictionary.
+
+        This method can create a step from data stored without the merged
+        `config` attribute, by merging the `step_config_overrides` with the
+        pipeline configuration.
+
+        Args:
+            data: The dictionary to create the `Step` object from.
+            pipeline_configuration: The pipeline configuration to apply to the
+                step configuration.
+
+        Returns:
+            The instantiated object.
+        """
+        if "config" not in data:
+            config = StepConfiguration.model_validate(
+                data["step_config_overrides"]
+            )
+            data["config"] = config.apply_pipeline_configuration(
+                pipeline_configuration
+            )
+        else:
+            # We still need to apply the pipeline substitutions for legacy step
+            # objects which include the full config object.
+            from zenml.config.pipeline_configurations import (
+                PipelineConfiguration,
+            )
+
+            config = StepConfiguration.model_validate(data["config"])
+            data["config"] = config.apply_pipeline_configuration(
+                PipelineConfiguration(
+                    name=pipeline_configuration.name,
+                    substitutions=pipeline_configuration.substitutions,
+                )
+            )
+
+        return cls.model_validate(data)

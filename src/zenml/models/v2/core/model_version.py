@@ -13,43 +13,61 @@
 #  permissions and limitations under the License.
 """Models representing model versions."""
 
-from typing import TYPE_CHECKING, Dict, List, Optional, Type, TypeVar, Union
+import json
+from typing import (
+    TYPE_CHECKING,
+    ClassVar,
+    Dict,
+    List,
+    Optional,
+    Type,
+    TypeVar,
+    Union,
+)
 from uuid import UUID
 
-from pydantic import BaseModel, ConfigDict, Field, PrivateAttr, field_validator
+from pydantic import ConfigDict, Field, field_validator
 
 from zenml.constants import STR_FIELD_MAX_LENGTH, TEXT_FIELD_MAX_LENGTH
-from zenml.enums import ModelStages
-from zenml.models.v2.base.filter import AnyQuery
+from zenml.enums import ArtifactType, ModelStages
+from zenml.logger import get_logger
+from zenml.metadata.metadata_types import MetadataType
+from zenml.models.v2.base.base import BaseUpdate
 from zenml.models.v2.base.page import Page
 from zenml.models.v2.base.scoped import (
-    WorkspaceScopedRequest,
-    WorkspaceScopedResponse,
-    WorkspaceScopedResponseBody,
-    WorkspaceScopedResponseMetadata,
-    WorkspaceScopedResponseResources,
-    WorkspaceScopedTaggableFilter,
+    ProjectScopedFilter,
+    ProjectScopedRequest,
+    ProjectScopedResponse,
+    ProjectScopedResponseBody,
+    ProjectScopedResponseMetadata,
+    ProjectScopedResponseResources,
+    RunMetadataFilterMixin,
+    TaggableFilter,
 )
 from zenml.models.v2.core.service import ServiceResponse
 from zenml.models.v2.core.tag import TagResponse
+from zenml.utils import pagination_utils
 
 if TYPE_CHECKING:
+    from sqlalchemy.sql.elements import ColumnElement
+
     from zenml.model.model import Model
     from zenml.models.v2.core.artifact_version import ArtifactVersionResponse
     from zenml.models.v2.core.model import ModelResponse
     from zenml.models.v2.core.pipeline_run import PipelineRunResponse
-    from zenml.models.v2.core.run_metadata import (
-        RunMetadataResponse,
+    from zenml.zen_stores.schemas import (
+        BaseSchema,
     )
-    from zenml.zen_stores.schemas import BaseSchema
 
     AnySchema = TypeVar("AnySchema", bound=BaseSchema)
 
 
+logger = get_logger(__name__)
+
 # ------------------ Request Model ------------------
 
 
-class ModelVersionRequest(WorkspaceScopedRequest):
+class ModelVersionRequest(ProjectScopedRequest):
     """Request model for model versions."""
 
     name: Optional[str] = Field(
@@ -68,10 +86,6 @@ class ModelVersionRequest(WorkspaceScopedRequest):
         default=None,
     )
 
-    number: Optional[int] = Field(
-        description="The number of the model version",
-        default=None,
-    )
     model: UUID = Field(
         description="The ID of the model containing version",
     )
@@ -84,12 +98,9 @@ class ModelVersionRequest(WorkspaceScopedRequest):
 # ------------------ Update Model ------------------
 
 
-class ModelVersionUpdate(BaseModel):
+class ModelVersionUpdate(BaseUpdate):
     """Update model for model versions."""
 
-    model: UUID = Field(
-        description="The ID of the model containing version",
-    )
     stage: Optional[Union[str, ModelStages]] = Field(
         description="Target model version stage to be set",
         default=None,
@@ -131,7 +142,7 @@ class ModelVersionUpdate(BaseModel):
 # ------------------ Response Model ------------------
 
 
-class ModelVersionResponseBody(WorkspaceScopedResponseBody):
+class ModelVersionResponseBody(ProjectScopedResponseBody):
     """Response body for model versions."""
 
     stage: Optional[str] = Field(
@@ -145,25 +156,6 @@ class ModelVersionResponseBody(WorkspaceScopedResponseBody):
     model: "ModelResponse" = Field(
         description="The model containing version",
     )
-    model_artifact_ids: Dict[str, Dict[str, UUID]] = Field(
-        description="Model artifacts linked to the model version",
-        default={},
-    )
-    data_artifact_ids: Dict[str, Dict[str, UUID]] = Field(
-        description="Data artifacts linked to the model version",
-        default={},
-    )
-    deployment_artifact_ids: Dict[str, Dict[str, UUID]] = Field(
-        description="Deployment artifacts linked to the model version",
-        default={},
-    )
-    pipeline_run_ids: Dict[str, UUID] = Field(
-        description="Pipeline runs linked to the model version",
-        default={},
-    )
-    tags: List[TagResponse] = Field(
-        title="Tags associated with the model version", default=[]
-    )
 
     # TODO: In Pydantic v2, the `model_` is a protected namespaces for all
     #  fields defined under base models. If not handled, this raises a warning.
@@ -174,7 +166,7 @@ class ModelVersionResponseBody(WorkspaceScopedResponseBody):
     model_config = ConfigDict(protected_namespaces=())
 
 
-class ModelVersionResponseMetadata(WorkspaceScopedResponseMetadata):
+class ModelVersionResponseMetadata(ProjectScopedResponseMetadata):
     """Response metadata for model versions."""
 
     description: Optional[str] = Field(
@@ -182,22 +174,25 @@ class ModelVersionResponseMetadata(WorkspaceScopedResponseMetadata):
         max_length=TEXT_FIELD_MAX_LENGTH,
         default=None,
     )
-    run_metadata: Dict[str, "RunMetadataResponse"] = Field(
+    run_metadata: Dict[str, MetadataType] = Field(
         description="Metadata linked to the model version",
         default={},
     )
 
 
-class ModelVersionResponseResources(WorkspaceScopedResponseResources):
+class ModelVersionResponseResources(ProjectScopedResponseResources):
     """Class for all resource models associated with the model version entity."""
 
     services: Page[ServiceResponse] = Field(
         description="Services linked to the model version",
     )
+    tags: List[TagResponse] = Field(
+        title="Tags associated with the model version", default=[]
+    )
 
 
 class ModelVersionResponse(
-    WorkspaceScopedResponse[
+    ProjectScopedResponse[
         ModelVersionResponseBody,
         ModelVersionResponseMetadata,
         ModelVersionResponseResources,
@@ -239,49 +234,13 @@ class ModelVersionResponse(
         return self.get_body().model
 
     @property
-    def model_artifact_ids(self) -> Dict[str, Dict[str, UUID]]:
-        """The `model_artifact_ids` property.
-
-        Returns:
-            the value of the property.
-        """
-        return self.get_body().model_artifact_ids
-
-    @property
-    def data_artifact_ids(self) -> Dict[str, Dict[str, UUID]]:
-        """The `data_artifact_ids` property.
-
-        Returns:
-            the value of the property.
-        """
-        return self.get_body().data_artifact_ids
-
-    @property
-    def deployment_artifact_ids(self) -> Dict[str, Dict[str, UUID]]:
-        """The `deployment_artifact_ids` property.
-
-        Returns:
-            the value of the property.
-        """
-        return self.get_body().deployment_artifact_ids
-
-    @property
-    def pipeline_run_ids(self) -> Dict[str, UUID]:
-        """The `pipeline_run_ids` property.
-
-        Returns:
-            the value of the property.
-        """
-        return self.get_body().pipeline_run_ids
-
-    @property
     def tags(self) -> List[TagResponse]:
         """The `tags` property.
 
         Returns:
             the value of the property.
         """
-        return self.get_body().tags
+        return self.get_resources().tags
 
     @property
     def description(self) -> Optional[str]:
@@ -293,7 +252,7 @@ class ModelVersionResponse(
         return self.get_metadata().description
 
     @property
-    def run_metadata(self) -> Optional[Dict[str, "RunMetadataResponse"]]:
+    def run_metadata(self) -> Dict[str, MetadataType]:
         """The `run_metadata` property.
 
         Returns:
@@ -314,14 +273,11 @@ class ModelVersionResponse(
     # Helper functions
     def to_model_class(
         self,
-        was_created_in_this_run: bool = False,
-        suppress_class_validation_warnings: bool = False,
+        suppress_class_validation_warnings: bool = True,
     ) -> "Model":
         """Convert response model to Model object.
 
         Args:
-            was_created_in_this_run: Whether model version was created during
-                the current run.
             suppress_class_validation_warnings: internally used to suppress
                 repeated warnings.
 
@@ -341,10 +297,9 @@ class ModelVersionResponse(
             ethics=self.model.ethics,
             tags=[t.name for t in self.tags],
             version=self.name,
-            was_created_in_this_run=was_created_in_this_run,
             suppress_class_validation_warnings=suppress_class_validation_warnings,
+            model_version_id=self.id,
         )
-        mv.model_version_id = self.id
 
         return mv
 
@@ -358,14 +313,86 @@ class ModelVersionResponse(
             Dictionary of model artifacts with versions as
             Dict[str, Dict[str, ArtifactResponse]]
         """
+        logger.warning(
+            "ModelVersionResponse.model_artifacts is deprecated and will be "
+            "removed in a future release."
+        )
         from zenml.client import Client
 
+        artifact_versions = pagination_utils.depaginate(
+            Client().list_artifact_versions,
+            model_version_id=self.id,
+            type=ArtifactType.MODEL,
+            project=self.project_id,
+        )
+
+        result: Dict[str, Dict[str, "ArtifactVersionResponse"]] = {}
+        for artifact_version in artifact_versions:
+            result.setdefault(artifact_version.name, {})
+            result[artifact_version.name][artifact_version.version] = (
+                artifact_version
+            )
+
+        return result
+
+    @property
+    def data_artifact_ids(self) -> Dict[str, Dict[str, UUID]]:
+        """Data artifacts linked to this model version.
+
+        Returns:
+            Data artifacts linked to this model version.
+        """
+        logger.warning(
+            "ModelVersionResponse.data_artifact_ids is deprecated and will "
+            "be removed in a future release."
+        )
+
         return {
-            name: {
-                version: Client().get_artifact_version(a)
-                for version, a in self.model_artifact_ids[name].items()
+            artifact_name: {
+                version_name: version_response.id
+                for version_name, version_response in artifact_versions.items()
             }
-            for name in self.model_artifact_ids
+            for artifact_name, artifact_versions in self.data_artifacts.items()
+        }
+
+    @property
+    def model_artifact_ids(self) -> Dict[str, Dict[str, UUID]]:
+        """Model artifacts linked to this model version.
+
+        Returns:
+            Model artifacts linked to this model version.
+        """
+        logger.warning(
+            "ModelVersionResponse.model_artifact_ids is deprecated and will "
+            "be removed in a future release."
+        )
+
+        return {
+            artifact_name: {
+                version_name: version_response.id
+                for version_name, version_response in artifact_versions.items()
+            }
+            for artifact_name, artifact_versions in self.model_artifacts.items()
+        }
+
+    @property
+    def deployment_artifact_ids(self) -> Dict[str, Dict[str, UUID]]:
+        """Deployment artifacts linked to this model version.
+
+        Returns:
+            Deployment artifacts linked to this model version.
+        """
+        logger.warning(
+            "ModelVersionResponse.deployment_artifact_ids is deprecated and "
+            "will be removed in a future release."
+        )
+
+        return {
+            artifact_name: {
+                version_name: version_response.id
+                for version_name, version_response in artifact_versions.items()
+            }
+            for artifact_name, artifact_versions in self.deployment_artifacts.items()
         }
 
     @property
@@ -378,15 +405,35 @@ class ModelVersionResponse(
             Dictionary of data artifacts with versions as
             Dict[str, Dict[str, ArtifactResponse]]
         """
+        logger.warning(
+            "ModelVersionResponse.data_artifacts is deprecated and will be "
+            "removed in a future release."
+        )
+
         from zenml.client import Client
 
-        return {
-            name: {
-                version: Client().get_artifact_version(a)
-                for version, a in self.data_artifact_ids[name].items()
-            }
-            for name in self.data_artifact_ids
-        }
+        data_artifact_types = [
+            value
+            for value in ArtifactType.values()
+            if value
+            not in [ArtifactType.MODEL.value, ArtifactType.SERVICE.value]
+        ]
+
+        artifact_versions = pagination_utils.depaginate(
+            Client().list_artifact_versions,
+            model_version_id=self.id,
+            type="oneof:" + json.dumps(data_artifact_types),
+            project=self.project_id,
+        )
+
+        result: Dict[str, Dict[str, "ArtifactVersionResponse"]] = {}
+        for artifact_version in artifact_versions:
+            result.setdefault(artifact_version.name, {})
+            result[artifact_version.name][artifact_version.version] = (
+                artifact_version
+            )
+
+        return result
 
     @property
     def deployment_artifacts(
@@ -398,14 +445,49 @@ class ModelVersionResponse(
             Dictionary of deployment artifacts with versions as
             Dict[str, Dict[str, ArtifactResponse]]
         """
+        logger.warning(
+            "ModelVersionResponse.deployment_artifacts is deprecated and will "
+            "be removed in a future release."
+        )
+
+        from zenml.client import Client
+
+        artifact_versions = pagination_utils.depaginate(
+            Client().list_artifact_versions,
+            model_version_id=self.id,
+            type=ArtifactType.SERVICE,
+            project=self.project_id,
+        )
+
+        result: Dict[str, Dict[str, "ArtifactVersionResponse"]] = {}
+        for artifact_version in artifact_versions:
+            result.setdefault(artifact_version.name, {})
+            result[artifact_version.name][artifact_version.version] = (
+                artifact_version
+            )
+
+        return result
+
+    @property
+    def pipeline_run_ids(self) -> Dict[str, UUID]:
+        """Pipeline runs linked to this model version.
+
+        Returns:
+            Pipeline runs linked to this model version.
+        """
+        logger.warning(
+            "ModelVersionResponse.pipeline_run_ids is deprecated and will be "
+            "removed in a future release."
+        )
+
         from zenml.client import Client
 
         return {
-            name: {
-                version: Client().get_artifact_version(a)
-                for version, a in self.deployment_artifact_ids[name].items()
-            }
-            for name in self.deployment_artifact_ids
+            link.pipeline_run.name: link.pipeline_run.id
+            for link in pagination_utils.depaginate(
+                Client().list_model_version_pipeline_run_links,
+                model_version_id=self.id,
+            )
         }
 
     @property
@@ -415,41 +497,54 @@ class ModelVersionResponse(
         Returns:
             Dictionary of Pipeline Runs as PipelineRunResponseModel
         """
+        logger.warning(
+            "ModelVersionResponse.pipeline_runs is deprecated and will be "
+            "removed in a future release."
+        )
+
         from zenml.client import Client
 
         return {
-            name: Client().get_pipeline_run(pr)
-            for name, pr in self.pipeline_run_ids.items()
+            link.pipeline_run.name: link.pipeline_run
+            for link in pagination_utils.depaginate(
+                Client().list_model_version_pipeline_run_links,
+                model_version_id=self.id,
+            )
         }
 
     def _get_linked_object(
         self,
-        collection: Dict[str, Dict[str, UUID]],
         name: str,
         version: Optional[str] = None,
+        type: Optional[ArtifactType] = None,
     ) -> Optional["ArtifactVersionResponse"]:
         """Get the artifact linked to this model version given type.
 
         Args:
-            collection: The collection to search in (one of
-                self.model_artifact_ids, self.data_artifact_ids,
-                self.deployment_artifact_ids)
             name: The name of the artifact to retrieve.
             version: The version of the artifact to retrieve (None for
                 latest/non-versioned)
+            type: The type of the artifact to filter by.
 
         Returns:
             Specific version of an artifact from collection or None
         """
         from zenml.client import Client
 
-        client = Client()
+        artifact_versions = Client().list_artifact_versions(
+            sort_by="desc:created",
+            size=1,
+            artifact=name,
+            version=version,
+            model_version_id=self.id,
+            type=type,
+            project=self.project_id,
+            hydrate=True,
+        )
 
-        if name not in collection:
+        if not artifact_versions.items:
             return None
-        if version is None:
-            version = max(collection[name].keys())
-        return client.get_artifact_version(collection[name][version])
+        return artifact_versions.items[0]
 
     def get_artifact(
         self,
@@ -466,12 +561,7 @@ class ModelVersionResponse(
         Returns:
             Specific version of an artifact or None
         """
-        all_artifact_ids = {
-            **self.model_artifact_ids,
-            **self.data_artifact_ids,
-            **self.deployment_artifact_ids,
-        }
-        return self._get_linked_object(all_artifact_ids, name, version)
+        return self._get_linked_object(name, version)
 
     def get_model_artifact(
         self,
@@ -488,7 +578,7 @@ class ModelVersionResponse(
         Returns:
             Specific version of the model artifact or None
         """
-        return self._get_linked_object(self.model_artifact_ids, name, version)
+        return self._get_linked_object(name, version, ArtifactType.MODEL)
 
     def get_data_artifact(
         self,
@@ -505,11 +595,7 @@ class ModelVersionResponse(
         Returns:
             Specific version of the data artifact or None
         """
-        return self._get_linked_object(
-            self.data_artifact_ids,
-            name,
-            version,
-        )
+        return self._get_linked_object(name, version, ArtifactType.DATA)
 
     def get_deployment_artifact(
         self,
@@ -526,24 +612,7 @@ class ModelVersionResponse(
         Returns:
             Specific version of the deployment artifact or None
         """
-        return self._get_linked_object(
-            self.deployment_artifact_ids,
-            name,
-            version,
-        )
-
-    def get_pipeline_run(self, name: str) -> "PipelineRunResponse":
-        """Get pipeline run linked to this version.
-
-        Args:
-            name: The name of the pipeline run to retrieve.
-
-        Returns:
-            PipelineRun as PipelineRunResponseModel
-        """
-        from zenml.client import Client
-
-        return Client().get_pipeline_run(self.pipeline_run_ids[name])
+        return self._get_linked_object(name, version, ArtifactType.SERVICE)
 
     def set_stage(
         self, stage: Union[str, ModelStages], force: bool = False
@@ -571,16 +640,36 @@ class ModelVersionResponse(
             force=force,
         )
 
-    # TODO in https://zenml.atlassian.net/browse/OSS-2433
-    # def generate_model_card(self, template_name: str) -> str:
-    #     """Return HTML/PDF based on input template"""
-
 
 # ------------------ Filter Model ------------------
 
 
-class ModelVersionFilter(WorkspaceScopedTaggableFilter):
+class ModelVersionFilter(
+    ProjectScopedFilter, TaggableFilter, RunMetadataFilterMixin
+):
     """Filter model for model versions."""
+
+    FILTER_EXCLUDE_FIELDS: ClassVar[List[str]] = [
+        *ProjectScopedFilter.FILTER_EXCLUDE_FIELDS,
+        *TaggableFilter.FILTER_EXCLUDE_FIELDS,
+        *RunMetadataFilterMixin.FILTER_EXCLUDE_FIELDS,
+        "model",
+    ]
+    CUSTOM_SORTING_OPTIONS: ClassVar[List[str]] = [
+        *ProjectScopedFilter.CUSTOM_SORTING_OPTIONS,
+        *TaggableFilter.CUSTOM_SORTING_OPTIONS,
+        *RunMetadataFilterMixin.CUSTOM_SORTING_OPTIONS,
+    ]
+    CLI_EXCLUDE_FIELDS: ClassVar[List[str]] = [
+        *ProjectScopedFilter.CLI_EXCLUDE_FIELDS,
+        *TaggableFilter.CLI_EXCLUDE_FIELDS,
+        *RunMetadataFilterMixin.CLI_EXCLUDE_FIELDS,
+    ]
+    API_MULTI_INPUT_PARAMS: ClassVar[List[str]] = [
+        *ProjectScopedFilter.API_MULTI_INPUT_PARAMS,
+        *TaggableFilter.API_MULTI_INPUT_PARAMS,
+        *RunMetadataFilterMixin.API_MULTI_INPUT_PARAMS,
+    ]
 
     name: Optional[str] = Field(
         default=None,
@@ -590,56 +679,47 @@ class ModelVersionFilter(WorkspaceScopedTaggableFilter):
         default=None,
         description="The number of the Model Version",
     )
-    workspace_id: Optional[Union[UUID, str]] = Field(
-        default=None,
-        description="The workspace of the Model Version",
-        union_mode="left_to_right",
-    )
-    user_id: Optional[Union[UUID, str]] = Field(
-        default=None,
-        description="The user of the Model Version",
-        union_mode="left_to_right",
-    )
     stage: Optional[Union[str, ModelStages]] = Field(
         description="The model version stage",
         default=None,
         union_mode="left_to_right",
     )
+    model: Optional[Union[str, UUID]] = Field(
+        default=None,
+        description="The name or ID of the model which the search is scoped "
+        "to. This field must always be set and is always applied in addition "
+        "to the other filters, regardless of the value of the "
+        "logical_operator field.",
+        union_mode="left_to_right",
+    )
 
-    _model_id: UUID = PrivateAttr(None)
-
-    def set_scope_model(self, model_name_or_id: Union[str, UUID]) -> None:
-        """Set the model to scope this response.
-
-        Args:
-            model_name_or_id: The model to scope this response to.
-        """
-        try:
-            model_id = UUID(str(model_name_or_id))
-        except ValueError:
-            from zenml.client import Client
-
-            model_id = Client().get_model(model_name_or_id).id
-
-        self._model_id = model_id
-
-    def apply_filter(
-        self,
-        query: AnyQuery,
-        table: Type["AnySchema"],
-    ) -> AnyQuery:
-        """Applies the filter to a query.
+    def get_custom_filters(
+        self, table: Type["AnySchema"]
+    ) -> List[Union["ColumnElement[bool]"]]:
+        """Get custom filters.
 
         Args:
-            query: The query to which to apply the filter.
             table: The query table.
 
         Returns:
-            The query with filter applied.
+            A list of custom filters.
         """
-        query = super().apply_filter(query=query, table=table)
+        from sqlalchemy import and_
 
-        if self._model_id:
-            query = query.where(getattr(table, "model_id") == self._model_id)
+        from zenml.zen_stores.schemas import (
+            ModelSchema,
+            ModelVersionSchema,
+        )
 
-        return query
+        custom_filters = super().get_custom_filters(table)
+
+        if self.model:
+            model_filter = and_(
+                ModelVersionSchema.model_id == ModelSchema.id,  # type: ignore[arg-type]
+                self.generate_name_or_id_query_conditions(
+                    value=self.model, table=ModelSchema
+                ),
+            )
+            custom_filters.append(model_filter)
+
+        return custom_filters

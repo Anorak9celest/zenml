@@ -13,26 +13,34 @@
 #  permissions and limitations under the License.
 """Utilities to publish pipeline and step runs."""
 
+from contextvars import ContextVar
 from datetime import datetime
-from typing import TYPE_CHECKING, Dict, List
+from typing import TYPE_CHECKING, Dict, List, Optional
 
 from zenml.client import Client
 from zenml.enums import ExecutionStatus, MetadataResourceTypes
 from zenml.models import (
+    ExceptionInfo,
     PipelineRunResponse,
     PipelineRunUpdate,
+    RunMetadataResource,
     StepRunResponse,
     StepRunUpdate,
 )
+from zenml.utils.time_utils import utc_now
 
 if TYPE_CHECKING:
     from uuid import UUID
 
     from zenml.metadata.metadata_types import MetadataType
 
+step_exception_info: ContextVar[Optional[ExceptionInfo]] = ContextVar(
+    "step_exception_info", default=None
+)
+
 
 def publish_successful_step_run(
-    step_run_id: "UUID", output_artifact_ids: Dict[str, "UUID"]
+    step_run_id: "UUID", output_artifact_ids: Dict[str, List["UUID"]]
 ) -> "StepRunResponse":
     """Publishes a successful step run.
 
@@ -47,10 +55,50 @@ def publish_successful_step_run(
         step_run_id=step_run_id,
         step_run_update=StepRunUpdate(
             status=ExecutionStatus.COMPLETED,
-            end_time=datetime.utcnow(),
+            end_time=utc_now(),
             outputs=output_artifact_ids,
         ),
     )
+
+
+def publish_step_run_status_update(
+    step_run_id: "UUID",
+    status: "ExecutionStatus",
+    end_time: Optional[datetime] = None,
+    exception_info: Optional[ExceptionInfo] = None,
+) -> "StepRunResponse":
+    """Publishes a step run update.
+
+    Args:
+        step_run_id: ID of the step run.
+        status: New status of the step run.
+        end_time: New end time of the step run.
+        exception_info: Exception information of the step run.
+
+    Returns:
+        The updated step run.
+
+    Raises:
+        ValueError: If the end time is set for a non-finished step run.
+    """
+    from zenml.client import Client
+
+    if end_time is not None and not status.is_finished:
+        raise ValueError("End time cannot be set for a non-finished step run.")
+
+    if end_time is None and status.is_finished:
+        end_time = utc_now()
+
+    step_run = Client().zen_store.update_run_step(
+        step_run_id=step_run_id,
+        step_run_update=StepRunUpdate(
+            status=status,
+            end_time=end_time,
+            exception_info=exception_info,
+        ),
+    )
+
+    return step_run
 
 
 def publish_failed_step_run(step_run_id: "UUID") -> "StepRunResponse":
@@ -62,11 +110,31 @@ def publish_failed_step_run(step_run_id: "UUID") -> "StepRunResponse":
     Returns:
         The updated step run.
     """
-    return Client().zen_store.update_run_step(
+    return publish_step_run_status_update(
         step_run_id=step_run_id,
-        step_run_update=StepRunUpdate(
-            status=ExecutionStatus.FAILED,
-            end_time=datetime.utcnow(),
+        status=ExecutionStatus.FAILED,
+        end_time=utc_now(),
+        exception_info=step_exception_info.get(),
+    )
+
+
+def publish_successful_pipeline_run(
+    pipeline_run_id: "UUID",
+) -> "PipelineRunResponse":
+    """Publishes a successful pipeline run.
+
+    Args:
+        pipeline_run_id: The ID of the pipeline run to update.
+
+    Returns:
+        The updated pipeline run.
+    """
+    return Client().zen_store.update_run(
+        run_id=pipeline_run_id,
+        run_update=PipelineRunUpdate(
+            status=ExecutionStatus.COMPLETED,
+            end_time=utc_now(),
+            is_finished=True,
         ),
     )
 
@@ -86,32 +154,100 @@ def publish_failed_pipeline_run(
         run_id=pipeline_run_id,
         run_update=PipelineRunUpdate(
             status=ExecutionStatus.FAILED,
-            end_time=datetime.utcnow(),
+            end_time=utc_now(),
+            is_finished=True,
+        ),
+    )
+
+
+def publish_pipeline_run_status_update(
+    pipeline_run_id: "UUID",
+    status: ExecutionStatus,
+    status_reason: Optional[str] = None,
+    end_time: Optional[datetime] = None,
+) -> "PipelineRunResponse":
+    """Publishes a pipeline run status update.
+
+    Args:
+        pipeline_run_id: The ID of the pipeline run to update.
+        status: The new status for the pipeline run.
+        status_reason: The reason for the status of the pipeline run.
+        end_time: The end time for the pipeline run. If None, will be set to current time
+            for finished statuses.
+
+    Returns:
+        The updated pipeline run.
+
+    Raises:
+        ValueError: If the end time is set for a non-finished run.
+    """
+    if end_time is not None and not status.is_finished:
+        raise ValueError("End time cannot be set for a non-finished run.")
+
+    if end_time is None and status.is_finished:
+        end_time = utc_now()
+
+    return Client().zen_store.update_run(
+        run_id=pipeline_run_id,
+        run_update=PipelineRunUpdate(
+            status=status,
+            status_reason=status_reason,
+            end_time=end_time,
         ),
     )
 
 
 def get_pipeline_run_status(
-    step_statuses: List[ExecutionStatus], num_steps: int
+    run_status: ExecutionStatus,
+    step_statuses: List[ExecutionStatus],
+    num_steps: int,
+    is_dynamic_pipeline: bool,
 ) -> ExecutionStatus:
     """Gets the pipeline run status for the given step statuses.
 
     Args:
+        run_status: The status of the run.
         step_statuses: The status of steps in this run.
         num_steps: The total amount of steps in this run.
+        is_dynamic_pipeline: If the pipeline is dynamic.
 
     Returns:
         The run status.
     """
-    if ExecutionStatus.FAILED in step_statuses:
-        return ExecutionStatus.FAILED
+    # STOPPING state
+    if run_status == ExecutionStatus.STOPPING:
+        if all(status.is_finished for status in step_statuses):
+            return ExecutionStatus.STOPPED
+        else:
+            return ExecutionStatus.STOPPING
+
+    # If there is a failed step, the run is failed
     if (
+        ExecutionStatus.FAILED in step_statuses
+        or run_status == ExecutionStatus.FAILED
+    ):
+        return ExecutionStatus.FAILED
+
+    # If there is a stopped step, the run is stopped or stopping
+    elif ExecutionStatus.STOPPED in step_statuses:
+        if all(status.is_finished for status in step_statuses):
+            return ExecutionStatus.STOPPED
+        else:
+            return ExecutionStatus.STOPPING
+
+    # If there is a running step, the run is running
+    elif (
         ExecutionStatus.RUNNING in step_statuses
-        or len(step_statuses) < num_steps
+        or ExecutionStatus.RETRYING in step_statuses
     ):
         return ExecutionStatus.RUNNING
-
-    return ExecutionStatus.COMPLETED
+    elif is_dynamic_pipeline:
+        return run_status
+    elif len(step_statuses) < num_steps:
+        return ExecutionStatus.RUNNING
+    # Any other state is completed
+    else:
+        return ExecutionStatus.COMPLETED
 
 
 def publish_pipeline_run_metadata(
@@ -129,8 +265,11 @@ def publish_pipeline_run_metadata(
     for stack_component_id, metadata in pipeline_run_metadata.items():
         client.create_run_metadata(
             metadata=metadata,
-            resource_id=pipeline_run_id,
-            resource_type=MetadataResourceTypes.PIPELINE_RUN,
+            resources=[
+                RunMetadataResource(
+                    id=pipeline_run_id, type=MetadataResourceTypes.PIPELINE_RUN
+                )
+            ],
             stack_component_id=stack_component_id,
         )
 
@@ -150,7 +289,34 @@ def publish_step_run_metadata(
     for stack_component_id, metadata in step_run_metadata.items():
         client.create_run_metadata(
             metadata=metadata,
-            resource_id=step_run_id,
-            resource_type=MetadataResourceTypes.STEP_RUN,
+            resources=[
+                RunMetadataResource(
+                    id=step_run_id, type=MetadataResourceTypes.STEP_RUN
+                )
+            ],
+            stack_component_id=stack_component_id,
+        )
+
+
+def publish_schedule_metadata(
+    schedule_id: "UUID",
+    schedule_metadata: Dict["UUID", Dict[str, "MetadataType"]],
+) -> None:
+    """Publishes the given schedule metadata.
+
+    Args:
+        schedule_id: The ID of the schedule.
+        schedule_metadata: A dictionary mapping stack component IDs to the
+            metadata they created.
+    """
+    client = Client()
+    for stack_component_id, metadata in schedule_metadata.items():
+        client.create_run_metadata(
+            metadata=metadata,
+            resources=[
+                RunMetadataResource(
+                    id=schedule_id, type=MetadataResourceTypes.SCHEDULE
+                )
+            ],
             stack_component_id=stack_component_id,
         )

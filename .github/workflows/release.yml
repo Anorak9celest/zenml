@@ -7,52 +7,23 @@ jobs:
   setup-and-test:
     uses: ./.github/workflows/unit-test.yml
     with:
-      os: arc-runner-set
-      python-version: '3.8'
+      os: ubuntu-latest
+      python-version: '3.11'
     secrets: inherit
-  mlstacks-compatibility-check:
-    needs: setup-and-test
-    runs-on: arc-runner-set
-    steps:
-      - name: Checkout code
-        uses: actions/checkout@v4.1.1
-      - name: Set up Python
-        uses: actions/setup-python@v5.0.0
-        with:
-          python-version: '3.8'
-      - name: Install uv
-        run: |
-          curl -LsSf https://astral.sh/uv/install.sh | sh
-          source $HOME/.cargo/env
-      - name: Create virtual environment
-        run: |
-          source $HOME/.cargo/env
-          uv venv
-      - name: Check mlstacks compatibility
-        run: |
-          source .venv/bin/activate
-          source $HOME/.cargo/env
-          uv pip install -e .
-          uv pip install mlstacks
-      - name: Check for broken dependencies
-        run: |
-          source .venv/bin/activate
-          source $HOME/.cargo/env
-          uv pip check
   mysql-db-migration-testing:
-    runs-on: arc-runner-set
+    runs-on: ubuntu-latest
     env:
       ZENML_ANALYTICS_OPT_IN: false
       ZENML_DEBUG: true
     steps:
       - name: Checkout code
-        uses: actions/checkout@v4.1.1
+        uses: actions/checkout@v4.2.2
         with:
           fetch-depth: 0
-      - name: Set up Python 3.9
-        uses: actions/setup-python@v5.0.0
+      - name: Set up Python 3.10
+        uses: actions/setup-python@v5.3.0
         with:
-          python-version: '3.9'
+          python-version: '3.10'
       - name: Login to Docker Hub
         uses: docker/login-action@v3
         with:
@@ -61,35 +32,35 @@ jobs:
       - name: Test migrations across versions
         run: bash scripts/test-migrations.sh mysql
   sqlite-db-migration-testing:
-    runs-on: arc-runner-set
+    runs-on: ubuntu-latest
     env:
       ZENML_ANALYTICS_OPT_IN: false
       ZENML_DEBUG: true
     steps:
       - name: Checkout code
-        uses: actions/checkout@v4.1.1
+        uses: actions/checkout@v4.2.2
         with:
           fetch-depth: 0
-      - name: Set up Python 3.9
-        uses: actions/setup-python@v5.0.0
+      - name: Set up Python 3.10
+        uses: actions/setup-python@v5.3.0
         with:
-          python-version: '3.9'
+          python-version: '3.11'
       - name: Test migrations across versions
         run: bash scripts/test-migrations.sh sqlite
   mariadb-db-migration-testing:
-    runs-on: arc-runner-set
+    runs-on: ubuntu-latest
     env:
       ZENML_ANALYTICS_OPT_IN: false
       ZENML_DEBUG: true
     steps:
       - name: Checkout code
-        uses: actions/checkout@v4.1.1
+        uses: actions/checkout@v4.2.2
         with:
           fetch-depth: 0
-      - name: Set up Python 3.9
+      - name: Set up Python 3.10
         uses: actions/setup-python@v4.8.0
         with:
-          python-version: '3.9'
+          python-version: '3.10'
       - name: Login to Docker Hub
         uses: docker/login-action@v3
         with:
@@ -98,17 +69,53 @@ jobs:
       - name: Test migrations across versions
         run: bash scripts/test-migrations.sh mariadb
   publish-python-package:
+    # This previously used the publish_to_pypi.yml workflow, but PyPI
+    # doesn't support trusted publishing with reusable workflows yet.
+    # See https://github.com/pypi/warehouse/issues/11096
     if: github.repository == 'zenml-io/zenml'
+    name: Publish Python 🐍 package 📦 to PyPI
     needs:
       - setup-and-test
-      - mlstacks-compatibility-check
       - sqlite-db-migration-testing
       - mysql-db-migration-testing
       - mariadb-db-migration-testing
-    uses: ./.github/workflows/publish_to_pypi.yml
-    secrets: inherit
+    runs-on: ubuntu-latest
+    environment: release
+    permissions:
+      # This permission is required for trusted publishing.
+      id-token: write
+      contents: read
+    env:
+      ZENML_DEBUG: 1
+      ZENML_ANALYTICS_OPT_IN: false
+      PYTHONIOENCODING: utf-8
+    steps:
+      - uses: actions/checkout@v4.2.2
+      - name: Get the version from the github tag ref
+        id: get_version
+        run: echo ::set-output name=VERSION::${GITHUB_REF/refs\/tags\//}
+      - name: Set up Python 3.11
+        uses: actions/setup-python@v5.3.0
+        with:
+          python-version: '3.11'
+      - name: Install uv
+        uses: astral-sh/setup-uv@v6
+        with:
+          version: 0.8.14
+      - name: Include latest dashboard
+        run: bash scripts/install-dashboard.sh
+      - name: Verify version
+        run: |-
+          if [ "$(cat src/zenml/VERSION)" != "$(echo ${GITHUB_REF} | sed 's|refs/tags/||g')" ]; then
+            echo "Version mismatch between src/zenml/VERSION and git tag"
+            exit 1
+          fi
+      - name: Build package
+        run: uv build
+      - name: Publish package distributions to PyPI
+        uses: pypa/gh-action-pypi-publish@release/v1
   wait-for-package-release:
-    runs-on: arc-runner-set
+    runs-on: ubuntu-latest
     needs: publish-python-package
     steps:
       - name: Sleep for 4 minutes
@@ -125,7 +132,7 @@ jobs:
     uses: ./.github/workflows/publish_helm_chart.yml
     secrets: inherit
   wait-for-package-release-again:
-    runs-on: arc-runner-set
+    runs-on: ubuntu-latest
     needs: publish-helm-chart
     steps:
       - name: Sleep for 4 minutes

@@ -13,7 +13,7 @@
 #  permissions and limitations under the License.
 """Util functions for handling stacks, components, and flavors."""
 
-from typing import Any, Dict, Optional
+from typing import Any, Dict, Optional, Union
 
 from zenml.client import Client
 from zenml.enums import StackComponentType, StoreType
@@ -28,16 +28,17 @@ logger = get_logger(__name__)
 
 def validate_stack_component_config(
     configuration_dict: Dict[str, Any],
-    flavor_name: str,
+    flavor: Union[FlavorResponse, str],
     component_type: StackComponentType,
     zen_store: Optional[BaseZenStore] = None,
     validate_custom_flavors: bool = True,
+    existing_config: Optional[Dict[str, Any]] = None,
 ) -> Optional[StackComponentConfig]:
     """Validate the configuration of a stack component.
 
     Args:
         configuration_dict: The stack component configuration to validate.
-        flavor_name: The name of the flavor of the stack component.
+        flavor: The model or name of the flavor of the stack component.
         component_type: The type of the stack component.
         zen_store: An optional ZenStore in which to look for the flavor. If not
             provided, the flavor will be fetched via the regular ZenML Client.
@@ -45,6 +46,7 @@ def validate_stack_component_config(
         validate_custom_flavors: When loading custom flavors from the local
             environment, this flag decides whether the import failures are
             raised or an empty value is returned.
+        existing_config: The existing stack component configuration.
 
     Returns:
         The validated stack component configuration or None, if the
@@ -56,17 +58,21 @@ def validate_stack_component_config(
         ImportError: If the flavor class could not be imported.
         ModuleNotFoundError: If the flavor class could not be imported.
     """
-    if zen_store:
-        flavor_model = get_flavor_by_name_and_type_from_zen_store(
-            zen_store=zen_store,
-            flavor_name=flavor_name,
-            component_type=component_type,
-        )
+    if isinstance(flavor, FlavorResponse):
+        flavor_model = flavor
     else:
-        flavor_model = Client().get_flavor_by_name_and_type(
-            name=flavor_name,
-            component_type=component_type,
-        )
+        if zen_store:
+            flavor_model = get_flavor_by_name_and_type_from_zen_store(
+                zen_store=zen_store,
+                flavor_name=flavor,
+                component_type=component_type,
+            )
+        else:
+            flavor_model = Client().get_flavor_by_name_and_type(
+                name=flavor,
+                component_type=component_type,
+            )
+
     try:
         flavor_class = Flavor.from_model(flavor_model)
     except (ImportError, ModuleNotFoundError):
@@ -75,7 +81,23 @@ def validate_stack_component_config(
             return None
         raise
 
-    configuration = flavor_class.config_class(**configuration_dict)
+    config_class = flavor_class.config_class
+
+    extra_keys = set(configuration_dict) - set(config_class.model_fields)
+    if existing_config:
+        # If there is an existing configuration, don't fail because of keys
+        # that were already set. This can be the case if the config stored in
+        # the DB contains attributes that have been removed.
+        extra_keys = extra_keys - set(existing_config)
+
+    if extra_keys:
+        raise ValueError(
+            f"Invalid configuration keys {list(extra_keys)} for "
+            f"{flavor_model.name} {component_type}."
+        )
+
+    configuration = config_class(**configuration_dict)
+
     if not configuration.is_valid:
         raise ValueError(
             f"Invalid stack component configuration. Please verify "
@@ -94,11 +116,19 @@ def warn_if_config_server_mismatch(
     """
     zen_store = Client().zen_store
     if configuration.is_remote and zen_store.is_local_store():
-        if zen_store.type != StoreType.REST:
+        if zen_store.type == StoreType.REST:
             logger.warning(
                 "You are configuring a stack component that is running "
                 "remotely while using a local ZenML server. The component "
                 "may not be able to reach the local ZenML server and will "
+                "therefore not be functional. Please consider deploying "
+                "and/or using a remote ZenML server instead."
+            )
+        else:
+            logger.warning(
+                "You are configuring a stack component that is running "
+                "remotely while connected to the local database. The component "
+                "will not be able to reach the local database and will "
                 "therefore not be functional. Please consider deploying "
                 "and/or using a remote ZenML server instead."
             )

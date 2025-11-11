@@ -10,6 +10,18 @@ Leveraging ZenML, you can create and manage robust, scalable machine learning (M
 
 <figure><img src="../../.gitbook/assets/pipeline_showcase.png" alt=""><figcaption><p>ZenML pipelines are simple Python code</p></figcaption></figure>
 
+{% hint style="info" %}
+Before starting this guide, make sure you have [installed ZenML](https://docs.zenml.io/getting-started/installation):
+
+```shell
+pip install "zenml[server]"
+zenml login --local  # Will launch the dashboard locally
+```
+
+It is also highly recommended that you run [`zenml init`](https://docs.zenml.io/how-to/project-setup-and-management/setting-up-a-project-repository/set-up-repository#zen) at your project root directory when starting a new project. This will tell ZenML which files to include when
+running your pipelines remotely.
+{% endhint %}
+
 ## Start with a simple ML pipeline
 
 Let's jump into an example that demonstrates how a simple pipeline can be set up in ZenML, featuring actual ML components to give you a better sense of its application.
@@ -61,7 +73,6 @@ Copy this code into a new file and name it `run.py`. Then run it with your comma
 $ python run.py
 
 Initiating a new run for the pipeline: simple_ml_pipeline.
-Registered new version: (version 2).
 Executing a new run.
 Using user: hamza@zenml.io
 Using stack: default
@@ -73,17 +84,17 @@ Step train_model has started.
 Trained model using 3 data points. Feature sum is 21, label sum is 1
 Step train_model has finished in 0.265s.
 Run simple_ml_pipeline-2023_11_23-10_51_59_657489 has finished in 1.612s.
-Pipeline visualization can be seen in the ZenML Dashboard. Run zenml up to see your pipeline!
+Pipeline visualization can be seen in the ZenML Dashboard. Run zenml login --local to see your pipeline!
 ```
 {% endcode %}
 
 ### Explore the dashboard
 
-Once the pipeline has finished its execution, use the `zenml up` command to view the results in the ZenML Dashboard. Using that command will open up the browser automatically.
+Once the pipeline has finished its execution, use the `zenml login --local` command to view the results in the ZenML Dashboard. Using that command will open up the browser automatically.
 
 <figure><img src="../../.gitbook/assets/landingpage.png" alt=""><figcaption><p>Landing Page of the Dashboard</p></figcaption></figure>
 
-Usually, the dashboard is accessible at [http://127.0.0.1:8237/](http://127.0.0.1:8237/). Log in with the default username **"default"** (password not required) and see your recently run pipeline. Browse through the pipeline components, such as the execution history and artifacts produced by your steps. Use the DAG visualization to understand the flow of data and to ensure all steps are completed successfully.
+Usually, the dashboard is accessible at [http://127.0.0.1:8237/](http://127.0.0.1:8237/). Log in with the default username **"default"** (password not required) and see your recently run pipeline. Browse through the pipeline components, such as the execution history and artifacts produced by your steps. Use the DAG or Timeline visualization to understand the flow of data and to ensure all steps are completed successfully. ZenML offers two visualization modes: the **DAG view** for understanding pipeline structure and dependencies, and the **Timeline view** for analyzing execution performance. For pipelines with many steps, the Timeline view provides a cleaner interface for performance optimization. [Learn more](../../how-to/dashboard/dashboard-features.md#timeline-view).
 
 <figure><img src="../../.gitbook/assets/DAGofRun.png" alt=""><figcaption><p>Diagram view of the run, with the runtime attributes of step 2.</p></figcaption></figure>
 
@@ -93,7 +104,7 @@ If you have closed the browser tab with the ZenML dashboard, you can always reop
 
 ## Understanding steps and artifacts
 
-When you ran the pipeline, each individual function that ran is shown in the DAG visualization as a `step` and is marked with the function name. Steps are connected with `artifacts`, which are simply the objects that are returned by these functions and input into downstream functions. This simple logic lets us break down our entire machine learning code into a sequence of tasks that pass data between each other.
+When you ran the pipeline, each individual function that ran is shown in the run view (DAG or Timeline) as a `step` and is marked with the function name. Steps are connected with `artifacts`, which are simply the objects that are returned by these functions and input into downstream functions. This simple logic lets us break down our entire machine learning code into a sequence of tasks that pass data between each other.
 
 The artifacts produced by your steps are automatically stored and versioned by ZenML. The code that produced these artifacts is also automatically tracked. The parameters and all other configuration is also automatically captured.
 
@@ -106,7 +117,7 @@ With the fundamentals in hand, let’s escalate our simple pipeline to a complet
 Let's start with the imports.
 
 ```python
-from typing_extensions import Annotated  # or `from typing import Annotated on Python 3.9+
+from typing import Annotated
 from typing import Tuple
 import pandas as pd
 from sklearn.datasets import load_iris
@@ -186,10 +197,10 @@ def svc_trainer(
 ```
 
 {% hint style="info" %}
-If you want to run the step function outside the context of a ZenML pipeline, all you need to do is call the step function outside of a ZenML pipeline. For example:
+If you want to run just a single step on your ZenML stack, all you need to do is call the step function outside of a ZenML pipeline. For example:
 
 ```python
-svc_trainer(X_train=..., y_train=...)
+model, train_acc = svc_trainer(X_train=..., y_train=...)
 ```
 {% endhint %}
 
@@ -260,7 +271,11 @@ If you are unsure how to format this config file, you can generate a template co
 training_pipeline.write_run_configuration_template(path='/local/path/to/config.yaml')
 ```
 
-Check out [this section](../../how-to/use-configuration-files/README.md) for advanced configuration options.
+Check out [this section](https://docs.zenml.io/concepts/steps_and_pipelines/yaml_configuration) for advanced configuration options.
+
+{% hint style="info" %}
+If you ever want to learn more about individual ZenML functions or classes, check out the [SDK Docs](https://sdkdocs.zenml.io/)
+{% endhint %}
 
 ## Full Code Example
 
@@ -271,7 +286,7 @@ This section combines all the code from this section into one simple script that
 <summary>Code Example of this Section</summary>
 
 ```python
-from typing_extensions import Tuple, Annotated
+from typing import Tuple, Annotated
 import pandas as pd
 from sklearn.datasets import load_iris
 from sklearn.model_selection import train_test_split

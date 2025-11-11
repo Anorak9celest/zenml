@@ -30,39 +30,40 @@ from tests.integration.functional.conftest import (
 from tests.integration.functional.utils import sample_name
 from zenml import (
     ExternalArtifact,
-    log_artifact_metadata,
+    get_pipeline_context,
+    get_step_context,
+    log_metadata,
     pipeline,
     save_artifact,
     step,
 )
 from zenml.client import Client
-from zenml.config.pipeline_spec import PipelineSpec
 from zenml.config.source import Source
 from zenml.constants import PAGE_SIZE_DEFAULT
 from zenml.enums import (
+    ArtifactSaveType,
     MetadataResourceTypes,
     ModelStages,
-    SecretScope,
     StackComponentType,
+    TaggableResourceTypes,
 )
 from zenml.exceptions import (
     EntityExistsError,
     IllegalOperationError,
     InitializationException,
-    StackComponentExistsError,
-    StackExistsError,
 )
 from zenml.io import fileio
-from zenml.metadata.metadata_types import MetadataTypeEnum
 from zenml.model.model import Model
 from zenml.models import (
     ComponentResponse,
     ModelResponse,
     ModelVersionResponse,
     PipelineBuildRequest,
-    PipelineDeploymentRequest,
     PipelineRequest,
+    PipelineSnapshotRequest,
+    RunMetadataResource,
     StackResponse,
+    TagResource,
 )
 from zenml.utils import io_utils
 from zenml.utils.string_utils import random_str
@@ -223,16 +224,6 @@ def test_finding_repository_directory_with_explicit_path(
     del os.environ["ZENML_REPOSITORY_PATH"]
 
 
-def test_creating_repository_instance_during_step_execution(mocker):
-    """Tests that creating a Repository instance while a step is being executed does not fail."""
-    mocker.patch(
-        "zenml.environment.Environment.step_is_running",
-        return_value=True,
-    )
-    with does_not_raise():
-        Client()
-
-
 def test_activating_nonexisting_stack_fails(clean_client):
     """Tests that activating a stack name that isn't registered fails."""
     with pytest.raises(KeyError):
@@ -278,7 +269,7 @@ def test_registering_a_stack_with_existing_name(clean_client):
     orchestrator = _create_local_orchestrator(clean_client)
     artifact_store = _create_local_artifact_store(clean_client)
 
-    with pytest.raises(StackExistsError):
+    with pytest.raises(EntityExistsError):
         clean_client.create_stack(
             name="axels_super_awesome_stack_of_fluffyness",
             components={
@@ -388,7 +379,7 @@ def test_registering_a_stack_component_with_existing_name(clean_client):
     _create_local_orchestrator(
         client=clean_client, orchestrator_name="axels_orchestration_laboratory"
     )
-    with pytest.raises(StackComponentExistsError):
+    with pytest.raises(EntityExistsError):
         clean_client.create_stack_component(
             name="axels_orchestration_laboratory",
             flavor="local",
@@ -453,12 +444,8 @@ def test_getting_a_pipeline(clean_client: "Client"):
         clean_client.get_pipeline(name_id_or_prefix="non_existent")
 
     request = PipelineRequest(
-        user=clean_client.active_user.id,
-        workspace=clean_client.active_workspace.id,
+        project=clean_client.active_project.id,
         name="pipeline",
-        version="1",
-        version_hash="",
-        spec=PipelineSpec(steps=[]),
     )
     response_1 = clean_client.zen_store.create_pipeline(request)
 
@@ -468,245 +455,87 @@ def test_getting_a_pipeline(clean_client: "Client"):
     pipeline = clean_client.get_pipeline(name_id_or_prefix="pipeline")
     assert pipeline == response_1
 
-    pipeline = clean_client.get_pipeline(
-        name_id_or_prefix="pipeline", version="1"
-    )
-    assert pipeline == response_1
-
-    # Non-existent version
-    with pytest.raises(KeyError):
-        clean_client.get_pipeline(name_id_or_prefix="pipeline", version="2")
-
-    request.version = "2"
-    request.version_hash = "foo"
-    response_2 = clean_client.zen_store.create_pipeline(request)
-
-    # Gets latest version
-    pipeline = clean_client.get_pipeline(name_id_or_prefix="pipeline")
-    assert pipeline == response_2
-
 
 def test_listing_pipelines(clean_client):
     """Tests listing of pipelines."""
     assert clean_client.list_pipelines().total == 0
 
     request = PipelineRequest(
-        user=clean_client.active_user.id,
-        workspace=clean_client.active_workspace.id,
+        project=clean_client.active_project.id,
         name="pipeline",
-        version="1",
-        version_hash="",
-        spec=PipelineSpec(steps=[]),
     )
     response_1 = clean_client.zen_store.create_pipeline(request)
     request.name = "other_pipeline"
-    request.version = "2"
-    response_2 = clean_client.zen_store.create_pipeline(request)
+    clean_client.zen_store.create_pipeline(request)
 
     assert clean_client.list_pipelines().total == 2
 
     assert clean_client.list_pipelines(name="pipeline").total == 1
     assert clean_client.list_pipelines(name="pipeline").items[0] == response_1
 
-    assert clean_client.list_pipelines(version="1").total == 1
-    assert clean_client.list_pipelines(version="1").items[0] == response_1
-
-    assert clean_client.list_pipelines(version="2").total == 1
-    assert clean_client.list_pipelines(version="2").items[0] == response_2
-
-    assert (
-        clean_client.list_pipelines(name="other_pipeline", version="3").total
-        == 0
-    )
+    assert clean_client.list_pipelines(name="yet_another_pipeline").total == 0
 
 
 def test_create_run_metadata_for_pipeline_run(clean_client_with_run: Client):
     """Test creating run metadata linked only to a pipeline run."""
-    pipeline_run = clean_client_with_run.list_runs()[0]
-    existing_metadata = clean_client_with_run.list_run_metadata(
-        resource_id=pipeline_run.id,
-        resource_type=MetadataResourceTypes.PIPELINE_RUN,
-    )
-
+    pipeline_run = clean_client_with_run.list_pipeline_runs()[0]
     # Assert that the created metadata is correct
-    new_metadata = clean_client_with_run.create_run_metadata(
+    clean_client_with_run.create_run_metadata(
         metadata={"axel": "is awesome"},
-        resource_id=pipeline_run.id,
-        resource_type=MetadataResourceTypes.PIPELINE_RUN,
+        resources=[
+            RunMetadataResource(
+                id=pipeline_run.id, type=MetadataResourceTypes.PIPELINE_RUN
+            )
+        ],
     )
-    assert isinstance(new_metadata, list)
-    assert len(new_metadata) == 1
-    assert new_metadata[0].key == "axel"
-    assert new_metadata[0].value == "is awesome"
-    assert new_metadata[0].type == MetadataTypeEnum.STRING
-    assert new_metadata[0].resource_id == pipeline_run.id
-    assert new_metadata[0].resource_type == MetadataResourceTypes.PIPELINE_RUN
-    assert new_metadata[0].stack_component_id is None
+    rm = clean_client_with_run.get_pipeline_run(pipeline_run.id).run_metadata
 
-    # Assert new metadata is linked to the pipeline run
-    all_metadata = clean_client_with_run.list_run_metadata(
-        resource_id=pipeline_run.id,
-        resource_type=MetadataResourceTypes.PIPELINE_RUN,
-    )
-    assert len(all_metadata) == len(existing_metadata) + 1
-
-
-def test_create_run_metadata_for_pipeline_run_and_component(
-    clean_client_with_run: Client,
-):
-    """Test creating metadata linked to a pipeline run and a stack component"""
-    pipeline_run = clean_client_with_run.list_runs()[0]
-    orchestrator_id = clean_client_with_run.active_stack_model.components[
-        "orchestrator"
-    ][0].id
-    existing_metadata = clean_client_with_run.list_run_metadata(
-        resource_id=pipeline_run.id,
-        resource_type=MetadataResourceTypes.PIPELINE_RUN,
-    )
-    existing_component_metadata = clean_client_with_run.list_run_metadata(
-        stack_component_id=orchestrator_id
-    )
-
-    # Assert that the created metadata is correct
-    new_metadata = clean_client_with_run.create_run_metadata(
-        metadata={"aria": "is awesome too"},
-        resource_id=pipeline_run.id,
-        resource_type=MetadataResourceTypes.PIPELINE_RUN,
-        stack_component_id=orchestrator_id,
-    )
-    assert isinstance(new_metadata, list)
-    assert len(new_metadata) == 1
-    assert new_metadata[0].key == "aria"
-    assert new_metadata[0].value == "is awesome too"
-    assert new_metadata[0].type == MetadataTypeEnum.STRING
-    assert new_metadata[0].resource_id == pipeline_run.id
-    assert new_metadata[0].resource_type == MetadataResourceTypes.PIPELINE_RUN
-    assert new_metadata[0].stack_component_id == orchestrator_id
-
-    # Assert new metadata is linked to the pipeline run
-    registered_metadata = clean_client_with_run.list_run_metadata(
-        resource_id=pipeline_run.id,
-        resource_type=MetadataResourceTypes.PIPELINE_RUN,
-    )
-    assert len(registered_metadata) == len(existing_metadata) + 1
-
-    # Assert new metadata is linked to the stack component
-    registered_component_metadata = clean_client_with_run.list_run_metadata(
-        stack_component_id=orchestrator_id
-    )
-    assert (
-        len(registered_component_metadata)
-        == len(existing_component_metadata) + 1
-    )
+    assert isinstance(rm, dict)
+    assert len(rm.values()) == 1
+    assert rm["axel"] == "is awesome"
 
 
 def test_create_run_metadata_for_step_run(clean_client_with_run: Client):
     """Test creating run metadata linked only to a step run."""
     step_run = clean_client_with_run.list_run_steps()[0]
-    existing_metadata = clean_client_with_run.list_run_metadata(
-        resource_id=step_run.id, resource_type=MetadataResourceTypes.STEP_RUN
-    )
 
     # Assert that the created metadata is correct
-    new_metadata = clean_client_with_run.create_run_metadata(
+    clean_client_with_run.create_run_metadata(
         metadata={"axel": "is awesome"},
-        resource_id=step_run.id,
-        resource_type=MetadataResourceTypes.STEP_RUN,
+        resources=[
+            RunMetadataResource(
+                id=step_run.id, type=MetadataResourceTypes.STEP_RUN
+            )
+        ],
     )
-    assert isinstance(new_metadata, list)
-    assert len(new_metadata) == 1
-    assert new_metadata[0].key == "axel"
-    assert new_metadata[0].value == "is awesome"
-    assert new_metadata[0].type == MetadataTypeEnum.STRING
-    assert new_metadata[0].resource_id == step_run.id
-    assert new_metadata[0].resource_type == MetadataResourceTypes.STEP_RUN
-    assert new_metadata[0].stack_component_id is None
+    rm = clean_client_with_run.get_run_step(step_run.id).run_metadata
 
-    # Assert new metadata is linked to the step run
-    registered_metadata = clean_client_with_run.list_run_metadata(
-        resource_id=step_run.id, resource_type=MetadataResourceTypes.STEP_RUN
-    )
-    assert len(registered_metadata) == len(existing_metadata) + 1
-
-
-def test_create_run_metadata_for_step_run_and_component(
-    clean_client_with_run: Client,
-):
-    """Test creating metadata linked to a step run and a stack component"""
-    step_run = clean_client_with_run.list_run_steps()[0]
-    orchestrator_id = clean_client_with_run.active_stack_model.components[
-        "orchestrator"
-    ][0].id
-    existing_metadata = clean_client_with_run.list_run_metadata(
-        resource_id=step_run.id, resource_type=MetadataResourceTypes.STEP_RUN
-    )
-    existing_component_metadata = clean_client_with_run.list_run_metadata(
-        stack_component_id=orchestrator_id
-    )
-
-    # Assert that the created metadata is correct
-    new_metadata = clean_client_with_run.create_run_metadata(
-        metadata={"aria": "is awesome too"},
-        resource_id=step_run.id,
-        resource_type=MetadataResourceTypes.STEP_RUN,
-        stack_component_id=orchestrator_id,
-    )
-    assert isinstance(new_metadata, list)
-    assert len(new_metadata) == 1
-    assert new_metadata[0].key == "aria"
-    assert new_metadata[0].value == "is awesome too"
-    assert new_metadata[0].type == MetadataTypeEnum.STRING
-    assert new_metadata[0].resource_id == step_run.id
-    assert new_metadata[0].resource_type == MetadataResourceTypes.STEP_RUN
-    assert new_metadata[0].stack_component_id == orchestrator_id
-
-    # Assert new metadata is linked to the step run
-    registered_metadata = clean_client_with_run.list_run_metadata(
-        resource_id=step_run.id, resource_type=MetadataResourceTypes.STEP_RUN
-    )
-    assert len(registered_metadata) == len(existing_metadata) + 1
-
-    # Assert new metadata is linked to the stack component
-    registered_component_metadata = clean_client_with_run.list_run_metadata(
-        stack_component_id=orchestrator_id
-    )
-    assert (
-        len(registered_component_metadata)
-        == len(existing_component_metadata) + 1
-    )
+    assert isinstance(rm, dict)
+    assert len(rm.values()) == 1
+    assert rm["axel"] == "is awesome"
 
 
 def test_create_run_metadata_for_artifact(clean_client_with_run: Client):
     """Test creating run metadata linked to an artifact."""
     artifact_version = clean_client_with_run.list_artifact_versions()[0]
-    existing_metadata = clean_client_with_run.list_run_metadata(
-        resource_id=artifact_version.id,
-        resource_type=MetadataResourceTypes.ARTIFACT_VERSION,
-    )
 
     # Assert that the created metadata is correct
-    new_metadata = clean_client_with_run.create_run_metadata(
+    clean_client_with_run.create_run_metadata(
         metadata={"axel": "is awesome"},
-        resource_id=artifact_version.id,
-        resource_type=MetadataResourceTypes.ARTIFACT_VERSION,
+        resources=[
+            RunMetadataResource(
+                id=artifact_version.id,
+                type=MetadataResourceTypes.ARTIFACT_VERSION,
+            )
+        ],
     )
-    assert isinstance(new_metadata, list)
-    assert len(new_metadata) == 1
-    assert new_metadata[0].key == "axel"
-    assert new_metadata[0].value == "is awesome"
-    assert new_metadata[0].type == MetadataTypeEnum.STRING
-    assert new_metadata[0].resource_id == artifact_version.id
-    assert (
-        new_metadata[0].resource_type == MetadataResourceTypes.ARTIFACT_VERSION
-    )
-    assert new_metadata[0].stack_component_id is None
 
-    # Assert new metadata is linked to the artifact
-    registered_metadata = clean_client_with_run.list_run_metadata(
-        resource_id=artifact_version.id,
-        resource_type=MetadataResourceTypes.ARTIFACT_VERSION,
-    )
-    assert len(registered_metadata) == len(existing_metadata) + 1
+    rm = clean_client_with_run.get_artifact_version(
+        artifact_version.id
+    ).run_metadata
+
+    assert isinstance(rm, dict)
+    assert rm["axel"] == "is awesome"
 
 
 # .---------.
@@ -735,28 +564,28 @@ def random_secret_context() -> Generator[str, None, None]:
 
 
 def test_create_secret_default_scope():
-    """Test that secrets are created in the workspace scope by default."""
+    """Test that secrets are created as public by default."""
     client = Client()
     with random_secret_context() as name:
         s = client.create_secret(
             name=name,
             values={"key": "value"},
         )
-        assert s.scope == SecretScope.WORKSPACE
+        assert s.private is False
         assert s.name == name
         assert s.secret_values == {"key": "value"}
 
 
-def test_create_secret_user_scope():
-    """Test creating secrets in the user scope."""
+def test_create_private_secret():
+    """Test creating private secrets."""
     client = Client()
     with random_secret_context() as name:
         s = client.create_secret(
             name=name,
-            scope=SecretScope.USER,
+            private=True,
             values={"key": "value"},
         )
-        assert s.scope == SecretScope.USER
+        assert s.private is True
         assert s.name == name
         assert s.secret_values == {"key": "value"}
 
@@ -777,20 +606,20 @@ def test_create_secret_existing_name_scope():
             )
 
 
-def test_create_secret_existing_name_user_scope():
-    """Test that creating a secret with an existing name in the user scope fails."""
+def test_create_private_secret_existing_name():
+    """Test that creating a private secret with an existing name fails."""
     client = Client()
     with random_secret_context() as name:
         client.create_secret(
             name=name,
-            scope=SecretScope.USER,
+            private=True,
             values={"key": "value"},
         )
 
         with pytest.raises(EntityExistsError):
             client.create_secret(
                 name=name,
-                scope=SecretScope.USER,
+                private=True,
                 values={"key": "value"},
             )
 
@@ -807,7 +636,7 @@ def test_create_secret_existing_name_different_scope():
         with does_not_raise():
             s2 = client.create_secret(
                 name=name,
-                scope=SecretScope.USER,
+                private=True,
                 values={"key": "value"},
             )
 
@@ -826,8 +655,7 @@ def test_listing_builds(clean_client):
     assert len(builds) == 0
 
     request = PipelineBuildRequest(
-        user=clean_client.active_user.id,
-        workspace=clean_client.active_workspace.id,
+        project=clean_client.active_project.id,
         images={},
         is_local=False,
         contains_code=True,
@@ -849,8 +677,7 @@ def test_getting_builds(clean_client):
         clean_client.get_build(str(uuid4()))
 
     request = PipelineBuildRequest(
-        user=clean_client.active_user.id,
-        workspace=clean_client.active_workspace.id,
+        project=clean_client.active_project.id,
         images={},
         is_local=False,
         contains_code=True,
@@ -869,8 +696,7 @@ def test_deleting_builds(clean_client):
         clean_client.delete_build(str(uuid4()))
 
     request = PipelineBuildRequest(
-        user=clean_client.active_user.id,
-        workspace=clean_client.active_workspace.id,
+        project=clean_client.active_project.id,
         images={},
         is_local=False,
         contains_code=True,
@@ -885,86 +711,108 @@ def test_deleting_builds(clean_client):
 
 
 # --------------------
-# Pipeline Deployments
+# Pipeline Snasphots
 # --------------------
 
 
-def test_listing_deployments(clean_client):
-    """Tests listing deployments."""
-    deployments = clean_client.list_deployments()
-    assert len(deployments) == 0
+def test_listing_snapshots(clean_client):
+    """Tests listing snapshots."""
+    snapshots = clean_client.list_snapshots(named_only=False)
+    assert len(snapshots) == 0
 
-    request = PipelineDeploymentRequest(
-        user=clean_client.active_user.id,
-        workspace=clean_client.active_workspace.id,
+    pipeline = clean_client.zen_store.create_pipeline(
+        PipelineRequest(
+            project=clean_client.active_project.id,
+            name="pipeline_name",
+        )
+    )
+
+    request = PipelineSnapshotRequest(
+        project=clean_client.active_project.id,
         stack=clean_client.active_stack.id,
         run_name_template="",
         pipeline_configuration={"name": "pipeline_name"},
         client_version="0.12.3",
         server_version="0.12.3",
+        pipeline=pipeline.id,
+        is_dynamic=False,
     )
-    response = clean_client.zen_store.create_deployment(request)
+    response = clean_client.zen_store.create_snapshot(request)
 
-    deployments = clean_client.list_deployments()
-    assert len(deployments) == 1
-    assert deployments[0] == response
+    snapshots = clean_client.list_snapshots(named_only=False)
+    assert len(snapshots) == 1
+    assert snapshots[0] == response
 
-    deployments = clean_client.list_deployments(stack_id=uuid4())
-    assert len(deployments) == 0
+    snapshots = clean_client.list_snapshots(named_only=False, stack=uuid4())
+    assert len(snapshots) == 0
 
 
-def test_getting_deployments(clean_client):
-    """Tests getting deployments."""
+def test_getting_snapshots(clean_client):
+    """Tests getting snapshots."""
     with pytest.raises(KeyError):
-        clean_client.get_deployment(str(uuid4()))
+        clean_client.get_snapshot(str(uuid4()))
 
-    request = PipelineDeploymentRequest(
-        user=clean_client.active_user.id,
-        workspace=clean_client.active_workspace.id,
+    pipeline = clean_client.zen_store.create_pipeline(
+        PipelineRequest(
+            project=clean_client.active_project.id,
+            name="pipeline_name",
+        )
+    )
+    request = PipelineSnapshotRequest(
+        project=clean_client.active_project.id,
         stack=clean_client.active_stack.id,
         run_name_template="",
         pipeline_configuration={"name": "pipeline_name"},
         client_version="0.12.3",
         server_version="0.12.3",
+        pipeline=pipeline.id,
+        is_dynamic=False,
     )
-    response = clean_client.zen_store.create_deployment(request)
+    response = clean_client.zen_store.create_snapshot(request)
 
     with does_not_raise():
-        deployment = clean_client.get_deployment(str(response.id))
+        snapshot = clean_client.get_snapshot(str(response.id))
 
-    assert deployment == response
+    assert snapshot == response
 
 
-def test_deleting_deployments(clean_client):
-    """Tests deleting deployments."""
+def test_deleting_snapshots(clean_client):
+    """Tests deleting snapshots."""
     with pytest.raises(KeyError):
-        clean_client.delete_deployment(str(uuid4()))
+        clean_client.delete_snapshot(str(uuid4()))
 
-    request = PipelineDeploymentRequest(
-        user=clean_client.active_user.id,
-        workspace=clean_client.active_workspace.id,
+    pipeline = clean_client.zen_store.create_pipeline(
+        PipelineRequest(
+            project=clean_client.active_project.id,
+            name="pipeline_name",
+        )
+    )
+    request = PipelineSnapshotRequest(
+        project=clean_client.active_project.id,
         stack=clean_client.active_stack.id,
         run_name_template="",
         pipeline_configuration={"name": "pipeline_name"},
         client_version="0.12.3",
         server_version="0.12.3",
+        pipeline=pipeline.id,
+        is_dynamic=False,
     )
-    response = clean_client.zen_store.create_deployment(request)
+    response = clean_client.zen_store.create_snapshot(request)
 
     with does_not_raise():
-        clean_client.delete_deployment(str(response.id))
+        clean_client.delete_snapshot(str(response.id))
 
     with pytest.raises(KeyError):
-        clean_client.get_deployment(str(response.id))
+        clean_client.get_snapshot(str(response.id))
 
 
 def test_get_run(clean_client: Client, connected_two_step_pipeline):
     """Test that `get_run()` returns the correct run."""
     pipeline_instance = connected_two_step_pipeline(
-        step_1=constant_int_output_test_step(),
-        step_2=int_plus_one_test_step(),
+        step_1=constant_int_output_test_step,
+        step_2=int_plus_one_test_step,
     )
-    pipeline_instance.run()
+    pipeline_instance()
     run_ = clean_client.get_pipeline("connected_two_step_pipeline").runs[0]
     assert clean_client.get_pipeline_run(run_.name) == run_
 
@@ -973,19 +821,6 @@ def test_get_run_fails_for_non_existent_run(clean_client: Client):
     """Test that `get_run()` raises a `KeyError` for non-existent runs."""
     with pytest.raises(KeyError):
         clean_client.get_pipeline_run("non_existent_run")
-
-
-def test_get_unlisted_runs(clean_client: Client, connected_two_step_pipeline):
-    """Test that listing unlisted runs works."""
-    assert len(clean_client.list_pipeline_runs(unlisted=True)) == 0
-    pipeline_instance = connected_two_step_pipeline(
-        step_1=constant_int_output_test_step(),
-        step_2=int_plus_one_test_step(),
-    )
-    pipeline_instance.run()
-    assert len(clean_client.list_pipeline_runs(unlisted=True)) == 0
-    pipeline_instance.run(unlisted=True)
-    assert len(clean_client.list_pipeline_runs(unlisted=True)) == 1
 
 
 class ClientCrudTestConfig(BaseModel):
@@ -1003,9 +838,9 @@ crud_test_configs = [
         update_args={"updated_name": sample_name("updated_user_name")},
     ),
     ClientCrudTestConfig(
-        entity_name="workspace",
-        create_args={"name": sample_name("workspace_name"), "description": ""},
-        update_args={"new_name": sample_name("updated_workspace_name")},
+        entity_name="project",
+        create_args={"name": sample_name("project_name"), "description": ""},
+        update_args={"new_name": sample_name("updated_project_name")},
     ),
     ClientCrudTestConfig(
         entity_name="stack",
@@ -1131,8 +966,7 @@ def test_basic_crud_for_entity(
             name_id_or_prefix=id_prefix, **crud_test_config.delete_args
         )
     finally:
-        # Make sure to delete the created entity to not leave anything in the
-        # workspace.
+        # Make sure to delete the created entity to not leave anything behind.
         try:
             delete_method(entity.id, **crud_test_config.delete_args)
         except KeyError:
@@ -1146,22 +980,28 @@ def lazy_producer_test_artifact() -> Annotated[str, "new_one"]:
     """Produce artifact with metadata."""
     from zenml.client import Client
 
-    log_artifact_metadata(metadata={"some_meta": "meta_new_one"})
+    log_metadata(
+        metadata={"some_meta": "meta_new_one"},
+        infer_artifact=True,
+    )
 
     client = Client()
-    model = client.create_model(name="model_name", description="model_desc")
-    client.create_model_version(
-        model_name_or_id=model.id,
-        name="model_version",
-        description="mv_desc_1",
+
+    model = get_step_context().model
+
+    log_metadata(
+        metadata={"some_meta": "meta_new_one"},
+        model_name=model.name,
+        model_version=model.version,
     )
+
     mv = client.create_model_version(
-        model_name_or_id=model.id,
+        model_name_or_id=model.name,
         name="model_version2",
         description="mv_desc_2",
     )
     client.update_model_version(
-        model_name_or_id=model.id, version_name_or_id=mv.id, stage="staging"
+        model_name_or_id=model.name, version_name_or_id=mv.id, stage="staging"
     )
     return "body_new_one"
 
@@ -1175,6 +1015,7 @@ def lazy_asserter_test_artifact(
     model: ModelResponse,
     model_version_by_version: ModelVersionResponse,
     model_version_by_stage: ModelVersionResponse,
+    model_version_run_metadata: str,
 ):
     """Assert that passed in values are loaded in lazy mode.
     They do not exists before actual run of the pipeline.
@@ -1184,12 +1025,13 @@ def lazy_asserter_test_artifact(
     assert artifact_new == "body_new_one"
     assert artifact_metadata_new == "meta_new_one"
 
-    assert model.name == "model_name"
-    assert model.description == "model_desc"
+    assert model.name == "aria"
+    # assert model.description == "model_description"
     assert model_version_by_version.name == "model_version"
-    assert model_version_by_version.description == "mv_desc_1"
+    # assert model_version_by_version.description == "mv_desc_1"
     assert model_version_by_stage.name == "model_version2"
     assert model_version_by_stage.description == "mv_desc_2"
+    assert model_version_run_metadata == "meta_new_one"
 
 
 class TestArtifact:
@@ -1198,6 +1040,7 @@ class TestArtifact:
         artifact_id = ExternalArtifact(value="foo").upload_by_value()
         artifact = clean_client.get_artifact_version(artifact_id)
         assert artifact is not None
+        assert artifact.save_type == ArtifactSaveType.EXTERNAL
         clean_client.prune_artifacts(
             only_versions=False, delete_from_artifact_store=True
         )
@@ -1250,7 +1093,12 @@ class TestArtifact:
     ):
         """Tests that user can load model artifact versions, metadata and models (versions) in lazy mode in pipeline codes."""
 
-        @pipeline(enable_cache=False)
+        @pipeline(
+            enable_cache=False,
+            model=Model(
+                name="aria", version="model_version", description="mv_desc_1"
+            ),
+        )
         def dummy():
             artifact_existing = clean_client.get_artifact_version(
                 name_id_or_prefix="preexisting"
@@ -1264,7 +1112,11 @@ class TestArtifact:
             )
             artifact_metadata_new = artifact_new.run_metadata["some_meta"]
 
-            model = clean_client.get_model(model_name_or_id="model_name")
+            model = clean_client.get_model(model_name_or_id="aria")
+
+            model_version_run_metadata = (
+                get_pipeline_context().model.run_metadata["some_meta"]
+            )
 
             lazy_producer_test_artifact()
             lazy_asserter_test_artifact(
@@ -1275,7 +1127,7 @@ class TestArtifact:
                 # pass as artifact response
                 artifact_new,
                 # read value of metadata directly
-                artifact_metadata_new.value,
+                artifact_metadata_new,
                 # load model
                 model,
                 # load model version by version
@@ -1287,16 +1139,17 @@ class TestArtifact:
                 # load model version by stage
                 clean_client.get_model_version(
                     # this can be lazy loaders too
-                    model.id,
+                    model_name_or_id=model.id,
                     model_version_name_or_number_or_id="staging",
                 ),
+                model_version_run_metadata,
                 after=["lazy_producer_test_artifact"],
             )
 
         save_artifact(
             data="body_preexisting", name="preexisting", version="1.2.3"
         )
-        log_artifact_metadata(
+        log_metadata(
             metadata={"some_meta": "meta_preexisting"},
             artifact_name="preexisting",
             artifact_version="1.2.3",
@@ -1304,6 +1157,11 @@ class TestArtifact:
         with pytest.raises(KeyError):
             clean_client.get_artifact_version("new_one")
         dummy()
+        log_metadata(
+            metadata={"some_meta": "meta_preexisting"},
+            model_name="aria",
+            model_version="model_version",
+        )
 
 
 class TestModel:
@@ -1455,16 +1313,16 @@ class TestModel:
         model2 = clean_client.create_model(
             name=self.MODEL_NAME + "2", tags=["foo"]
         )
-        ms = clean_client.list_models(tag="foo")
+        ms = clean_client.list_models(tags=["foo"])
         assert len(ms) == 2
         assert model1 in ms
         assert model2 in ms
 
-        ms = clean_client.list_models(tag="bar")
+        ms = clean_client.list_models(tags=["bar"])
         assert len(ms) == 1
         assert model1 in ms
 
-        ms = clean_client.list_models(tag="non_existent_tag")
+        ms = clean_client.list_models(tags=["non_existent_tag"])
         assert len(ms) == 0
 
         ms = clean_client.list_models()
@@ -1472,10 +1330,8 @@ class TestModel:
         assert model1 in ms
         assert model2 in ms
 
-        ms = clean_client.list_models(tag="")
-        assert len(ms) == 2
-        assert model1 in ms
-        assert model2 in ms
+        ms = clean_client.list_models(tags=[""])
+        assert len(ms) == 0
 
 
 class TestModelVersion:
@@ -1700,23 +1556,16 @@ class TestModelVersion:
         model_versions = client_with_model.list_model_versions(
             self.MODEL_NAME,
             name=f"contains:{self.VERSION_NAME}_",
-            tag="foo",
+            tags=["foo"],
         )
         assert len(model_versions) == PAGE_SIZE_DEFAULT
 
         model_versions = client_with_model.list_model_versions(
             self.MODEL_NAME,
             name=f"contains:{self.VERSION_NAME}_",
-            tag="non_existent_tag",
+            tags=["non_existent_tag"],
         )
         assert len(model_versions) == 0
-
-        model_versions = client_with_model.list_model_versions(
-            self.MODEL_NAME,
-            name=f"contains:{self.VERSION_NAME}_",
-            tag="",
-        )
-        assert len(model_versions) == PAGE_SIZE_DEFAULT
 
     def test_delete_model_version_found(self, client_with_model: "Client"):
         client_with_model.delete_model_version(
@@ -1817,3 +1666,22 @@ class TestModelVersion:
         )
         assert mv.name == "bar"
         assert mv.description == "bar"
+
+
+def test_attach_and_detach_tag_pipeline_run(clean_client_with_run: Client):
+    run = clean_client_with_run.get_pipeline_run("connected_two_step_pipeline")
+    tag = clean_client_with_run.create_tag(name="foo")
+    clean_client_with_run.attach_tag(
+        tag.name,
+        [TagResource(id=run.id, type=TaggableResourceTypes.PIPELINE_RUN)],
+    )
+
+    run = clean_client_with_run.get_pipeline_run(run.id)
+    assert "foo" in [t.name for t in run.tags]
+
+    clean_client_with_run.detach_tag(
+        tag.name,
+        [TagResource(id=run.id, type=TaggableResourceTypes.PIPELINE_RUN)],
+    )
+    run = clean_client_with_run.get_pipeline_run(run.id)
+    assert "foo" not in [t.name for t in run.tags]

@@ -59,11 +59,6 @@ def _model_to_print(model: ModelResponse) -> Dict[str, Any]:
 def _model_version_to_print(
     model_version: ModelVersionResponse,
 ) -> Dict[str, Any]:
-    run_metadata = None
-    if model_version.run_metadata:
-        run_metadata = {
-            k: v.value for k, v in model_version.run_metadata.items()
-        }
     return {
         "id": model_version.id,
         "model": model_version.model.name,
@@ -71,14 +66,8 @@ def _model_version_to_print(
         "number": model_version.number,
         "description": model_version.description,
         "stage": model_version.stage,
-        "run_metadata": run_metadata,
+        "run_metadata": model_version.run_metadata,
         "tags": [t.name for t in model_version.tags],
-        "data_artifacts_count": len(model_version.data_artifact_ids),
-        "model_artifacts_count": len(model_version.model_artifact_ids),
-        "deployment_artifacts_count": len(
-            model_version.deployment_artifact_ids
-        ),
-        "pipeline_runs_count": len(model_version.pipeline_run_ids),
         "updated": model_version.updated.date(),
     }
 
@@ -96,9 +85,7 @@ def list_models(**kwargs: Any) -> None:
     Args:
         **kwargs: Keyword arguments to filter models.
     """
-    models = Client().zen_store.list_models(
-        model_filter_model=ModelFilter(**kwargs)
-    )
+    models = Client().list_models(**kwargs)
 
     if not models:
         cli_utils.declare("No models found.")
@@ -225,7 +212,7 @@ def register_model(
             )
         )
     except (EntityExistsError, ValueError) as e:
-        cli_utils.error(str(e))
+        cli_utils.exception(e)
 
     cli_utils.print_table([_model_to_print(model)])
 
@@ -393,7 +380,7 @@ def delete_model(
             model_name_or_id=model_name_or_id,
         )
     except (KeyError, ValueError) as e:
-        cli_utils.error(str(e))
+        cli_utils.exception(e)
     else:
         cli_utils.declare(f"Model '{model_name_or_id}' deleted.")
 
@@ -404,25 +391,14 @@ def version() -> None:
 
 
 @cli_utils.list_options(ModelVersionFilter)
-@click.option(
-    "--model-name",
-    "-n",
-    help="The name of the parent model.",
-    type=str,
-    required=False,
-)
 @version.command("list", help="List model versions with filter.")
-def list_model_versions(model_name: str, **kwargs: Any) -> None:
+def list_model_versions(**kwargs: Any) -> None:
     """List model versions with filter in the Model Control Plane.
 
     Args:
-        model_name: The name of the parent model.
         **kwargs: Keyword arguments to filter models.
     """
-    model_versions = Client().zen_store.list_model_versions(
-        model_name_or_id=model_name,
-        model_version_filter_model=ModelVersionFilter(**kwargs),
-    )
+    model_versions = Client().list_model_versions(**kwargs)
 
     if not model_versions:
         cli_utils.declare("No model versions found.")
@@ -582,7 +558,7 @@ def delete_model_version(
             model_version_id=model_version.id,
         )
     except (KeyError, ValueError) as e:
-        cli_utils.error(str(e))
+        cli_utils.exception(e)
     else:
         cli_utils.declare(
             f"Model version '{model_version_name_or_number_or_id}' deleted from model '{model_name_or_id}'."
@@ -619,21 +595,6 @@ def _print_artifacts_links_generic(
         else "model artifacts"
     )
 
-    if (
-        (only_data_artifacts and not model_version.data_artifact_ids)
-        or (
-            only_deployment_artifacts
-            and not model_version.deployment_artifact_ids
-        )
-        or (only_model_artifacts and not model_version.model_artifact_ids)
-    ):
-        cli_utils.declare(f"No {type_} linked to the model version found.")
-        return
-
-    cli_utils.title(
-        f"{type_} linked to the model version `{model_version.name}[{model_version.number}]`:"
-    )
-
     links = Client().list_model_version_artifact_links(
         model_version_id=model_version.id,
         only_data_artifacts=only_data_artifacts,
@@ -642,6 +603,13 @@ def _print_artifacts_links_generic(
         **kwargs,
     )
 
+    if not links:
+        cli_utils.declare(f"No {type_} linked to the model version found.")
+        return
+
+    cli_utils.title(
+        f"{type_} linked to the model version `{model_version.name}[{model_version.number}]`:"
+    )
     cli_utils.print_pydantic_models(
         links,
         columns=["artifact_version", "created"],
@@ -750,29 +718,23 @@ def list_model_version_pipeline_runs(
         model_name: The ID or name of the model containing version.
         model_version: The name, number or ID of the model version. If not
             provided, the latest version is used.
-        **kwargs: Keyword arguments to filter models.
+        **kwargs: Keyword arguments to filter runs.
     """
     model_version_response_model = Client().get_model_version(
         model_name_or_id=model_name,
         model_version_name_or_number_or_id=model_version,
     )
 
-    if not model_version_response_model.pipeline_run_ids:
-        cli_utils.declare("No pipeline runs attached to model version found.")
-        return
-    cli_utils.title(
-        f"Pipeline runs linked to the model version `{model_version_response_model.name}[{model_version_response_model.number}]`:"
-    )
-
-    links = Client().list_model_version_pipeline_run_links(
+    runs = Client().list_model_version_pipeline_run_links(
         model_version_id=model_version_response_model.id,
         **kwargs,
     )
 
-    cli_utils.print_pydantic_models(
-        links,
-        columns=[
-            "pipeline_run",
-            "created",
-        ],
+    if not runs:
+        cli_utils.declare("No pipeline runs attached to model version found.")
+        return
+
+    cli_utils.title(
+        f"Pipeline runs linked to the model version `{model_version_response_model.name}[{model_version_response_model.number}]`:"
     )
+    cli_utils.print_pydantic_models(runs)

@@ -11,15 +11,12 @@
 #  WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express
 #  or implied. See the License for the specific language governing
 #  permissions and limitations under the License.
-"""CLI for manipulating ZenML local and global config file."""
+"""Stack CLI."""
 
 import getpass
-import os
 import re
 import time
 import webbrowser
-from datetime import datetime
-from pathlib import Path
 from typing import (
     TYPE_CHECKING,
     Any,
@@ -35,6 +32,7 @@ import click
 from rich.console import Console
 from rich.markdown import Markdown
 from rich.prompt import Confirm
+from rich.style import Style
 from rich.syntax import Syntax
 
 import zenml
@@ -45,23 +43,14 @@ from zenml.cli.cli import TagGroup, cli
 from zenml.cli.text_utils import OldSchoolMarkdownHeading
 from zenml.cli.utils import (
     _component_display_name,
-    confirmation,
-    declare,
-    error,
     is_sorted_or_filtered,
     list_options,
     print_model_url,
     print_page_info,
     print_stacks_table,
-    verify_mlstacks_prerequisites_installation,
 )
 from zenml.client import Client
 from zenml.console import console
-from zenml.constants import (
-    ALPHA_MESSAGE,
-    MLSTACKS_SUPPORTED_STACK_COMPONENTS,
-    STACK_RECIPE_MODULAR_RECIPES,
-)
 from zenml.enums import (
     CliCategories,
     StackComponentType,
@@ -69,34 +58,25 @@ from zenml.enums import (
 )
 from zenml.exceptions import (
     IllegalOperationError,
-    ProvisioningError,
 )
-from zenml.io.fileio import rmtree
 from zenml.logger import get_logger
-from zenml.models import StackFilter
+from zenml.models import (
+    ComponentInfo,
+    ServiceConnectorInfo,
+    ServiceConnectorResourcesInfo,
+    StackFilter,
+    StackRequest,
+)
 from zenml.models.v2.core.service_connector import (
     ServiceConnectorRequest,
     ServiceConnectorResponse,
 )
-from zenml.models.v2.misc.full_stack import (
-    ComponentInfo,
-    FullStackRequest,
-    ServiceConnectorInfo,
+from zenml.service_connectors.service_connector_utils import (
+    get_resources_options_from_resource_model_for_full_stack,
 )
-from zenml.models.v2.misc.service_connector_type import (
-    ServiceConnectorTypedResourcesModel,
-)
+from zenml.utils import requirements_utils
 from zenml.utils.dashboard_utils import get_component_url, get_stack_url
-from zenml.utils.io_utils import create_dir_recursive_if_not_exists
-from zenml.utils.mlstacks_utils import (
-    convert_click_params_to_mlstacks_primitives,
-    convert_mlstacks_primitives_to_dicts,
-    deploy_mlstacks_stack,
-    get_stack_spec_file_path,
-    stack_exists,
-    stack_spec_exists,
-    verify_spec_and_tf_files_exist,
-)
+from zenml.utils.time_utils import utc_now_tz_aware
 from zenml.utils.yaml_utils import read_yaml, write_yaml
 
 if TYPE_CHECKING:
@@ -105,13 +85,12 @@ if TYPE_CHECKING:
 logger = get_logger(__name__)
 
 
-# Stacks
 @cli.group(
     cls=TagGroup,
     tag=CliCategories.MANAGEMENT_TOOLS,
 )
 def stack() -> None:
-    """Stacks to define various environments."""
+    """Manage stacks."""
 
 
 @stack.command(
@@ -217,6 +196,14 @@ def stack() -> None:
     required=False,
 )
 @click.option(
+    "-D",
+    "--deployer",
+    "deployer",
+    help="Name of the deployer for this stack.",
+    type=str,
+    required=False,
+)
+@click.option(
     "--set",
     "set_stack",
     is_flag=True,
@@ -237,6 +224,23 @@ def stack() -> None:
     type=str,
     required=False,
 )
+@click.option(
+    "--secret",
+    "secrets",
+    help="Secret to attach to the stack.",
+    type=str,
+    required=False,
+    multiple=True,
+)
+@click.option(
+    "--env",
+    "environment_variables",
+    help="Environment variables to set when running on this stack. Must be of "
+    "the format 'KEY=VALUE'.",
+    type=str,
+    required=False,
+    multiple=True,
+)
 def register_stack(
     stack_name: str,
     artifact_store: Optional[str] = None,
@@ -251,9 +255,12 @@ def register_stack(
     annotator: Optional[str] = None,
     data_validator: Optional[str] = None,
     image_builder: Optional[str] = None,
+    deployer: Optional[str] = None,
     set_stack: bool = False,
     provider: Optional[str] = None,
     connector: Optional[str] = None,
+    secrets: List[str] = [],
+    environment_variables: List[str] = [],
 ) -> None:
     """Register a stack.
 
@@ -271,21 +278,39 @@ def register_stack(
         annotator: Name of the annotator for this stack.
         data_validator: Name of the data validator for this stack.
         image_builder: Name of the new image builder for this stack.
+        deployer: Name of the deployer for this stack.
         set_stack: Immediately set this stack as active.
         provider: Name of the cloud provider for this stack.
         connector: Name of the service connector for this stack.
+        secrets: List of secrets to attach to the stack.
+        environment_variables: List of environment variables to set when
+            running on this stack. Must be of the format "KEY=VALUE".
     """
     if (provider is None and connector is None) and (
         artifact_store is None or orchestrator is None
     ):
         cli_utils.error(
-            "Only stack using service connector can be registered "
-            "without specifying an artifact store and an orchestrator. "
-            "Please specify the artifact store and the orchestrator or "
-            "the service connector or cloud type settings."
+            "The only way to register a stack without specifying an "
+            "orchestrator and an artifact store is by using either a provider"
+            "(-p/--provider) or an existing service connector "
+            "(-sc/--connector). Please specify the artifact store and "
+            "the orchestrator or the service connector or cloud type settings."
         )
 
     client = Client()
+
+    if provider is not None or connector is not None:
+        if client.zen_store.is_local_store():
+            cli_utils.error(
+                "You are registering a stack using a service connector, but "
+                "this feature cannot be used with a local ZenML deployment. "
+                "ZenML needs to be accessible from the cloud provider to allow "
+                "the stack and its components to be registered automatically. "
+                "Please deploy ZenML in a remote environment as described in "
+                "the documentation: https://docs.zenml.io/deploying-zenml/deploying-zenml "
+                "or use a managed ZenML Pro server instance for quick access "
+                "to this feature and more: https://www.zenml.io/pro"
+            )
 
     try:
         client.get_stack(
@@ -299,9 +324,15 @@ def register_stack(
     except KeyError:
         pass
 
+    environment: Dict[str, str] = {}
+    for environment_variable in environment_variables:
+        key, value = environment_variable.split("=", 1)
+        environment[key] = value
+
     labels: Dict[str, str] = {}
-    components: Dict[StackComponentType, Union[UUID, ComponentInfo]] = {}
-    # cloud flow
+    components: Dict[StackComponentType, List[Union[UUID, ComponentInfo]]] = {}
+
+    # Cloud Flow
     created_objects: Set[str] = set()
     service_connector: Optional[Union[UUID, ServiceConnectorInfo]] = None
     if provider is not None and connector is None:
@@ -315,8 +346,16 @@ def register_stack(
                 auto_configure=True,
                 verify=False,
             )
+        except NotImplementedError:
+            cli_utils.warning(
+                f"The {provider.upper()} service connector libraries are not "
+                "installed properly. Please run `zenml integration install "
+                f"{provider}` and try again to enable auto-discovery of the "
+                "connection configuration."
+            )
         except Exception:
             pass
+
         if service_connector_response:
             use_auto_configure = Confirm.ask(
                 f"[bold]{provider.upper()} cloud service connector[/bold] "
@@ -342,8 +381,9 @@ def register_stack(
                         for connector in existing_connectors.items
                     ],
                     headers=["Name"],
-                    prompt_text=f"We found these {provider.upper()} service connectors. "
-                    "Do you want to create a new one or use one of the existing ones?",
+                    prompt_text=f"We found these {provider.upper()} service "
+                    "connectors. Do you want to create a new one or use one "
+                    "of the existing ones?",
                     default_choice="0",
                     allow_zero_be_a_new_object=True,
                 )
@@ -376,7 +416,21 @@ def register_stack(
         labels["zenml:wizard"] = "true"
         if provider:
             labels["zenml:provider"] = provider
-        service_connector_resource_model = None
+        resources_info = None
+        # explore the service connector
+        with console.status(
+            "Exploring resources available to the service connector...\n"
+        ):
+            resources_info = (
+                get_resources_options_from_resource_model_for_full_stack(
+                    connector_details=service_connector
+                )
+            )
+        if resources_info is None:
+            cli_utils.error(
+                f"Failed to fetch service connector resources information for {service_connector}..."
+            )
+
         # create components
         needed_components = (
             (StackComponentType.ARTIFACT_STORE, artifact_store),
@@ -390,24 +444,41 @@ def register_stack(
                     component_type, preset_name
                 )
                 component_info = component_response.id
+                component_name = component_response.name
             else:
                 if isinstance(service_connector, UUID):
                     # find existing components under same connector
-                    existing_components = client.list_stack_components(
-                        type=component_type.value,
-                        connector_id=service_connector,
-                        size=100,
-                    )
-                    # if some existing components are found - prompt user what to do
-                    component_selected: Optional[int] = None
-                    if existing_components.total > 0:
+                    if (
+                        component_type
+                        in resources_info.components_resources_info
+                    ):
+                        existing_components = [
+                            existing_response
+                            for res_info in resources_info.components_resources_info[
+                                component_type
+                            ]
+                            for existing_response in res_info.connected_through_service_connector
+                        ]
+
+                        # if some existing components are found - prompt user what to do
+                        component_selected: Optional[int] = None
                         component_selected = cli_utils.multi_choice_prompt(
                             object_type=component_type.value.replace("_", " "),
                             choices=[
-                                [component.name]
-                                for component in existing_components.items
+                                [
+                                    component.flavor_name,
+                                    component.name,
+                                    component.configuration or "",
+                                    component.connector_resource_id,
+                                ]
+                                for component in existing_components
                             ],
-                            headers=["Name"],
+                            headers=[
+                                "Type",
+                                "Name",
+                                "Configuration",
+                                "Connected as",
+                            ],
                             prompt_text=f"We found these {component_type.value.replace('_', ' ')} "
                             "connected using the current service connector. Do you "
                             "want to create a new one or use existing one?",
@@ -418,54 +489,23 @@ def register_stack(
                     component_selected = None
 
                 if component_selected is None:
-                    if service_connector_resource_model is None:
-                        if isinstance(service_connector, UUID):
-                            service_connector_resource_model = (
-                                client.verify_service_connector(
-                                    service_connector
-                                )
-                            )
-                        else:
-                            _, service_connector_resource_model = (
-                                client.create_service_connector(
-                                    name=stack_name,
-                                    connector_type=service_connector.type,
-                                    auth_method=service_connector.auth_method,
-                                    configuration=service_connector.configuration,
-                                    register=False,
-                                )
-                            )
-                            if service_connector_resource_model is None:
-                                cli_utils.error(
-                                    f"Failed to validate service connector {service_connector}..."
-                                )
-                    if provider is None:
-                        if isinstance(
-                            service_connector_resource_model.connector_type,
-                            str,
-                        ):
-                            provider = (
-                                service_connector_resource_model.connector_type
-                            )
-                        else:
-                            provider = service_connector_resource_model.connector_type.connector_type
-
                     component_info = _get_stack_component_info(
                         component_type=component_type.value,
-                        cloud_provider=provider,
-                        service_connector_resource_models=service_connector_resource_model.resources,
+                        cloud_provider=provider
+                        or resources_info.connector_type,
+                        resources_info=resources_info,
                         service_connector_index=0,
                     )
                     component_name = stack_name
                     created_objects.add(component_type.value)
                 else:
-                    selected_component = existing_components.items[
+                    selected_component = existing_components[
                         component_selected
                     ]
                     component_info = selected_component.id
                     component_name = selected_component.name
 
-            components[component_type] = component_info
+            components[component_type] = [component_info]
             if component_type == StackComponentType.ARTIFACT_STORE:
                 artifact_store = component_name
             if component_type == StackComponentType.ORCHESTRATOR:
@@ -488,27 +528,30 @@ def register_stack(
             (StackComponentType.STEP_OPERATOR, step_operator),
             (StackComponentType.EXPERIMENT_TRACKER, experiment_tracker),
             (StackComponentType.CONTAINER_REGISTRY, container_registry),
+            (StackComponentType.DEPLOYER, deployer),
         ]:
             if component_name_ and component_type_ not in components:
-                components[component_type_] = client.get_stack_component(
-                    component_type_, component_name_
-                ).id
+                components[component_type_] = [
+                    client.get_stack_component(
+                        component_type_, component_name_
+                    ).id
+                ]
 
         try:
-            created_stack = client.zen_store.create_full_stack(
-                full_stack=FullStackRequest(
-                    user=client.active_user.id,
-                    workspace=client.active_workspace.id,
+            created_stack = client.zen_store.create_stack(
+                stack=StackRequest(
                     name=stack_name,
                     components=components,
                     service_connectors=[service_connector]
                     if service_connector
                     else [],
                     labels=labels,
+                    secrets=secrets,
+                    environment=environment,
                 )
             )
         except (KeyError, IllegalOperationError) as err:
-            cli_utils.error(str(err))
+            cli_utils.exception(err)
 
         cli_utils.declare(
             f"Stack '{created_stack.name}' successfully registered!"
@@ -655,6 +698,40 @@ def register_stack(
     type=str,
     required=False,
 )
+@click.option(
+    "-D",
+    "--deployer",
+    "deployer",
+    help="Name of the deployer for this stack.",
+    type=str,
+    required=False,
+)
+@click.option(
+    "--secret",
+    "secrets",
+    help="Secrets to attach to the stack.",
+    type=str,
+    required=False,
+    multiple=True,
+)
+@click.option(
+    "--remove-secret",
+    "remove_secrets",
+    help="Secrets to remove from the stack.",
+    type=str,
+    required=False,
+    multiple=True,
+)
+@click.option(
+    "--env",
+    "environment_variables",
+    help="Environment variables to set when running on this stack. Must be of "
+    "the format 'KEY=VALUE'. To remove an environment variable from the "
+    "stack, use an empty value, e.g. 'KEY='",
+    type=str,
+    required=False,
+    multiple=True,
+)
 def update_stack(
     stack_name_or_id: Optional[str] = None,
     artifact_store: Optional[str] = None,
@@ -669,6 +746,10 @@ def update_stack(
     data_validator: Optional[str] = None,
     image_builder: Optional[str] = None,
     model_registry: Optional[str] = None,
+    deployer: Optional[str] = None,
+    secrets: List[str] = [],
+    remove_secrets: List[str] = [],
+    environment_variables: List[str] = [],
 ) -> None:
     """Update a stack.
 
@@ -687,8 +768,20 @@ def update_stack(
         data_validator: Name of the new data validator for this stack.
         image_builder: Name of the new image builder for this stack.
         model_registry: Name of the new model registry for this stack.
+        deployer: Name of the new deployer for this stack.
+        secrets: Secrets to attach to the stack.
+        remove_secrets: Secrets to remove from the stack.
+        environment_variables: Environment variables to set when running on this
+            stack. Must be of the format "KEY=VALUE".
     """
     client = Client()
+
+    environment: Dict[str, Any] = {}
+    for environment_variable in environment_variables:
+        key, value = environment_variable.split("=", 1)
+        # Fallback to None if the value is empty so the existing environment
+        # variable is removed
+        environment[key] = value or None
 
     with console.status("Updating stack...\n"):
         updates: Dict[StackComponentType, List[Union[str, UUID]]] = dict()
@@ -720,15 +813,20 @@ def update_stack(
             updates[StackComponentType.ORCHESTRATOR] = [orchestrator]
         if step_operator:
             updates[StackComponentType.STEP_OPERATOR] = [step_operator]
+        if deployer:
+            updates[StackComponentType.DEPLOYER] = [deployer]
 
         try:
             updated_stack = client.update_stack(
                 name_id_or_prefix=stack_name_or_id,
                 component_updates=updates,
+                add_secrets=secrets,
+                remove_secrets=remove_secrets,
+                environment=environment,
             )
 
         except (KeyError, IllegalOperationError) as err:
-            cli_utils.error(str(err))
+            cli_utils.exception(err)
 
         cli_utils.declare(
             f"Stack `{updated_stack.name}` successfully updated!"
@@ -822,6 +920,14 @@ def update_stack(
     is_flag=True,
     required=False,
 )
+@click.option(
+    "-D",
+    "--deployer",
+    "deployer_flag",
+    help="Include this to remove the deployer from this stack.",
+    is_flag=True,
+    required=False,
+)
 def remove_stack_component(
     stack_name_or_id: Optional[str] = None,
     container_registry_flag: Optional[bool] = False,
@@ -834,6 +940,7 @@ def remove_stack_component(
     data_validator_flag: Optional[bool] = False,
     image_builder_flag: Optional[bool] = False,
     model_registry_flag: Optional[str] = None,
+    deployer_flag: Optional[bool] = False,
 ) -> None:
     """Remove stack components from a stack.
 
@@ -851,6 +958,7 @@ def remove_stack_component(
         data_validator_flag: To remove the data validator from this stack.
         image_builder_flag: To remove the image builder from this stack.
         model_registry_flag: To remove the model registry from this stack.
+        deployer_flag: To remove the deployer from this stack.
     """
     client = Client()
 
@@ -887,13 +995,16 @@ def remove_stack_component(
         if image_builder_flag:
             stack_component_update[StackComponentType.IMAGE_BUILDER] = []
 
+        if deployer_flag:
+            stack_component_update[StackComponentType.DEPLOYER] = []
+
         try:
             updated_stack = client.update_stack(
                 name_id_or_prefix=stack_name_or_id,
                 component_updates=stack_component_update,
             )
         except (KeyError, IllegalOperationError) as err:
-            cli_utils.error(str(err))
+            cli_utils.exception(err)
         cli_utils.declare(
             f"Stack `{updated_stack.name}` successfully updated!"
         )
@@ -921,7 +1032,7 @@ def rename_stack(
                 name=new_stack_name,
             )
         except (KeyError, IllegalOperationError) as err:
-            cli_utils.error(str(err))
+            cli_utils.exception(err)
         cli_utils.declare(
             f"Stack `{stack_name_or_id}` successfully renamed to `"
             f"{new_stack_name}`!"
@@ -933,7 +1044,7 @@ def rename_stack(
 @stack.command("list")
 @list_options(StackFilter)
 @click.pass_context
-def list_stacks(ctx: click.Context, **kwargs: Any) -> None:
+def list_stacks(ctx: click.Context, /, **kwargs: Any) -> None:
     """List all stacks that fulfill the filter requirements.
 
     Args:
@@ -963,21 +1074,11 @@ def list_stacks(ctx: click.Context, **kwargs: Any) -> None:
     type=click.STRING,
     required=False,
 )
-@click.option(
-    "--outputs",
-    "-o",
-    is_flag=True,
-    default=False,
-    help="Include the outputs from mlstacks deployments.",
-)
-def describe_stack(
-    stack_name_or_id: Optional[str] = None, outputs: bool = False
-) -> None:
+def describe_stack(stack_name_or_id: Optional[str] = None) -> None:
     """Show details about a named stack or the active stack.
 
     Args:
         stack_name_or_id: Name of the stack to describe.
-        outputs: Include the outputs from mlstacks deployments.
     """
     client = Client()
 
@@ -987,14 +1088,12 @@ def describe_stack(
                 name_id_or_prefix=stack_name_or_id
             )
         except KeyError as err:
-            cli_utils.error(str(err))
+            cli_utils.exception(err)
 
         cli_utils.print_stack_configuration(
             stack=stack_,
             active=stack_.id == client.active_stack_model.id,
         )
-        if outputs:
-            cli_utils.print_stack_outputs(stack_)
 
     print_model_url(get_stack_url(stack_))
 
@@ -1055,7 +1154,7 @@ def delete_stack(
         try:
             client.delete_stack(stack_name_or_id)
         except (KeyError, ValueError, IllegalOperationError) as err:
-            cli_utils.error(str(err))
+            cli_utils.exception(err)
         cli_utils.declare(f"Deleted stack '{stack_name_or_id}'.")
 
 
@@ -1076,11 +1175,10 @@ def set_active_stack_command(stack_name_or_id: str) -> None:
         try:
             client.activate_stack(stack_name_id_or_prefix=stack_name_or_id)
         except KeyError as err:
-            cli_utils.error(str(err))
+            cli_utils.exception(err)
 
         cli_utils.declare(
-            f"Active {scope} stack set to: "
-            f"'{client.active_stack_model.name}'"
+            f"Active {scope} stack set to: '{client.active_stack_model.name}'"
         )
 
 
@@ -1096,52 +1194,7 @@ def get_active_stack() -> None:
                 f"The {scope} active stack is: '{client.active_stack_model.name}'"
             )
         except KeyError as err:
-            cli_utils.error(str(err))
-
-
-@stack.command("up")
-def up_stack() -> None:
-    """Provisions resources for the active stack."""
-    stack_ = Client().active_stack
-
-    cli_utils.declare(
-        f"Provisioning resources for active stack '{stack_.name}'."
-    )
-    try:
-        stack_.provision()
-        stack_.resume()
-    except ProvisioningError as e:
-        cli_utils.error(str(e))
-
-
-@stack.command(
-    "down", help="Suspends resources of the active stack deployment."
-)
-@click.option(
-    "--force",
-    "-f",
-    "force",
-    is_flag=True,
-    help="Deprovisions local resources instead of suspending them.",
-)
-def down_stack(force: bool = False) -> None:
-    """Suspends resources of the active stack deployment.
-
-    Args:
-        force: Deprovisions local resources instead of suspending them.
-    """
-    stack_ = Client().active_stack
-
-    if force:
-        cli_utils.declare(
-            f"Deprovisioning resources for active stack '{stack_.name}'."
-        )
-        stack_.deprovision()
-    else:
-        cli_utils.declare(
-            f"Suspending resources for active stack '{stack_.name}'."
-        )
-        stack_.suspend()
+            cli_utils.exception(err)
 
 
 @stack.command("export", help="Exports a stack to a YAML file.")
@@ -1162,7 +1215,7 @@ def export_stack(
     try:
         stack_to_export = client.get_stack(name_id_or_prefix=stack_name_or_id)
     except KeyError as err:
-        cli_utils.error(str(err))
+        cli_utils.exception(err)
 
     # write zenml version and stack dict to YAML
     yaml_data = stack_to_export.to_yaml()
@@ -1180,14 +1233,12 @@ def export_stack(
 def _import_stack_component(
     component_type: StackComponentType,
     component_dict: Dict[str, Any],
-    component_spec_path: Optional[str] = None,
 ) -> UUID:
     """Import a single stack component with given type/config.
 
     Args:
         component_type: The type of component to import.
         component_dict: Dict representation of the component to import.
-        component_spec_path: Path to the component spec file.
 
     Returns:
         The ID of the imported component.
@@ -1223,7 +1274,6 @@ def _import_stack_component(
         component_type=component_type,
         flavor=flavor,
         configuration=config,
-        component_spec_path=component_spec_path,
     )
     return component.id
 
@@ -1333,7 +1383,7 @@ def copy_stack(source_stack_name_or_id: str, target_stack: str) -> None:
                 name_id_or_prefix=source_stack_name_or_id
             )
         except KeyError as err:
-            cli_utils.error(str(err))
+            cli_utils.exception(err)
 
         component_mapping: Dict[StackComponentType, Union[str, UUID]] = {}
 
@@ -1460,105 +1510,6 @@ def register_secrets(
         client.update_secret(secret_name, add_or_update_values=secret_values)
 
 
-def _get_deployment_params_interactively(
-    click_params: Dict[str, Any],
-) -> Dict[str, Any]:
-    """Get deployment values from command line arguments.
-
-    Args:
-        click_params: Required and pre-existing values.
-
-    Returns:
-        Full deployment arguments.
-    """
-    deployment_values = {
-        "provider": click_params["provider"],
-        "stack_name": click_params["stack_name"],
-        "region": click_params["region"],
-    }
-    for component_type in MLSTACKS_SUPPORTED_STACK_COMPONENTS:
-        verify_mlstacks_prerequisites_installation()
-        from mlstacks.constants import ALLOWED_FLAVORS
-
-        if (
-            click.prompt(
-                f"Enable {component_type}?",
-                type=click.Choice(["y", "n"]),
-                default="n",
-            )
-            == "y"
-        ):
-            component_flavor = click.prompt(
-                f"  Enter {component_type} flavor",
-                type=click.Choice(ALLOWED_FLAVORS[component_type]),
-            )
-            deployment_values[component_type] = component_flavor
-
-    if (
-        click.prompt(
-            "Deploy using debug_mode?",
-            type=click.Choice(["y", "n"]),
-            default="n",
-        )
-        == "y"
-    ):
-        deployment_values["debug_mode"] = True
-
-    extra_config = []
-    # use click.prompt to populate extra_config until someone just hits enter
-    while True:
-        declare(
-            "\nAdd to extra_config for stack deployment -->\n",
-            bold=True,
-        )
-        key = click.prompt(
-            "Enter `extra_config` key or hit enter to skip",
-            type=str,
-            default="",
-        )
-        if key == "":
-            break
-        value = click.prompt(
-            f"Enter value for '{key}'",
-            type=str,
-        )
-        extra_config.append(f"{key}={value}")
-
-    # get mandatory GCP project_id if provider is GCP
-    # skip if project_id already specified in extra_config
-    if click_params["provider"] == "gcp" and not any(
-        s.startswith("project_id=") for s in extra_config
-    ):
-        project_id = click.prompt("What is your GCP project_id?", type=str)
-        extra_config.append(f"project_id={project_id}")
-        declare(f"Project ID '{project_id}' added to extra_config.")
-
-    deployment_values["extra_config"] = extra_config
-
-    tags = []
-    # use click.prompt to populate tags until someone just hits enter
-    while True:
-        declare(
-            "\nAdd to tags for stack deployment -->\n",
-            bold=True,
-        )
-        tag = click.prompt(
-            "Enter `tags` key or hit enter to skip",
-            type=str,
-            default="",
-        )
-        if tag == "":
-            break
-        value = click.prompt(
-            f"Enter value for '{tag}'",
-            type=str,
-        )
-        tags.append(f"{tag}={value}")
-    deployment_values["tags"] = tags
-
-    return deployment_values
-
-
 def validate_name(ctx: click.Context, param: str, value: str) -> str:
     """Validate the name of the stack.
 
@@ -1671,7 +1622,7 @@ def deploy(
             "ZenML needs to be accessible from the cloud provider to allow the "
             "stack and its components to be registered automatically. "
             "Please deploy ZenML in a remote environment as described in the "
-            "documentation: https://docs.zenml.io/getting-started/deploying-zenml "
+            "documentation: https://docs.zenml.io/deploying-zenml/deploying-zenml "
             "or use a managed ZenML Pro server instance for quick access to "
             "this feature and more: https://www.zenml.io/pro"
         )
@@ -1687,63 +1638,83 @@ def deploy(
             provider=StackDeploymentProvider(provider),
         )
 
+        if location and location not in deployment.locations.values():
+            cli_utils.error(
+                f"Invalid location '{location}' for provider '{provider}'. "
+                f"Valid locations are: {', '.join(deployment.locations.values())}"
+            )
+
         console.print(
             Markdown(
                 f"# {provider.upper()} ZenML Cloud Stack Deployment\n"
                 + deployment.description
             )
         )
-        console.print(Markdown("## Instructions\n" + deployment.instructions))
+        console.print(Markdown("## Details\n" + deployment.instructions))
+
+        deployment_config = client.zen_store.get_stack_deployment_config(
+            provider=StackDeploymentProvider(provider),
+            stack_name=stack_name,
+            location=location,
+        )
+
+        if deployment_config.instructions:
+            console.print(
+                Markdown("## Instructions\n" + deployment_config.instructions),
+                "\n",
+            )
+
+        if deployment_config.configuration:
+            console.print(
+                deployment_config.configuration,
+                no_wrap=True,
+                overflow="ignore",
+                crop=False,
+                style=Style(bgcolor="grey15"),
+            )
 
         if not cli_utils.confirmation(
             "\n\nProceed to continue with the deployment. You will be "
-            f"automatically redirected to {provider.upper()} in your browser.",
+            f"automatically redirected to "
+            f"{deployment_config.deployment_url_text} in your browser.",
         ):
             raise click.Abort()
 
-        deployment_url, deployment_url_title = (
-            client.zen_store.get_stack_deployment_url(
-                provider=StackDeploymentProvider(provider),
-                stack_name=stack_name,
-                location=location,
-            )
-        )
+        date_start = utc_now_tz_aware()
 
-        date_start = datetime.utcnow()
-
-        webbrowser.open(deployment_url)
+        webbrowser.open(deployment_config.deployment_url)
         console.print(
             Markdown(
                 f"If your browser did not open automatically, please open "
                 f"the following URL into your browser to deploy the stack to "
                 f"{provider.upper()}: "
-                f"[{deployment_url_title}]({deployment_url}).\n\n"
+                f"[{deployment_config.deployment_url_text}]"
+                f"({deployment_config.deployment_url}).\n\n"
             )
         )
 
         try:
-            with console.status(
-                "Waiting for the deployment to complete and the stack to be "
+            cli_utils.declare(
+                "\n\nWaiting for the deployment to complete and the stack to be "
                 "registered. Press CTRL+C to abort...\n"
-            ):
-                while True:
-                    deployed_stack = (
-                        client.zen_store.get_stack_deployment_stack(
-                            provider=StackDeploymentProvider(provider),
-                            stack_name=stack_name,
-                            location=location,
-                            date_start=date_start,
-                        )
-                    )
-                    if deployed_stack:
-                        break
-                    time.sleep(10)
+            )
 
-                analytics_handler.metadata.update(
-                    {
-                        "stack_id": deployed_stack.stack.id,
-                    }
+            while True:
+                deployed_stack = client.zen_store.get_stack_deployment_stack(
+                    provider=StackDeploymentProvider(provider),
+                    stack_name=stack_name,
+                    location=location,
+                    date_start=date_start,
                 )
+                if deployed_stack:
+                    break
+                time.sleep(10)
+
+            analytics_handler.metadata.update(
+                {
+                    "stack_id": deployed_stack.stack.id,
+                }
+            )
 
         except KeyboardInterrupt:
             cli_utils.declare("Stack deployment aborted.")
@@ -1756,7 +1727,7 @@ Stack [{deployed_stack.stack.name}]({get_stack_url(deployed_stack.stack)}):\n"""
         if components:
             component = components[0]
             stack_desc += (
-                f" * `{component.flavor}` {component_type.value}: "
+                f" * `{component.flavor_name}` {component_type.value}: "
                 f"[{component.name}]({get_component_url(component)})\n"
             )
 
@@ -1767,402 +1738,28 @@ Stack [{deployed_stack.stack.name}]({get_stack_url(deployed_stack.stack)}):\n"""
 
     console.print(Markdown(stack_desc))
 
-    console.print(
-        Markdown("## Follow-up\n" + deployment.post_deploy_instructions)
-    )
+    follow_up = f"""
+## Follow-up
 
+{deployment.post_deploy_instructions}
+
+To use the `{deployed_stack.stack.name}` stack to run pipelines:
+
+* install the required ZenML integrations by running: `zenml integration install {" ".join(deployment.integrations)}`
+"""
     if set_stack:
         client.activate_stack(deployed_stack.stack.id)
-        cli_utils.declare(
-            f"\nStack `{deployed_stack.stack.name}` set as active"
-        )
+        follow_up += f"""
+* the `{deployed_stack.stack.name}` stack has already been set as active
+"""
+    else:
+        follow_up += f"""
+* set the `{deployed_stack.stack.name}` stack as active by running: `zenml stack set {deployed_stack.stack.name}`
+"""
 
-
-@stack.command(help="[DEPRECATED] Deploy a stack using mlstacks.")
-@click.option(
-    "--provider",
-    "-p",
-    "provider",
-    required=True,
-    type=click.Choice(STACK_RECIPE_MODULAR_RECIPES),
-)
-@click.option(
-    "--name",
-    "-n",
-    "stack_name",
-    type=click.STRING,
-    required=True,
-    help="Set a name for the ZenML stack that will be imported from the YAML "
-    "configuration file which gets generated after deploying the stack recipe. "
-    "Defaults to the name of the stack recipe being deployed.",
-)
-@click.option(
-    "--region",
-    "-r",
-    "region",
-    type=click.STRING,
-    required=True,
-    help="The region to deploy the stack to.",
-)
-@click.option(
-    "--no-import",
-    "-ni",
-    "no_import_stack_flag",
-    is_flag=True,
-    help="If you don't want the stack to be imported automatically.",
-)
-@click.option(
-    "--artifact-store",
-    "-a",
-    "artifact_store",
-    required=False,
-    is_flag=True,
-    help="Whether to deploy an artifact store.",
-)
-@click.option(
-    "--container-registry",
-    "-c",
-    "container_registry",
-    required=False,
-    is_flag=True,
-    help="Whether to deploy a container registry.",
-)
-@click.option(
-    "--mlops-platform",
-    "-m",
-    "mlops_platform",
-    type=click.Choice(["zenml"]),
-    required=False,
-    help="The flavor of MLOps platform to use."
-    "If not specified, the default MLOps platform will be used.",
-)
-@click.option(
-    "--orchestrator",
-    "-o",
-    required=False,
-    type=click.Choice(
-        [
-            "kubernetes",
-            "kubeflow",
-            "tekton",
-            "sagemaker",
-            "skypilot",
-            "vertex",
-        ]
-    ),
-    help="The flavor of orchestrator to use. "
-    "If not specified, the default orchestrator will be used.",
-)
-@click.option(
-    "--model-deployer",
-    "-md",
-    "model_deployer",
-    required=False,
-    type=click.Choice(["mlflow", "seldon"]),
-    help="The flavor of model deployer to use. ",
-)
-@click.option(
-    "--experiment-tracker",
-    "-e",
-    "experiment_tracker",
-    required=False,
-    type=click.Choice(["mlflow"]),
-    help="The flavor of experiment tracker to use.",
-)
-@click.option(
-    "--step-operator",
-    "-s",
-    "step_operator",
-    required=False,
-    type=click.Choice(["sagemaker"]),
-    help="The flavor of step operator to use.",
-)
-@click.option(
-    "--file",
-    "-f",
-    "file",
-    required=False,
-    type=click.Path(exists=True, dir_okay=False, readable=True),
-    help="Use a YAML specification file as the basis of the stack deployment.",
-)
-@click.option(
-    "--debug-mode",
-    "-d",
-    "debug_mode",
-    is_flag=True,
-    default=False,
-    help="Whether to run the stack deployment in debug mode.",
-)
-@click.option(
-    "--extra-config",
-    "-x",
-    "extra_config",
-    multiple=True,
-    help="Extra configurations as key=value pairs. This option can be used multiple times.",
-)
-@click.option(
-    "--tags",
-    "-t",
-    "tags",
-    required=False,
-    type=click.STRING,
-    help="Pass one or more tags.",
-    multiple=True,
-)
-@click.option(
-    "--interactive",
-    "-i",
-    "interactive",
-    is_flag=True,
-    default=False,
-    help="Deploy the stack interactively.",
-)
-@click.pass_context
-def deploy_mlstack(
-    ctx: click.Context,
-    provider: str,
-    stack_name: str,
-    region: str,
-    mlops_platform: Optional[str] = None,
-    orchestrator: Optional[str] = None,
-    model_deployer: Optional[str] = None,
-    experiment_tracker: Optional[str] = None,
-    step_operator: Optional[str] = None,
-    no_import_stack_flag: bool = False,
-    artifact_store: Optional[bool] = None,
-    container_registry: Optional[bool] = None,
-    file: Optional[str] = None,
-    debug_mode: bool = False,
-    tags: Optional[List[str]] = None,
-    extra_config: Optional[List[str]] = None,
-    interactive: bool = False,
-) -> None:
-    """Deploy a stack with mlstacks.
-
-    `zenml stack_recipe pull <STACK_RECIPE_NAME>` has to be called with the
-    same relative path before the `deploy` command.
-
-    Args:
-        ctx: The click context.
-        provider: The cloud provider to deploy the stack to.
-        stack_name: A name for the ZenML stack that gets imported as a result
-            of the recipe deployment.
-        no_import_stack_flag: If you don't want the stack to be imported into
-            ZenML after deployment.
-        artifact_store: The flavor of artifact store to deploy. In the case of
-            the artifact store, it doesn't matter what you specify here, as
-            there's only one flavor per cloud provider and that will be deployed.
-        orchestrator: The flavor of orchestrator to use.
-        container_registry: The flavor of container registry to deploy. In the case of
-            the container registry, it doesn't matter what you specify here, as
-            there's only one flavor per cloud provider and that will be deployed.
-        model_deployer: The flavor of model deployer to deploy.
-        experiment_tracker: The flavor of experiment tracker to deploy.
-        step_operator: The flavor of step operator to deploy.
-        extra_config: Extra configurations as key=value pairs.
-        tags: Pass one or more tags.
-        debug_mode: Whether to run the stack deployment in debug mode.
-        file: Use a YAML specification file as the basis of the stack
-            deployment.
-        mlops_platform: The flavor of MLOps platform to use.
-        region: The region to deploy the stack to.
-        interactive: Deploy the stack interactively.
-    """
-    cli_utils.warning(
-        "The `zenml stack deploy-mlstack` (former `zenml stack deploy`) CLI "
-        "command has been deprecated and will be removed in a future release. "
-        "Please use `zenml stack deploy` instead for a simplified "
-        "experience."
+    console.print(
+        Markdown(follow_up),
     )
-
-    with track_handler(
-        event=AnalyticsEvent.DEPLOY_STACK,
-    ) as analytics_handler:
-        if stack_exists(stack_name):
-            cli_utils.error(
-                f"Stack with name '{stack_name}' already exists. Please choose a "
-                "different name."
-            )
-        elif stack_spec_exists(stack_name):
-            cli_utils.error(
-                f"Stack spec for stack named '{stack_name}' already exists. "
-                "Please choose a different name."
-            )
-
-        cli_utils.declare("Checking prerequisites are installed...")
-        cli_utils.verify_mlstacks_prerequisites_installation()
-        cli_utils.warning(ALPHA_MESSAGE)
-
-        if not file:
-            cli_params: Dict[str, Any] = ctx.params
-            if interactive:
-                cli_params = _get_deployment_params_interactively(cli_params)
-            stack, components = convert_click_params_to_mlstacks_primitives(
-                cli_params
-            )
-
-            from mlstacks.utils import zenml_utils
-
-            cli_utils.declare("Checking flavor compatibility...")
-            if not zenml_utils.has_valid_flavor_combinations(
-                stack, components
-            ):
-                cli_utils.error(
-                    "The specified stack and component flavors are not compatible "
-                    "with the provider or with one another. Please try again."
-                )
-
-            stack_dict, component_dicts = convert_mlstacks_primitives_to_dicts(
-                stack, components
-            )
-            # write the stack and component yaml files
-            from mlstacks.constants import MLSTACKS_PACKAGE_NAME
-
-            spec_dir = os.path.join(
-                click.get_app_dir(MLSTACKS_PACKAGE_NAME),
-                "stack_specs",
-                stack.name,
-            )
-            cli_utils.declare(f"Writing spec files to {spec_dir}...")
-            create_dir_recursive_if_not_exists(spec_dir)
-
-            stack_file_path = os.path.join(
-                spec_dir, f"stack-{stack.name}.yaml"
-            )
-            write_yaml(file_path=stack_file_path, contents=stack_dict)
-            for component in component_dicts:
-                write_yaml(
-                    file_path=os.path.join(
-                        spec_dir, f"{component['name']}.yaml"
-                    ),
-                    contents=component,
-                )
-        else:
-            declare("Importing from stack specification file...")
-            stack_file_path = file
-
-            from mlstacks.utils.yaml_utils import load_stack_yaml
-
-            stack = load_stack_yaml(stack_file_path)
-
-        analytics_handler.metadata = {
-            "stack_provider": stack.provider,
-            "debug_mode": debug_mode,
-            "no_import_stack_flag": no_import_stack_flag,
-            "user_created_spec": bool(file),
-            "mlops_platform": mlops_platform,
-            "orchestrator": orchestrator,
-            "model_deployer": model_deployer,
-            "experiment_tracker": experiment_tracker,
-            "step_operator": step_operator,
-            "artifact_store": artifact_store,
-            "container_registry": container_registry,
-        }
-
-        deploy_mlstacks_stack(
-            spec_file_path=stack_file_path,
-            stack_name=stack.name,
-            stack_provider=stack.provider,
-            debug_mode=debug_mode,
-            no_import_stack_flag=no_import_stack_flag,
-            user_created_spec=bool(file),
-        )
-
-
-@stack.command(
-    help="Destroy stack components created previously with "
-    "`zenml stack deploy`"
-)
-@click.argument("stack_name", required=True)
-@click.option(
-    "--debug",
-    "-d",
-    "debug_mode",
-    is_flag=True,
-    default=False,
-    help="Whether to run Terraform in debug mode.",
-)
-def destroy(
-    stack_name: str,
-    debug_mode: bool = False,
-) -> None:
-    """Destroy all resources previously created with `zenml stack deploy`.
-
-    Args:
-        stack_name: Name of the stack
-        debug_mode: Whether to run Terraform in debug mode.
-    """
-    if not confirmation(
-        f"Are you sure you want to destroy stack '{stack_name}' and all "
-        "associated infrastructure?"
-    ):
-        error("Aborting stack destroy...")
-
-    with track_handler(
-        event=AnalyticsEvent.DESTROY_STACK,
-    ) as analytics_handler:
-        analytics_handler.metadata["debug_mode"] = debug_mode
-        cli_utils.verify_mlstacks_prerequisites_installation()
-        from mlstacks.constants import MLSTACKS_PACKAGE_NAME
-
-        # check the stack actually exists
-        if not stack_exists(stack_name):
-            cli_utils.error(
-                f"Stack with name '{stack_name}' does not exist. Please check and "
-                "try again."
-            )
-
-        spec_file_path = get_stack_spec_file_path(stack_name)
-        spec_files_dir: str = os.path.join(
-            click.get_app_dir(MLSTACKS_PACKAGE_NAME), "stack_specs", stack_name
-        )
-        user_created_spec = str(Path(spec_file_path).parent) != spec_files_dir
-
-        provider = read_yaml(file_path=spec_file_path).get("provider")
-        tf_definitions_path: str = os.path.join(
-            click.get_app_dir(MLSTACKS_PACKAGE_NAME),
-            "terraform",
-            f"{provider}-modular",
-        )
-
-        cli_utils.declare(
-            "Checking Terraform definitions and spec files are present..."
-        )
-        verify_spec_and_tf_files_exist(spec_file_path, tf_definitions_path)
-
-        from mlstacks.utils import terraform_utils
-
-        cli_utils.declare(
-            f"Destroying stack '{stack_name}' using Terraform..."
-        )
-        terraform_utils.destroy_stack(
-            stack_path=spec_file_path, debug_mode=debug_mode
-        )
-        cli_utils.declare(f"Stack '{stack_name}' successfully destroyed.")
-
-        if cli_utils.confirmation(
-            f"Would you like to recursively delete the associated ZenML "
-            f"stack '{stack_name}'?\nThis will delete the stack and any "
-            "underlying stack components."
-        ):
-            from zenml.client import Client
-
-            client = Client()
-            client.delete_stack(name_id_or_prefix=stack_name, recursive=True)
-            cli_utils.declare(
-                f"Stack '{stack_name}' successfully deleted from ZenML."
-            )
-
-        spec_dir = os.path.dirname(spec_file_path)
-        if not user_created_spec and cli_utils.confirmation(
-            f"Would you like to delete the `mlstacks` spec directory for "
-            f"this stack, located at {spec_dir}?"
-        ):
-            rmtree(spec_files_dir)
-            cli_utils.declare(
-                f"Spec directory for stack '{stack_name}' successfully deleted."
-            )
-        cli_utils.declare(f"Stack '{stack_name}' successfully destroyed.")
 
 
 @stack.command(
@@ -2248,7 +1845,7 @@ def _get_service_connector_info(
     """
     from rich.prompt import Prompt
 
-    if cloud_provider not in {"aws"}:
+    if cloud_provider not in {"aws", "gcp", "azure"}:
         raise ValueError(f"Unknown cloud provider {cloud_provider}")
 
     client = Client()
@@ -2270,14 +1867,14 @@ def _get_service_connector_info(
             required = ""
             for each_req in schema["required"]:
                 field = schema["properties"][each_req]
-                required += f"[bold]{each_req}[/bold]  [italic]({field.get('title','no description')})[/italic]\n"
+                required += f"[bold]{each_req}[/bold]  [italic]({field.get('title', 'no description')})[/italic]\n"
             choices.append([value.name, required])
 
         selected_auth_idx = cli_utils.multi_choice_prompt(
-            object_type=f"authentication methods for {cloud_provider}",
+            object_type=f"authentication methods for {cloud_provider.upper()}",
             choices=choices,
             headers=headers,
-            prompt_text="Please choose one of the authentication option above.",
+            prompt_text="Please choose one of the authentication option above",
         )
         if selected_auth_idx is None:
             cli_utils.error("No authentication method selected.")
@@ -2293,21 +1890,16 @@ def _get_service_connector_info(
     answers = {}
     for req_field in required_fields:
         if connector_details:
-            if conf_value := connector_details.configuration.get(
+            if conf_value := connector_details.configuration.get_plain(
                 req_field, None
             ):
                 answers[req_field] = conf_value
-            elif secret_value := connector_details.secrets.get(
-                req_field, None
-            ):
-                answers[req_field] = secret_value.get_secret_value()
         if req_field not in answers:
             answers[req_field] = Prompt.ask(
                 f"Please enter value for `{req_field}`:",
                 password="format" in properties[req_field]
                 and properties[req_field]["format"] == "password",
             )
-    Console().print("All mandatory configuration parameters received!")
 
     return ServiceConnectorInfo(
         type=cloud_provider,
@@ -2319,9 +1911,7 @@ def _get_service_connector_info(
 def _get_stack_component_info(
     component_type: str,
     cloud_provider: str,
-    service_connector_resource_models: List[
-        ServiceConnectorTypedResourcesModel
-    ],
+    resources_info: ServiceConnectorResourcesInfo,
     service_connector_index: Optional[int] = None,
 ) -> ComponentInfo:
     """Get a stack component info with given type and service connector.
@@ -2329,7 +1919,7 @@ def _get_stack_component_info(
     Args:
         component_type: The type of component to create.
         cloud_provider: The cloud provider to use.
-        service_connector_resource_models: The list of the available service connector resource models.
+        resources_info: The resources info of the service connector.
         service_connector_index: The index of the service connector to use.
 
     Returns:
@@ -2344,138 +1934,105 @@ def _get_stack_component_info(
     if cloud_provider not in {"aws", "azure", "gcp"}:
         raise ValueError(f"Unknown cloud provider {cloud_provider}")
 
-    AWS_DOCS = (
-        "https://docs.zenml.io/how-to/auth-management/aws-service-connector"
-    )
-
     flavor = "undefined"
     service_connector_resource_id = None
     config = {}
+    choices = [
+        [cri.flavor, resource_id]
+        for cri in resources_info.components_resources_info[
+            StackComponentType(component_type)
+        ]
+        for resource_id in cri.accessible_by_service_connector
+    ]
     if component_type == "artifact_store":
-        available_storages: List[str] = []
-        if cloud_provider == "aws":
-            for each in service_connector_resource_models:
-                if each.resource_type == "s3-bucket":
-                    available_storages = each.resource_ids or []
-            flavor = "s3"
-            if not available_storages:
-                cli_utils.error(
-                    "We were unable to find any S3 buckets available "
-                    "to configured service connector. Please, verify "
-                    "that needed permission are granted for the "
-                    "service connector.\nDocumentation for the S3 "
-                    "Buckets configuration can be found at "
-                    f"{AWS_DOCS}#s3-bucket"
-                )
-        elif cloud_provider == "azure":
-            flavor = "azure"
-        elif cloud_provider == "gcp":
-            flavor = "gcs"
-
         selected_storage_idx = cli_utils.multi_choice_prompt(
             object_type=f"{cloud_provider.upper()} storages",
-            choices=[[st] for st in available_storages],
-            headers=["Storage"],
+            choices=choices,
+            headers=["Artifact Store Type", "Storage"],
             prompt_text="Please choose one of the storages for the new artifact store:",
         )
         if selected_storage_idx is None:
             cli_utils.error("No storage selected.")
 
-        selected_storage = available_storages[selected_storage_idx]
+        selected_storage = choices[selected_storage_idx]
 
-        config = {"path": selected_storage}
-        service_connector_resource_id = selected_storage
+        flavor = selected_storage[0]
+        config = {"path": selected_storage[1]}
+        service_connector_resource_id = selected_storage[1]
     elif component_type == "orchestrator":
-        if cloud_provider == "aws":
-            available_orchestrators = []
-            for each in service_connector_resource_models:
-                types = []
-                if each.resource_type == "aws-generic":
-                    types = ["Sagemaker", "Skypilot (EC2)"]
-                if each.resource_type == "kubernetes-cluster":
-                    types = ["Kubernetes"]
 
-                if each.resource_ids:
-                    for orchestrator in each.resource_ids:
-                        for t in types:
-                            available_orchestrators.append([t, orchestrator])
-            if not available_orchestrators:
-                cli_utils.error(
-                    "We were unable to find any orchestrator engines "
-                    "available to the service connector. Please, verify "
-                    "that needed permission are granted for the "
-                    "service connector.\nDocumentation for the Generic "
-                    "AWS resource configuration can be found at "
-                    f"{AWS_DOCS}#generic-aws-resource\n"
-                    "Documentation for the Kubernetes resource "
-                    "configuration can be found at "
-                    f"{AWS_DOCS}#eks-kubernetes-cluster"
-                )
-        elif cloud_provider == "gcp":
-            pass
-        elif cloud_provider == "azure":
-            pass
+        def query_region(
+            provider: StackDeploymentProvider,
+            compute_type: str,
+            is_skypilot: bool = False,
+        ) -> str:
+            deployment_info = Client().zen_store.get_stack_deployment_info(
+                provider
+            )
+            region = Prompt.ask(
+                f"Select the location for your {compute_type}:",
+                choices=sorted(
+                    deployment_info.skypilot_default_regions.values()
+                    if is_skypilot
+                    else deployment_info.locations.values()
+                ),
+                show_choices=True,
+            )
+            return region
 
         selected_orchestrator_idx = cli_utils.multi_choice_prompt(
             object_type=f"orchestrators on {cloud_provider.upper()}",
-            choices=available_orchestrators,
-            headers=["Orchestrator Type", "Orchestrator details"],
+            choices=choices,
+            headers=["Orchestrator Type", "Details"],
             prompt_text="Please choose one of the orchestrators for the new orchestrator:",
         )
         if selected_orchestrator_idx is None:
             cli_utils.error("No orchestrator selected.")
 
-        selected_orchestrator = available_orchestrators[
-            selected_orchestrator_idx
-        ]
+        selected_orchestrator = choices[selected_orchestrator_idx]
 
-        if selected_orchestrator[0] == "Sagemaker":
-            flavor = "sagemaker"
-            execution_role = Prompt.ask("Please enter an execution role ARN:")
-            config = {"execution_role": execution_role}
-        elif selected_orchestrator[0] == "Skypilot (EC2)":
-            flavor = "vm_aws"
-            config = {"region": selected_orchestrator[1]}
-        elif selected_orchestrator[0] == "Kubernetes":
-            flavor = "kubernetes"
-            config = {}
-        else:
-            raise ValueError(
-                f"Unknown orchestrator type {selected_orchestrator[0]}"
+        config = {}
+        flavor = selected_orchestrator[0]
+        if flavor == "sagemaker":
+            execution_role = Prompt.ask("Enter an execution role ARN:")
+            config["execution_role"] = execution_role
+        elif flavor == "vm_aws":
+            config["region"] = selected_orchestrator[1]
+        elif flavor == "vm_gcp":
+            config["region"] = query_region(
+                StackDeploymentProvider.GCP,
+                "Skypilot cluster",
+                is_skypilot=True,
+            )
+        elif flavor == "vm_azure":
+            config["region"] = query_region(
+                StackDeploymentProvider.AZURE,
+                "Skypilot cluster",
+                is_skypilot=True,
+            )
+        elif flavor == "azureml":
+            config["subscription_id"] = Prompt.ask(
+                "Enter the subscription ID:"
+            )
+            config["resource_group"] = Prompt.ask("Enter the resource group:")
+        elif flavor == "vertex":
+            config["location"] = query_region(
+                StackDeploymentProvider.GCP, "Vertex AI job"
             )
         service_connector_resource_id = selected_orchestrator[1]
     elif component_type == "container_registry":
-        available_registries: List[str] = []
-        if cloud_provider == "aws":
-            flavor = "aws"
-            for each in service_connector_resource_models:
-                if each.resource_type == "docker-registry":
-                    available_registries = each.resource_ids or []
-            if not available_registries:
-                cli_utils.error(
-                    "We were unable to find any container registries "
-                    "available to the service connector. Please, verify "
-                    "that needed permission are granted for the "
-                    "service connector.\nDocumentation for the ECR "
-                    "container registry resource configuration can "
-                    f"be found at {AWS_DOCS}#ecr-container-registry"
-                )
-        elif cloud_provider == "azure":
-            flavor = "azure"
-        elif cloud_provider == "gcp":
-            flavor = "gcp"
-
         selected_registry_idx = cli_utils.multi_choice_prompt(
             object_type=f"{cloud_provider.upper()} registries",
-            choices=[[st] for st in available_registries],
-            headers=["Container Registry"],
+            choices=choices,
+            headers=["Container Registry Type", "Container Registry"],
             prompt_text="Please choose one of the registries for the new container registry:",
         )
         if selected_registry_idx is None:
             cli_utils.error("No container registry selected.")
-        selected_registry = available_registries[selected_registry_idx]
-        config = {"uri": selected_registry}
-        service_connector_resource_id = selected_registry
+        selected_registry = choices[selected_registry_idx]
+        flavor = selected_registry[0]
+        config = {"uri": selected_registry[1]}
+        service_connector_resource_id = selected_registry[1]
     else:
         raise ValueError(f"Unknown component type {component_type}")
 
@@ -2485,3 +2042,77 @@ def _get_stack_component_info(
         service_connector_index=service_connector_index,
         service_connector_resource_id=service_connector_resource_id,
     )
+
+
+@stack.command(
+    name="export-requirements", help="Export the stack requirements."
+)
+@click.argument(
+    "stack_name_or_id",
+    type=click.STRING,
+    required=False,
+)
+@click.option(
+    "--output-file",
+    "-o",
+    "output_file",
+    type=str,
+    required=False,
+    help="File to which to export the stack requirements. If not "
+    "provided, the requirements will be printed to stdout instead.",
+)
+@click.option(
+    "--overwrite",
+    "-ov",
+    "overwrite",
+    type=bool,
+    required=False,
+    is_flag=True,
+    help="Overwrite the output file if it already exists. This option is "
+    "only valid if the output file is provided.",
+)
+def export_requirements(
+    stack_name_or_id: Optional[str] = None,
+    output_file: Optional[str] = None,
+    overwrite: bool = False,
+) -> None:
+    """Exports stack requirements so they can be installed using pip.
+
+    Args:
+        stack_name_or_id: Stack name or ID. If not given, the active stack will
+            be used.
+        output_file: Optional path to the requirements output file.
+        overwrite: Overwrite the output file if it already exists. This option
+            is only valid if the output file is provided.
+    """
+    try:
+        stack_model: "StackResponse" = Client().get_stack(
+            name_id_or_prefix=stack_name_or_id
+        )
+    except KeyError as err:
+        cli_utils.exception(err)
+
+    requirements, _ = requirements_utils.get_requirements_for_stack(
+        stack_model
+    )
+
+    if not requirements:
+        cli_utils.declare(f"Stack `{stack_model.name}` has no requirements.")
+        return
+
+    if output_file:
+        try:
+            with open(output_file, "x") as f:
+                f.write("\n".join(requirements))
+        except FileExistsError:
+            if overwrite or cli_utils.confirmation(
+                "A file already exists at the specified path. "
+                "Would you like to overwrite it?"
+            ):
+                with open(output_file, "w") as f:
+                    f.write("\n".join(requirements))
+        cli_utils.declare(
+            f"Requirements for stack `{stack_model.name}` exported to {output_file}."
+        )
+    else:
+        click.echo(" ".join(requirements), nl=False)

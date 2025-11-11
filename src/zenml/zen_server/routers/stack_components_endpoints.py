@@ -13,15 +13,17 @@
 #  permissions and limitations under the License.
 """Endpoint definitions for stack components."""
 
-from typing import List
+from typing import List, Optional, Union
 from uuid import UUID
 
 from fastapi import APIRouter, Depends, Security
+from pydantic import BaseModel
 
 from zenml.constants import API, COMPONENT_TYPES, STACK_COMPONENTS, VERSION_1
 from zenml.enums import StackComponentType
 from zenml.models import (
     ComponentFilter,
+    ComponentRequest,
     ComponentResponse,
     ComponentUpdate,
     Page,
@@ -29,15 +31,17 @@ from zenml.models import (
 from zenml.zen_server.auth import AuthContext, authorize
 from zenml.zen_server.exceptions import error_response
 from zenml.zen_server.rbac.endpoint_utils import (
+    verify_permissions_and_create_entity,
     verify_permissions_and_delete_entity,
     verify_permissions_and_get_entity,
     verify_permissions_and_list_entities,
     verify_permissions_and_update_entity,
 )
 from zenml.zen_server.rbac.models import Action, ResourceType
-from zenml.zen_server.rbac.utils import verify_permission_for_model
+from zenml.zen_server.rbac.utils import batch_verify_permissions_for_models
+from zenml.zen_server.routers.projects_endpoints import workspace_router
 from zenml.zen_server.utils import (
-    handle_exceptions,
+    async_fastapi_endpoint_wrapper,
     make_dependable,
     zen_store,
 )
@@ -55,29 +59,104 @@ types_router = APIRouter(
 )
 
 
+@router.post(
+    "",
+    responses={401: error_response, 409: error_response, 422: error_response},
+)
+# TODO: the workspace scoped endpoint is only kept for dashboard compatibility
+# and can be removed after the migration
+@workspace_router.post(
+    "/{project_name_or_id}" + STACK_COMPONENTS,
+    responses={401: error_response, 409: error_response, 422: error_response},
+    deprecated=True,
+    tags=["stack_components"],
+)
+@async_fastapi_endpoint_wrapper
+def create_stack_component(
+    component: ComponentRequest,
+    project_name_or_id: Optional[Union[str, UUID]] = None,
+    _: AuthContext = Security(authorize),
+) -> ComponentResponse:
+    """Creates a stack component.
+
+    Args:
+        component: Stack component to register.
+        project_name_or_id: Optional name or ID of the project.
+
+    Returns:
+        The created stack component.
+    """
+    rbac_read_checks: List[BaseModel] = []
+    if component.connector:
+        service_connector = zen_store().get_service_connector(
+            component.connector
+        )
+        rbac_read_checks.append(service_connector)
+
+    if component.secrets:
+        secrets = [
+            zen_store().get_secret_by_name_or_id(secret)
+            for secret in component.secrets
+        ]
+        rbac_read_checks.extend(secrets)
+        component.secrets = [secret.id for secret in secrets]
+
+    batch_verify_permissions_for_models(rbac_read_checks, action=Action.READ)
+
+    from zenml.stack.utils import validate_stack_component_config
+
+    validated_config = validate_stack_component_config(
+        configuration_dict=component.configuration,
+        flavor=component.flavor,
+        component_type=component.type,
+        zen_store=zen_store(),
+        # We allow custom flavors to fail import on the server side.
+        validate_custom_flavors=False,
+    )
+
+    if validated_config:
+        component.configuration = validated_config.model_dump(
+            mode="json", exclude_unset=True
+        )
+
+    return verify_permissions_and_create_entity(
+        request_model=component,
+        create_method=zen_store().create_stack_component,
+    )
+
+
 @router.get(
     "",
-    response_model=Page[ComponentResponse],
     responses={401: error_response, 404: error_response, 422: error_response},
 )
-@handle_exceptions
+# TODO: the workspace scoped endpoint is only kept for dashboard compatibility
+# and can be removed after the migration
+@workspace_router.get(
+    "/{project_name_or_id}" + STACK_COMPONENTS,
+    responses={401: error_response, 404: error_response, 422: error_response},
+    deprecated=True,
+    tags=["stack_components"],
+)
+@async_fastapi_endpoint_wrapper
 def list_stack_components(
     component_filter_model: ComponentFilter = Depends(
         make_dependable(ComponentFilter)
     ),
+    project_name_or_id: Optional[Union[str, UUID]] = None,
     hydrate: bool = False,
     _: AuthContext = Security(authorize),
 ) -> Page[ComponentResponse]:
-    """Get a list of all stack components for a specific type.
+    """Get a list of all stack components.
 
     Args:
         component_filter_model: Filter model used for pagination, sorting,
             filtering.
+        project_name_or_id: Optional name or ID of the project to filter by.
         hydrate: Flag deciding whether to hydrate the output model(s)
             by including metadata fields in the response.
 
     Returns:
-        List of stack components for a specific type.
+        List of stack components matching the filter criteria.
     """
     return verify_permissions_and_list_entities(
         filter_model=component_filter_model,
@@ -89,10 +168,9 @@ def list_stack_components(
 
 @router.get(
     "/{component_id}",
-    response_model=ComponentResponse,
     responses={401: error_response, 404: error_response, 422: error_response},
 )
-@handle_exceptions
+@async_fastapi_endpoint_wrapper
 def get_stack_component(
     component_id: UUID,
     hydrate: bool = True,
@@ -117,10 +195,9 @@ def get_stack_component(
 
 @router.put(
     "/{component_id}",
-    response_model=ComponentResponse,
     responses={401: error_response, 404: error_response, 422: error_response},
 )
-@handle_exceptions
+@async_fastapi_endpoint_wrapper
 def update_stack_component(
     component_id: UUID,
     component_update: ComponentUpdate,
@@ -139,20 +216,36 @@ def update_stack_component(
         from zenml.stack.utils import validate_stack_component_config
 
         existing_component = zen_store().get_stack_component(component_id)
-        validate_stack_component_config(
+        validated_config = validate_stack_component_config(
             configuration_dict=component_update.configuration,
-            flavor_name=existing_component.flavor,
+            flavor=existing_component.flavor_name,
             component_type=existing_component.type,
             zen_store=zen_store(),
             # We allow custom flavors to fail import on the server side.
             validate_custom_flavors=False,
+            existing_config=existing_component.configuration,
         )
+        if validated_config:
+            component_update.configuration = validated_config.model_dump(
+                mode="json", exclude_unset=True
+            )
 
+    rbac_read_checks: List[BaseModel] = []
     if component_update.connector:
         service_connector = zen_store().get_service_connector(
             component_update.connector
         )
-        verify_permission_for_model(service_connector, action=Action.READ)
+        rbac_read_checks.append(service_connector)
+
+    if component_update.add_secrets:
+        secrets = [
+            zen_store().get_secret_by_name_or_id(secret)
+            for secret in component_update.add_secrets
+        ]
+        rbac_read_checks.extend(secrets)
+        component_update.add_secrets = [secret.id for secret in secrets]
+
+    batch_verify_permissions_for_models(rbac_read_checks, action=Action.READ)
 
     return verify_permissions_and_update_entity(
         id=component_id,
@@ -166,7 +259,7 @@ def update_stack_component(
     "/{component_id}",
     responses={401: error_response, 404: error_response, 422: error_response},
 )
-@handle_exceptions
+@async_fastapi_endpoint_wrapper
 def deregister_stack_component(
     component_id: UUID,
     _: AuthContext = Security(authorize),
@@ -185,10 +278,9 @@ def deregister_stack_component(
 
 @types_router.get(
     "",
-    response_model=List[str],
     responses={401: error_response, 404: error_response, 422: error_response},
 )
-@handle_exceptions
+@async_fastapi_endpoint_wrapper
 def get_stack_component_types(
     _: AuthContext = Security(authorize),
 ) -> List[str]:

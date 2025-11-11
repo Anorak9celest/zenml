@@ -13,9 +13,10 @@
 #  permissions and limitations under the License.
 """Utility functions for building manifests for k8s pods."""
 
+import base64
 import os
 import sys
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, List, Mapping, Optional
 
 from kubernetes import client as k8s_client
 
@@ -26,6 +27,9 @@ from zenml.integrations.airflow.orchestrators.dag_generator import (
     ENV_ZENML_LOCAL_STORES_PATH,
 )
 from zenml.integrations.kubernetes.pod_settings import KubernetesPodSettings
+from zenml.logger import get_logger
+
+logger = get_logger(__name__)
 
 
 def add_local_stores_mount(
@@ -91,9 +95,7 @@ def add_local_stores_mount(
 
 
 def build_pod_manifest(
-    pod_name: str,
-    run_name: str,
-    pipeline_name: str,
+    pod_name: Optional[str],
     image_name: str,
     command: List[str],
     args: List[str],
@@ -101,14 +103,15 @@ def build_pod_manifest(
     pod_settings: Optional[KubernetesPodSettings] = None,
     service_account_name: Optional[str] = None,
     env: Optional[Dict[str, str]] = None,
+    labels: Optional[Dict[str, str]] = None,
     mount_local_stores: bool = False,
+    owner_references: Optional[List[k8s_client.V1OwnerReference]] = None,
+    termination_grace_period_seconds: Optional[int] = 30,
 ) -> k8s_client.V1Pod:
     """Build a Kubernetes pod manifest for a ZenML run or step.
 
     Args:
         pod_name: Name of the pod.
-        run_name: Name of the ZenML run.
-        pipeline_name: Name of the ZenML pipeline.
         image_name: Name of the Docker image.
         command: Command to execute the entrypoint in the pod.
         args: Arguments provided to the entrypoint command.
@@ -118,8 +121,12 @@ def build_pod_manifest(
             Can be used to assign certain roles to a pod, e.g., to allow it to
             run Kubernetes commands from within the cluster.
         env: Environment variables to set.
+        labels: Labels to add to the pod.
         mount_local_stores: Whether to mount the local stores path inside the
             pod.
+        owner_references: List of owner references for the pod.
+        termination_grace_period_seconds: The amount of seconds to wait for a
+            pod to shutdown gracefully.
 
     Returns:
         Pod manifest.
@@ -139,24 +146,36 @@ def build_pod_manifest(
         ],
         security_context=security_context,
     )
+    image_pull_secrets = []
+    if pod_settings:
+        image_pull_secrets = [
+            k8s_client.V1LocalObjectReference(name=name)
+            for name in pod_settings.image_pull_secrets
+        ]
 
     pod_spec = k8s_client.V1PodSpec(
         containers=[container_spec],
         restart_policy="Never",
+        image_pull_secrets=image_pull_secrets,
+        termination_grace_period_seconds=termination_grace_period_seconds,
     )
 
     if service_account_name is not None:
         pod_spec.service_account_name = service_account_name
 
+    # Apply pod settings if provided
+    labels = labels or {}
+
     if pod_settings:
         add_pod_settings(pod_spec, pod_settings)
 
+    if pod_settings and pod_settings.labels:
+        labels.update(pod_settings.labels)
+
     pod_metadata = k8s_client.V1ObjectMeta(
         name=pod_name,
-        labels={
-            "run": run_name,
-            "pipeline": pipeline_name,
-        },
+        labels=labels,
+        owner_references=owner_references,
     )
 
     if pod_settings and pod_settings.annotations:
@@ -203,6 +222,28 @@ def add_pod_settings(
             else:
                 container.volume_mounts = settings.volume_mounts
 
+        if settings.env:
+            if container.env:
+                container.env.extend(settings.env)
+            else:
+                container.env = settings.env
+
+        if settings.env_from:
+            if container.env_from:
+                container.env_from.extend(settings.env_from)
+            else:
+                container.env_from = settings.env_from
+
+        if settings.container_security_context:
+            if container.security_context:
+                existing_dict = container.security_context.to_dict()
+                existing_dict.update(settings.container_security_context)
+                container.security_context = existing_dict
+            else:
+                container.security_context = (
+                    settings.container_security_context
+                )
+
     if settings.volumes:
         if pod_spec.volumes:
             pod_spec.volumes.extend(settings.volumes)
@@ -212,87 +253,32 @@ def add_pod_settings(
     if settings.host_ipc:
         pod_spec.host_ipc = settings.host_ipc
 
+    if settings.scheduler_name:
+        pod_spec.scheduler_name = settings.scheduler_name
 
-def build_cron_job_manifest(
-    cron_expression: str,
-    pod_name: str,
-    run_name: str,
-    pipeline_name: str,
-    image_name: str,
-    command: List[str],
-    args: List[str],
-    privileged: bool,
-    pod_settings: Optional[KubernetesPodSettings] = None,
-    service_account_name: Optional[str] = None,
-    env: Optional[Dict[str, str]] = None,
-    mount_local_stores: bool = False,
-) -> k8s_client.V1CronJob:
-    """Create a manifest for launching a pod as scheduled CRON job.
+    for key, value in settings.additional_pod_spec_args.items():
+        if not hasattr(pod_spec, key):
+            logger.warning(f"Ignoring invalid Pod Spec argument `{key}`.")
+        else:
+            if value is None:
+                continue
 
-    Args:
-        cron_expression: CRON job schedule expression, e.g. "* * * * *".
-        pod_name: Name of the pod.
-        run_name: Name of the ZenML run.
-        pipeline_name: Name of the ZenML pipeline.
-        image_name: Name of the Docker image.
-        command: Command to execute the entrypoint in the pod.
-        args: Arguments provided to the entrypoint command.
-        privileged: Whether to run the container in privileged mode.
-        pod_settings: Optional settings for the pod.
-        service_account_name: Optional name of a service account.
-            Can be used to assign certain roles to a pod, e.g., to allow it to
-            run Kubernetes commands from within the cluster.
-        env: Environment variables to set.
-        mount_local_stores: Whether to mount the local stores path inside the
-            pod.
-
-    Returns:
-        CRON job manifest.
-    """
-    pod_manifest = build_pod_manifest(
-        pod_name=pod_name,
-        run_name=run_name,
-        pipeline_name=pipeline_name,
-        image_name=image_name,
-        command=command,
-        args=args,
-        privileged=privileged,
-        pod_settings=pod_settings,
-        service_account_name=service_account_name,
-        env=env,
-        mount_local_stores=mount_local_stores,
-    )
-
-    job_spec = k8s_client.V1CronJobSpec(
-        schedule=cron_expression,
-        job_template=k8s_client.V1JobTemplateSpec(
-            metadata=pod_manifest.metadata,
-            spec=k8s_client.V1JobSpec(
-                template=k8s_client.V1PodTemplateSpec(
-                    metadata=pod_manifest.metadata,
-                    spec=pod_manifest.spec,
-                ),
-            ),
-        ),
-    )
-
-    job_manifest = k8s_client.V1CronJob(
-        kind="CronJob",
-        api_version="batch/v1",
-        metadata=pod_manifest.metadata,
-        spec=job_spec,
-    )
-
-    return job_manifest
+            existing_value = getattr(pod_spec, key)
+            if isinstance(existing_value, list):
+                existing_value.extend(value)
+            elif isinstance(existing_value, dict):
+                existing_value.update(value)
+            else:
+                setattr(pod_spec, key, value)
 
 
-def build_cluster_role_binding_manifest_for_service_account(
+def build_role_binding_manifest_for_service_account(
     name: str,
     role_name: str,
     service_account_name: str,
     namespace: str = "default",
 ) -> Dict[str, Any]:
-    """Build a manifest for a cluster role binding of a service account.
+    """Build a manifest for a role binding of a service account.
 
     Args:
         name: Name of the cluster role binding.
@@ -305,7 +291,7 @@ def build_cluster_role_binding_manifest_for_service_account(
     """
     return {
         "apiVersion": "rbac.authorization.k8s.io/v1",
-        "kind": "ClusterRoleBinding",
+        "kind": "RoleBinding",
         "metadata": {"name": name},
         "subjects": [
             {
@@ -359,3 +345,146 @@ def build_namespace_manifest(namespace: str) -> Dict[str, Any]:
             "name": namespace,
         },
     }
+
+
+def build_secret_manifest(
+    name: str,
+    data: Mapping[str, Optional[str]],
+    secret_type: str = "Opaque",
+) -> Dict[str, Any]:
+    """Builds a Kubernetes secret manifest.
+
+    Args:
+        name: Name of the secret.
+        data: The secret data.
+        secret_type: The secret type.
+
+    Returns:
+        The secret manifest.
+    """
+    encoded_data = {
+        key: base64.b64encode(value.encode()).decode() if value else None
+        for key, value in data.items()
+    }
+
+    return {
+        "apiVersion": "v1",
+        "kind": "Secret",
+        "metadata": {
+            "name": name,
+        },
+        "type": secret_type,
+        "data": encoded_data,
+    }
+
+
+def pod_template_manifest_from_pod(
+    pod: k8s_client.V1Pod,
+) -> k8s_client.V1PodTemplateSpec:
+    """Build a Kubernetes pod template manifest from a pod.
+
+    Args:
+        pod: The pod manifest to build the template from.
+
+    Returns:
+        The pod template manifest.
+    """
+    return k8s_client.V1PodTemplateSpec(
+        metadata=pod.metadata,
+        spec=pod.spec,
+    )
+
+
+def build_job_manifest(
+    job_name: str,
+    pod_template: k8s_client.V1PodTemplateSpec,
+    backoff_limit: Optional[int] = None,
+    ttl_seconds_after_finished: Optional[int] = None,
+    labels: Optional[Dict[str, str]] = None,
+    annotations: Optional[Dict[str, str]] = None,
+    active_deadline_seconds: Optional[int] = None,
+    pod_failure_policy: Optional[Dict[str, Any]] = None,
+    owner_references: Optional[List[k8s_client.V1OwnerReference]] = None,
+) -> k8s_client.V1Job:
+    """Build a Kubernetes job manifest.
+
+    Args:
+        job_name: Name of the job.
+        pod_template: The pod template to use for the job.
+        backoff_limit: The backoff limit for the job.
+        ttl_seconds_after_finished: The TTL seconds after finished for the job.
+        labels: The labels to use for the job.
+        annotations: The annotations to use for the job.
+        active_deadline_seconds: The active deadline seconds for the job.
+        pod_failure_policy: The pod failure policy for the job.
+        owner_references: The owner references for the job.
+
+    Returns:
+        The Kubernetes job manifest.
+    """
+    job_spec = k8s_client.V1JobSpec(
+        template=pod_template,
+        backoff_limit=backoff_limit,
+        parallelism=1,
+        ttl_seconds_after_finished=ttl_seconds_after_finished,
+        active_deadline_seconds=active_deadline_seconds,
+        pod_failure_policy=pod_failure_policy,
+    )
+
+    job_metadata = k8s_client.V1ObjectMeta(
+        name=job_name,
+        labels=labels,
+        annotations=annotations,
+        owner_references=owner_references,
+    )
+
+    return k8s_client.V1Job(spec=job_spec, metadata=job_metadata)
+
+
+def job_template_manifest_from_job(
+    job: k8s_client.V1Job,
+) -> k8s_client.V1JobTemplateSpec:
+    """Build a Kubernetes job template manifest from a job.
+
+    Args:
+        job: The job manifest to build the template from.
+
+    Returns:
+        The job template manifest.
+    """
+    return k8s_client.V1JobTemplateSpec(
+        metadata=job.metadata,
+        spec=job.spec,
+    )
+
+
+def build_cron_job_manifest(
+    job_template: k8s_client.V1JobTemplateSpec,
+    cron_expression: str,
+    successful_jobs_history_limit: Optional[int] = None,
+    failed_jobs_history_limit: Optional[int] = None,
+) -> k8s_client.V1CronJob:
+    """Build a Kubernetes cron job manifest.
+
+    Args:
+        job_template: The job template to use for the cron job.
+        cron_expression: The cron expression to use for the cron job.
+        successful_jobs_history_limit: The number of successful jobs to keep.
+        failed_jobs_history_limit: The number of failed jobs to keep.
+
+    Returns:
+        The Kubernetes cron job manifest.
+    """
+    spec = k8s_client.V1CronJobSpec(
+        schedule=cron_expression,
+        successful_jobs_history_limit=successful_jobs_history_limit,
+        failed_jobs_history_limit=failed_jobs_history_limit,
+        job_template=job_template,
+    )
+
+    return k8s_client.V1CronJob(
+        kind="CronJob",
+        api_version="batch/v1",
+        metadata=job_template.metadata,
+        spec=spec,
+    )

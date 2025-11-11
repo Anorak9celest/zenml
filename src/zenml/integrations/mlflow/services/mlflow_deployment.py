@@ -13,7 +13,9 @@
 #  permissions and limitations under the License.
 """Implementation of the MLflow deployment functionality."""
 
+import importlib
 import os
+import sys
 from typing import TYPE_CHECKING, Any, Dict, Optional, Union
 
 import numpy as np
@@ -21,6 +23,7 @@ import pandas as pd
 import requests
 from mlflow.pyfunc.backend import PyFuncBackend
 from mlflow.version import VERSION as MLFLOW_VERSION
+from pydantic import field_validator
 
 from zenml.client import Client
 from zenml.constants import DEFAULT_SERVICE_START_STOP_TIMEOUT
@@ -28,6 +31,7 @@ from zenml.integrations.mlflow.experiment_trackers.mlflow_experiment_tracker imp
     MLFlowExperimentTracker,
 )
 from zenml.logger import get_logger
+from zenml.models.v2.misc.service import ServiceType
 from zenml.services import (
     HTTPEndpointHealthMonitor,
     HTTPEndpointHealthMonitorConfig,
@@ -36,7 +40,6 @@ from zenml.services import (
     LocalDaemonServiceEndpoint,
     LocalDaemonServiceEndpointConfig,
     ServiceEndpointProtocol,
-    ServiceType,
 )
 from zenml.services.service import BaseDeploymentService
 
@@ -109,6 +112,47 @@ class MLFlowDeploymentConfig(LocalDaemonServiceConfig):
     workers: int = 1
     mlserver: bool = False
     timeout: int = DEFAULT_SERVICE_START_STOP_TIMEOUT
+
+    @field_validator("mlserver")
+    @classmethod
+    def validate_mlserver_python_version(cls, mlserver: bool) -> bool:
+        """Validates the Python version if mlserver is used.
+
+        Args:
+            mlserver: set to True if the MLflow MLServer backend is used,
+                else set to False and MLflow built-in scoring server will be
+                used.
+
+        Returns:
+            the validated value
+
+        Raises:
+            ValueError: if mlserver packages are not installed
+        """
+        if mlserver is True:
+            # For the mlserver deployment, the mlserver and
+            # mlserver-mlflow packages need to be installed separately
+            # because they rely on an older version of Pydantic.
+
+            # Check if the mlserver and mlserver-mlflow packages are installed
+            try:
+                importlib.import_module("mlserver")
+                importlib.import_module("mlserver_mlflow")
+            except ModuleNotFoundError:
+                if sys.version_info.minor >= 12:
+                    raise ValueError(
+                        "The mlserver deployment is not yet supported on "
+                        "Python 3.12 or above."
+                    )
+
+                raise ValueError(
+                    "The MLflow MLServer backend requires the `mlserver` and "
+                    "`mlserver-mlflow` packages to be installed. These "
+                    "packages are not included in the ZenML MLflow integration "
+                    "requirements. Please install them manually."
+                )
+
+        return mlserver
 
 
 class MLFlowDeploymentService(LocalDaemonService, BaseDeploymentService):
@@ -199,7 +243,7 @@ class MLFlowDeploymentService(LocalDaemonService, BaseDeploymentService):
             # to run the deploy the model on the local running environment
             if int(mlflow_version[0]) >= 2:
                 backend_kwargs["env_manager"] = "local"
-            backend = PyFuncBackend(
+            backend = PyFuncBackend(  # type: ignore[no-untyped-call, unused-ignore]
                 config={},
                 no_conda=True,
                 workers=self.config.workers,
@@ -214,7 +258,7 @@ class MLFlowDeploymentService(LocalDaemonService, BaseDeploymentService):
                     "stack."
                 )
             experiment_tracker.configure_mlflow()
-            backend.serve(
+            backend.serve(  # type: ignore[no-untyped-call, unused-ignore]
                 model_uri=self.config.model_uri,
                 port=self.endpoint.status.port,
                 host="localhost",
@@ -260,7 +304,7 @@ class MLFlowDeploymentService(LocalDaemonService, BaseDeploymentService):
             )
 
         if self.endpoint.prediction_url is not None:
-            if type(request) == pd.DataFrame:
+            if type(request) is pd.DataFrame:
                 response = requests.post(  # nosec
                     self.endpoint.prediction_url,
                     json={"instances": request.to_dict("records")},

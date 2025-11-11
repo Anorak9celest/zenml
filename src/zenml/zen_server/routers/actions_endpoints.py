@@ -40,10 +40,11 @@ from zenml.zen_server.rbac.endpoint_utils import (
 from zenml.zen_server.rbac.models import Action, ResourceType
 from zenml.zen_server.rbac.utils import (
     dehydrate_response_model,
+    delete_model_resource,
     verify_permission_for_model,
 )
 from zenml.zen_server.utils import (
-    handle_exceptions,
+    async_fastapi_endpoint_wrapper,
     make_dependable,
     plugin_flavor_registry,
     zen_store,
@@ -58,10 +59,9 @@ router = APIRouter(
 
 @router.get(
     "",
-    response_model=Page[ActionResponse],
     responses={401: error_response, 404: error_response, 422: error_response},
 )
-@handle_exceptions
+@async_fastapi_endpoint_wrapper
 def list_actions(
     action_filter_model: ActionFilter = Depends(make_dependable(ActionFilter)),
     hydrate: bool = False,
@@ -130,10 +130,9 @@ def list_actions(
 
 @router.get(
     "/{action_id}",
-    response_model=ActionResponse,
     responses={401: error_response, 404: error_response, 422: error_response},
 )
-@handle_exceptions
+@async_fastapi_endpoint_wrapper
 def get_action(
     action_id: UUID,
     hydrate: bool = True,
@@ -178,10 +177,9 @@ def get_action(
 
 @router.post(
     "",
-    response_model=ActionResponse,
     responses={401: error_response, 409: error_response, 422: error_response},
 )
-@handle_exceptions
+@async_fastapi_endpoint_wrapper
 def create_action(
     action: ActionRequest,
     _: AuthContext = Security(authorize),
@@ -219,17 +217,15 @@ def create_action(
 
     return verify_permissions_and_create_entity(
         request_model=action,
-        resource_type=ResourceType.ACTION,
         create_method=action_handler.create_action,
     )
 
 
 @router.put(
     "/{action_id}",
-    response_model=ActionResponse,
     responses={401: error_response, 404: error_response, 422: error_response},
 )
-@handle_exceptions
+@async_fastapi_endpoint_wrapper
 def update_action(
     action_id: UUID,
     action_update: ActionUpdate,
@@ -284,7 +280,7 @@ def update_action(
     "/{action_id}",
     responses={401: error_response, 404: error_response, 422: error_response},
 )
-@handle_exceptions
+@async_fastapi_endpoint_wrapper
 def delete_action(
     action_id: UUID,
     force: bool = False,
@@ -322,3 +318,5 @@ def delete_action(
         action=action,
         force=force,
     )
+
+    delete_model_resource(action)

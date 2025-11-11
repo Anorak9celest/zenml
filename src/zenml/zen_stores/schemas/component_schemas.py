@@ -15,19 +15,24 @@
 
 import base64
 import json
-from datetime import datetime
-from typing import TYPE_CHECKING, Any, List, Optional
+from typing import TYPE_CHECKING, Any, List, Optional, Sequence
 from uuid import UUID
 
-from sqlmodel import Relationship
+from sqlalchemy import UniqueConstraint
+from sqlalchemy.orm import joinedload
+from sqlalchemy.sql.base import ExecutableOption
+from sqlmodel import Field, Relationship
 
-from zenml.enums import StackComponentType
+from zenml.enums import SecretResourceTypes, StackComponentType
 from zenml.models import (
+    ComponentRequest,
     ComponentResponse,
     ComponentResponseBody,
     ComponentResponseMetadata,
+    ComponentResponseResources,
     ComponentUpdate,
 )
+from zenml.utils.time_utils import utc_now
 from zenml.zen_stores.schemas.base_schemas import NamedSchema
 from zenml.zen_stores.schemas.schema_utils import build_foreign_key_field
 from zenml.zen_stores.schemas.service_connector_schemas import (
@@ -35,12 +40,14 @@ from zenml.zen_stores.schemas.service_connector_schemas import (
 )
 from zenml.zen_stores.schemas.stack_schemas import StackCompositionSchema
 from zenml.zen_stores.schemas.user_schemas import UserSchema
-from zenml.zen_stores.schemas.workspace_schemas import WorkspaceSchema
+from zenml.zen_stores.schemas.utils import jl_arg
 
 if TYPE_CHECKING:
+    from zenml.zen_stores.schemas.flavor_schemas import FlavorSchema
     from zenml.zen_stores.schemas.logs_schemas import LogsSchema
     from zenml.zen_stores.schemas.run_metadata_schemas import RunMetadataSchema
     from zenml.zen_stores.schemas.schedule_schema import ScheduleSchema
+    from zenml.zen_stores.schemas.secret_schemas import SecretSchema
     from zenml.zen_stores.schemas.stack_schemas import StackSchema
 
 
@@ -48,22 +55,19 @@ class StackComponentSchema(NamedSchema, table=True):
     """SQL Model for stack components."""
 
     __tablename__ = "stack_component"
+    __table_args__ = (
+        UniqueConstraint(
+            "name",
+            "type",
+            name="unique_component_name_and_type",
+        ),
+    )
 
     type: str
     flavor: str
     configuration: bytes
     labels: Optional[bytes]
-    component_spec_path: Optional[str]
-
-    workspace_id: UUID = build_foreign_key_field(
-        source=__tablename__,
-        target=WorkspaceSchema.__tablename__,
-        source_column="workspace_id",
-        target_column="id",
-        ondelete="CASCADE",
-        nullable=False,
-    )
-    workspace: "WorkspaceSchema" = Relationship(back_populates="components")
+    environment: Optional[bytes] = Field(default=None)
 
     user_id: Optional[UUID] = build_foreign_key_field(
         source=__tablename__,
@@ -85,6 +89,13 @@ class StackComponentSchema(NamedSchema, table=True):
     run_metadata: List["RunMetadataSchema"] = Relationship(
         back_populates="stack_component",
     )
+    flavor_schema: Optional["FlavorSchema"] = Relationship(
+        sa_relationship_kwargs={
+            "primaryjoin": "and_(foreign(StackComponentSchema.flavor) == FlavorSchema.name, foreign(StackComponentSchema.type) == FlavorSchema.type)",
+            "lazy": "joined",
+            "uselist": False,
+        },
+    )
 
     run_or_step_logs: List["LogsSchema"] = Relationship(
         back_populates="artifact_store",
@@ -104,6 +115,86 @@ class StackComponentSchema(NamedSchema, table=True):
     )
 
     connector_resource_id: Optional[str]
+    secrets: List["SecretSchema"] = Relationship(
+        sa_relationship_kwargs=dict(
+            primaryjoin=f"and_(foreign(SecretResourceSchema.resource_type)=='{SecretResourceTypes.STACK_COMPONENT.value}', foreign(SecretResourceSchema.resource_id)==StackComponentSchema.id)",
+            secondary="secret_resource",
+            secondaryjoin="SecretSchema.id == foreign(SecretResourceSchema.secret_id)",
+            order_by="SecretSchema.name",
+            overlaps="secrets",
+        ),
+    )
+
+    @classmethod
+    def get_query_options(
+        cls,
+        include_metadata: bool = False,
+        include_resources: bool = False,
+        **kwargs: Any,
+    ) -> Sequence[ExecutableOption]:
+        """Get the query options for the schema.
+
+        Args:
+            include_metadata: Whether metadata will be included when converting
+                the schema to a model.
+            include_resources: Whether resources will be included when
+                converting the schema to a model.
+            **kwargs: Keyword arguments to allow schema specific logic
+
+        Returns:
+            A list of query options.
+        """
+        options = [
+            joinedload(jl_arg(StackComponentSchema.flavor_schema)),
+        ]
+
+        if include_metadata:
+            options.extend(
+                [joinedload(jl_arg(StackComponentSchema.connector))]
+            )
+
+        if include_resources:
+            options.extend(
+                [
+                    joinedload(jl_arg(StackComponentSchema.user)),
+                ]
+            )
+
+        return options
+
+    @classmethod
+    def from_request(
+        cls,
+        request: "ComponentRequest",
+        service_connector: Optional[ServiceConnectorSchema] = None,
+    ) -> "StackComponentSchema":
+        """Create a component schema from a request.
+
+        Args:
+            request: The request from which to create the component.
+            service_connector: Optional service connector to link to the
+                component.
+
+        Returns:
+            The component schema.
+        """
+        return cls(
+            name=request.name,
+            user_id=request.user,
+            type=request.type,
+            flavor=request.flavor,
+            configuration=base64.b64encode(
+                json.dumps(request.configuration).encode("utf-8")
+            ),
+            labels=base64.b64encode(
+                json.dumps(request.labels).encode("utf-8")
+            ),
+            environment=base64.b64encode(
+                json.dumps(request.environment).encode("utf-8")
+            ),
+            connector=service_connector,
+            connector_resource_id=request.connector_resource_id,
+        )
 
     def update(
         self, component_update: "ComponentUpdate"
@@ -117,7 +208,8 @@ class StackComponentSchema(NamedSchema, table=True):
             The updated `StackComponentSchema`.
         """
         for field, value in component_update.model_dump(
-            exclude_unset=True, exclude={"workspace", "user", "connector"}
+            exclude_unset=True,
+            exclude={"user", "connector", "add_secrets", "remove_secrets"},
         ).items():
             if field == "configuration":
                 self.configuration = base64.b64encode(
@@ -127,15 +219,14 @@ class StackComponentSchema(NamedSchema, table=True):
                 self.labels = base64.b64encode(
                     json.dumps(component_update.labels).encode("utf-8")
                 )
-            elif field == "type":
-                component_type = component_update.type
-
-                if component_type is not None:
-                    self.type = component_type
+            elif field == "environment":
+                self.environment = base64.b64encode(
+                    json.dumps(component_update.environment).encode("utf-8")
+                )
             else:
                 setattr(self, field, value)
 
-        self.updated = datetime.utcnow()
+        self.updated = utc_now()
         return self
 
     def to_model(
@@ -151,36 +242,61 @@ class StackComponentSchema(NamedSchema, table=True):
             include_resources: Whether the resources will be filled.
             **kwargs: Keyword arguments to allow schema specific logic
 
+        Raises:
+            RuntimeError: If the flavor for the component is missing in the DB.
 
         Returns:
             A `ComponentModel`
         """
         body = ComponentResponseBody(
+            user_id=self.user_id,
             type=StackComponentType(self.type),
-            flavor=self.flavor,
-            user=self.user.to_model() if self.user else None,
+            flavor_name=self.flavor,
             created=self.created,
             updated=self.updated,
+            logo_url=self.flavor_schema.logo_url
+            if self.flavor_schema
+            else None,
+            integration=self.flavor_schema.integration
+            if self.flavor_schema
+            else None,
         )
         metadata = None
         if include_metadata:
+            environment = None
+            if self.environment:
+                environment = json.loads(
+                    base64.b64decode(self.environment).decode()
+                )
             metadata = ComponentResponseMetadata(
-                workspace=self.workspace.to_model(),
                 configuration=json.loads(
                     base64.b64decode(self.configuration).decode()
                 ),
                 labels=json.loads(base64.b64decode(self.labels).decode())
                 if self.labels
                 else None,
-                component_spec_path=self.component_spec_path,
+                environment=environment or {},
                 connector_resource_id=self.connector_resource_id,
                 connector=self.connector.to_model()
                 if self.connector
                 else None,
+                secrets=[secret.id for secret in self.secrets],
+            )
+        resources = None
+        if include_resources:
+            if not self.flavor_schema:
+                raise RuntimeError(
+                    f"Missing flavor {self.flavor} for component {self.name}."
+                )
+
+            resources = ComponentResponseResources(
+                user=self.user.to_model() if self.user else None,
+                flavor=self.flavor_schema.to_model(),
             )
         return ComponentResponse(
             id=self.id,
             name=self.name,
             body=body,
             metadata=metadata,
+            resources=resources,
         )

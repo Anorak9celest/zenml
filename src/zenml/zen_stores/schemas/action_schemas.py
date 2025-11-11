@@ -15,12 +15,13 @@
 
 import base64
 import json
-from datetime import datetime
-from typing import TYPE_CHECKING, Any, List, Optional
+from typing import TYPE_CHECKING, Any, List, Optional, Sequence
 from uuid import UUID
 
 from pydantic.json import pydantic_encoder
-from sqlalchemy import TEXT, Column
+from sqlalchemy import TEXT, Column, UniqueConstraint
+from sqlalchemy.orm import joinedload
+from sqlalchemy.sql.base import ExecutableOption
 from sqlmodel import Field, Relationship
 
 from zenml.models import (
@@ -31,10 +32,12 @@ from zenml.models import (
     ActionResponseResources,
     ActionUpdate,
 )
+from zenml.utils.time_utils import utc_now
 from zenml.zen_stores.schemas.base_schemas import NamedSchema
+from zenml.zen_stores.schemas.project_schemas import ProjectSchema
 from zenml.zen_stores.schemas.schema_utils import build_foreign_key_field
 from zenml.zen_stores.schemas.user_schemas import UserSchema
-from zenml.zen_stores.schemas.workspace_schemas import WorkspaceSchema
+from zenml.zen_stores.schemas.utils import jl_arg
 
 if TYPE_CHECKING:
     from zenml.zen_stores.schemas import TriggerSchema
@@ -44,16 +47,23 @@ class ActionSchema(NamedSchema, table=True):
     """SQL Model for actions."""
 
     __tablename__ = "action"
+    __table_args__ = (
+        UniqueConstraint(
+            "name",
+            "project_id",
+            name="unique_action_name_in_project",
+        ),
+    )
 
-    workspace_id: UUID = build_foreign_key_field(
+    project_id: UUID = build_foreign_key_field(
         source=__tablename__,
-        target=WorkspaceSchema.__tablename__,
-        source_column="workspace_id",
+        target=ProjectSchema.__tablename__,
+        source_column="project_id",
         target_column="id",
         ondelete="CASCADE",
         nullable=False,
     )
-    workspace: "WorkspaceSchema" = Relationship(back_populates="actions")
+    project: "ProjectSchema" = Relationship(back_populates="actions")
 
     user_id: Optional[UUID] = build_foreign_key_field(
         source=__tablename__,
@@ -93,6 +103,39 @@ class ActionSchema(NamedSchema, table=True):
     configuration: bytes
 
     @classmethod
+    def get_query_options(
+        cls,
+        include_metadata: bool = False,
+        include_resources: bool = False,
+        **kwargs: Any,
+    ) -> Sequence[ExecutableOption]:
+        """Get the query options for the schema.
+
+        Args:
+            include_metadata: Whether metadata will be included when converting
+                the schema to a model.
+            include_resources: Whether resources will be included when
+                converting the schema to a model.
+            **kwargs: Keyword arguments to allow schema specific logic
+
+        Returns:
+            A list of query options.
+        """
+        options = []
+
+        if include_resources:
+            options.extend(
+                [
+                    joinedload(jl_arg(ActionSchema.user)),
+                    joinedload(
+                        jl_arg(ActionSchema.service_account), innerjoin=True
+                    ),
+                ]
+            )
+
+        return options
+
+    @classmethod
     def from_request(cls, request: "ActionRequest") -> "ActionSchema":
         """Convert a `ActionRequest` to a `ActionSchema`.
 
@@ -104,7 +147,7 @@ class ActionSchema(NamedSchema, table=True):
         """
         return cls(
             name=request.name,
-            workspace_id=request.workspace,
+            project_id=request.project,
             user_id=request.user,
             configuration=base64.b64encode(
                 json.dumps(
@@ -140,7 +183,7 @@ class ActionSchema(NamedSchema, table=True):
             else:
                 setattr(self, field, value)
 
-        self.updated = datetime.utcnow()
+        self.updated = utc_now()
         return self
 
     def to_model(
@@ -162,7 +205,8 @@ class ActionSchema(NamedSchema, table=True):
             The converted model.
         """
         body = ActionResponseBody(
-            user=self.user.to_model() if self.user else None,
+            user_id=self.user_id,
+            project_id=self.project_id,
             created=self.created,
             updated=self.updated,
             flavor=self.flavor,
@@ -171,7 +215,6 @@ class ActionSchema(NamedSchema, table=True):
         metadata = None
         if include_metadata:
             metadata = ActionResponseMetadata(
-                workspace=self.workspace.to_model(),
                 configuration=json.loads(
                     base64.b64decode(self.configuration).decode()
                 ),
@@ -181,6 +224,7 @@ class ActionSchema(NamedSchema, table=True):
         resources = None
         if include_resources:
             resources = ActionResponseResources(
+                user=self.user.to_model() if self.user else None,
                 service_account=self.service_account.to_model(),
             )
         return ActionResponse(

@@ -26,22 +26,24 @@ from zenml.materializers.built_in_materializer import (
 from zenml.materializers.cloudpickle_materializer import (
     CloudpickleMaterializer,
 )
+from zenml.materializers.in_memory_materializer import InMemoryMaterializer
+from zenml.materializers.path_materializer import PathMaterializer
+from zenml.materializers.pydantic_materializer import PydanticMaterializer
+from zenml.materializers.service_materializer import ServiceMaterializer
 from zenml.materializers.structured_string_materializer import (
     StructuredStringMaterializer,
 )
-from zenml.materializers.numpy_materializer import NumpyMaterializer
-from zenml.materializers.pandas_materializer import PandasMaterializer
-from zenml.materializers.pydantic_materializer import PydanticMaterializer
-from zenml.materializers.service_materializer import ServiceMaterializer
+from zenml.materializers.uuid_materializer import UUIDMaterializer
 
 __all__ = [
     "BuiltInContainerMaterializer",
     "BuiltInMaterializer",
     "BytesMaterializer",
     "CloudpickleMaterializer",
+    "InMemoryMaterializer",
     "StructuredStringMaterializer",
-    "NumpyMaterializer",
-    "PandasMaterializer",
     "PydanticMaterializer",
     "ServiceMaterializer",
+    "UUIDMaterializer",
+    "PathMaterializer",
 ]

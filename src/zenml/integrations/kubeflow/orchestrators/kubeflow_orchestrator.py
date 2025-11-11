@@ -32,7 +32,16 @@
 
 import os
 import types
-from typing import TYPE_CHECKING, Any, Dict, List, Optional, Tuple, Type, cast
+from typing import (
+    TYPE_CHECKING,
+    Any,
+    Dict,
+    List,
+    Optional,
+    Tuple,
+    Type,
+    cast,
+)
 from uuid import UUID
 
 import kfp
@@ -60,13 +69,13 @@ from zenml.integrations.kubeflow.flavors.kubeflow_orchestrator_flavor import (
 from zenml.io import fileio
 from zenml.logger import get_logger
 from zenml.metadata.metadata_types import MetadataType, Uri
-from zenml.orchestrators import ContainerizedOrchestrator
+from zenml.orchestrators import ContainerizedOrchestrator, SubmissionResult
 from zenml.orchestrators.utils import get_orchestrator_run_name
 from zenml.stack import StackValidator
-from zenml.utils import io_utils, settings_utils, yaml_utils
+from zenml.utils import io_utils, settings_utils
 
 if TYPE_CHECKING:
-    from zenml.models import PipelineDeploymentResponse
+    from zenml.models import PipelineRunResponse, PipelineSnapshotResponse
     from zenml.stack import Stack
 
 
@@ -457,45 +466,37 @@ class KubeflowOrchestrator(ContainerizedOrchestrator):
 
         return pipeline_task
 
-    def prepare_or_run_pipeline(
+    def submit_pipeline(
         self,
-        deployment: "PipelineDeploymentResponse",
+        snapshot: "PipelineSnapshotResponse",
         stack: "Stack",
-        environment: Dict[str, str],
-    ) -> Any:
-        """Creates a kfp yaml file.
+        base_environment: Dict[str, str],
+        step_environments: Dict[str, Dict[str, str]],
+        placeholder_run: Optional["PipelineRunResponse"] = None,
+    ) -> Optional[SubmissionResult]:
+        """Submits a pipeline to the orchestrator.
 
-        This functions as an intermediary representation of the pipeline which
-        is then deployed to the kubeflow pipelines instance.
-
-        How it works:
-        -------------
-        Before this method is called the `prepare_pipeline_deployment()`
-        method builds a docker image that contains the code for the
-        pipeline, all steps the context around these files.
-
-        Based on this docker image a callable is created which builds
-        container_ops for each step (`_construct_kfp_pipeline`).
-        To do this the entrypoint of the docker image is configured to
-        run the correct step within the docker image. The dependencies
-        between these container_ops are then also configured onto each
-        container_op by pointing at the downstream steps.
-
-        This callable is then compiled into a kfp yaml file that is used as
-        the intermediary representation of the kubeflow pipeline.
-
-        This file, together with some metadata, runtime configurations is
-        then uploaded into the kubeflow pipelines cluster for execution.
+        This method should only submit the pipeline and not wait for it to
+        complete. If the orchestrator is configured to wait for the pipeline run
+        to complete, a function that waits for the pipeline run to complete can
+        be passed as part of the submission result.
 
         Args:
-            deployment: The pipeline deployment to prepare or run.
+            snapshot: The pipeline snapshot to submit.
             stack: The stack the pipeline will run on.
-            environment: Environment variables to set in the orchestration
-                environment.
+            base_environment: Base environment shared by all steps. This should
+                be set if your orchestrator for example runs one container that
+                is responsible for starting all the steps.
+            step_environments: Environment variables to set when executing
+                specific steps.
+            placeholder_run: An optional placeholder run for the snapshot.
 
         Raises:
             RuntimeError: If trying to run a pipeline in a notebook
                 environment.
+
+        Returns:
+            Optional submission result.
         """
         # First check whether the code running in a notebook
         if Environment.in_notebook():
@@ -512,7 +513,7 @@ class KubeflowOrchestrator(ContainerizedOrchestrator):
 
         # Create a callable for future compilation into a dsl.Pipeline.
         orchestrator_run_name = get_orchestrator_run_name(
-            pipeline_name=deployment.pipeline_configuration.name
+            pipeline_name=snapshot.pipeline_configuration.name
         ).replace("_", "-")
 
         def _create_dynamic_pipeline() -> Any:
@@ -524,16 +525,16 @@ class KubeflowOrchestrator(ContainerizedOrchestrator):
             step_name_to_dynamic_component: Dict[str, Any] = {}
             node_selector_constraint: Optional[Tuple[str, str]] = None
 
-            for step_name, step in deployment.step_configurations.items():
+            for step_name, step in snapshot.step_configurations.items():
                 image = self.get_image(
-                    deployment=deployment,
+                    snapshot=snapshot,
                     step_name=step_name,
                 )
                 command = StepEntrypointConfiguration.get_entrypoint_command()
                 arguments = (
                     StepEntrypointConfiguration.get_entrypoint_arguments(
                         step_name=step_name,
-                        deployment_id=deployment.id,
+                        snapshot_id=snapshot.id,
                     )
                 )
                 dynamic_component = self._create_dynamic_component(
@@ -544,30 +545,14 @@ class KubeflowOrchestrator(ContainerizedOrchestrator):
                 )
                 pod_settings = step_settings.pod_settings
                 if pod_settings:
-                    if pod_settings.host_ipc:
+                    ignored_fields = pod_settings.model_fields_set - {
+                        "node_selectors"
+                    }
+                    if ignored_fields:
                         logger.warning(
-                            "Host IPC is set to `True` but not supported in "
-                            "this orchestrator. Ignoring..."
-                        )
-                    if pod_settings.affinity:
-                        logger.warning(
-                            "Affinity is set but not supported in Kubeflow with "
-                            "Kubeflow Pipelines 2.x. Ignoring..."
-                        )
-                    if pod_settings.tolerations:
-                        logger.warning(
-                            "Tolerations are set but not supported in "
-                            "Kubeflow with Kubeflow Pipelines 2.x. Ignoring..."
-                        )
-                    if pod_settings.volumes:
-                        logger.warning(
-                            "Volumes are set but not supported in Kubeflow with "
-                            "Kubeflow Pipelines 2.x. Ignoring..."
-                        )
-                    if pod_settings.volume_mounts:
-                        logger.warning(
-                            "Volume mounts are set but not supported in "
-                            "Kubeflow with Kubeflow Pipelines 2.x. Ignoring..."
+                            f"The following pod settings are not supported in "
+                            f"Kubeflow with Kubeflow Pipelines 2.x and will be "
+                            f"ignored: {list(ignored_fields)}."
                         )
 
                     # apply pod settings
@@ -595,9 +580,10 @@ class KubeflowOrchestrator(ContainerizedOrchestrator):
                     component_name,
                     component,
                 ) in step_name_to_dynamic_component.items():
+                    step_environment = step_environments[component_name]
                     # for each component, check to see what other steps are
                     # upstream of it
-                    step = deployment.step_configurations[component_name]
+                    step = snapshot.step_configurations[component_name]
                     upstream_step_components = [
                         step_name_to_dynamic_component[upstream_step_name]
                         for upstream_step_name in step.spec.upstream_steps
@@ -614,6 +600,9 @@ class KubeflowOrchestrator(ContainerizedOrchestrator):
                         )
                         .after(*upstream_step_components)
                     )
+                    for key, value in step_environment.items():
+                        task = task.set_env_variable(name=key, value=value)
+
                     self._configure_container_resources(
                         task,
                         step.config.resource_settings,
@@ -621,39 +610,6 @@ class KubeflowOrchestrator(ContainerizedOrchestrator):
                     )
 
             return dynamic_pipeline
-
-        def _update_yaml_with_environment(
-            yaml_file_path: str, environment: Dict[str, str]
-        ) -> None:
-            """Updates the env section of the steps in the YAML file with the given environment variables.
-
-            Args:
-                yaml_file_path: The path to the YAML file to update.
-                environment: A dictionary of environment variables to add.
-            """
-            pipeline_definition = yaml_utils.read_yaml(pipeline_file_path)
-
-            # Iterate through each component and add the environment variables
-            for executor in pipeline_definition["deploymentSpec"]["executors"]:
-                if (
-                    "container"
-                    in pipeline_definition["deploymentSpec"]["executors"][
-                        executor
-                    ]
-                ):
-                    container = pipeline_definition["deploymentSpec"][
-                        "executors"
-                    ][executor]["container"]
-                    if "env" not in container:
-                        container["env"] = []
-                    for key, value in environment.items():
-                        container["env"].append({"name": key, "value": value})
-
-            yaml_utils.write_yaml(pipeline_file_path, pipeline_definition)
-
-            print(
-                f"Updated YAML file with environment variables at {yaml_file_path}"
-            )
 
         # Get a filepath to use to save the finished yaml to
         fileio.makedirs(self.pipeline_directory)
@@ -668,40 +624,40 @@ class KubeflowOrchestrator(ContainerizedOrchestrator):
             pipeline_name=orchestrator_run_name,
         )
 
-        # Let's update the YAML file with the environment variables
-        _update_yaml_with_environment(pipeline_file_path, environment)
-
         logger.info(
             "Writing Kubeflow workflow definition to `%s`.", pipeline_file_path
         )
 
         # using the kfp client uploads the pipeline to kubeflow pipelines and
         # runs it there
-        self._upload_and_run_pipeline(
-            deployment=deployment,
+        return self._upload_and_run_pipeline(
+            snapshot=snapshot,
             pipeline_file_path=pipeline_file_path,
             run_name=orchestrator_run_name,
         )
 
     def _upload_and_run_pipeline(
         self,
-        deployment: "PipelineDeploymentResponse",
+        snapshot: "PipelineSnapshotResponse",
         pipeline_file_path: str,
         run_name: str,
-    ) -> None:
+    ) -> Optional[SubmissionResult]:
         """Tries to upload and run a KFP pipeline.
 
         Args:
-            deployment: The pipeline deployment.
+            snapshot: The pipeline snapshot.
             pipeline_file_path: Path to the pipeline definition file.
             run_name: The Kubeflow run name.
 
         Raises:
             RuntimeError: If Kubeflow API returns an error.
+
+        Returns:
+            Optional submission result.
         """
-        pipeline_name = deployment.pipeline_configuration.name
+        pipeline_name = snapshot.pipeline_configuration.name
         settings = cast(
-            KubeflowOrchestratorSettings, self.get_settings(deployment)
+            KubeflowOrchestratorSettings, self.get_settings(snapshot)
         )
         user_namespace = settings.user_namespace
 
@@ -726,7 +682,7 @@ class KubeflowOrchestrator(ContainerizedOrchestrator):
             # upload the pipeline to Kubeflow and start it
 
             client = self._get_kfp_client(settings=settings)
-            if deployment.schedule:
+            if snapshot.schedule:
                 try:
                     experiment = client.get_experiment(
                         pipeline_name, namespace=user_namespace
@@ -749,8 +705,8 @@ class KubeflowOrchestrator(ContainerizedOrchestrator):
                 )
 
                 interval_seconds = (
-                    deployment.schedule.interval_second.seconds
-                    if deployment.schedule.interval_second
+                    snapshot.schedule.interval_second.seconds
+                    if snapshot.schedule.interval_second
                     else None
                 )
                 result = client.create_recurring_run(
@@ -758,11 +714,11 @@ class KubeflowOrchestrator(ContainerizedOrchestrator):
                     job_name=run_name,
                     pipeline_package_path=pipeline_file_path,
                     enable_caching=False,
-                    cron_expression=deployment.schedule.cron_expression,
-                    start_time=deployment.schedule.utc_start_time,
-                    end_time=deployment.schedule.utc_end_time,
+                    cron_expression=snapshot.schedule.cron_expression,
+                    start_time=snapshot.schedule.utc_start_time,
+                    end_time=snapshot.schedule.utc_end_time,
                     interval_second=interval_seconds,
-                    no_catchup=not deployment.schedule.catchup,
+                    no_catchup=not snapshot.schedule.catchup,
                 )
 
                 logger.info(
@@ -793,8 +749,14 @@ class KubeflowOrchestrator(ContainerizedOrchestrator):
                 )
 
                 if settings.synchronous:
-                    client.wait_for_run_completion(
-                        run_id=result.run_id, timeout=settings.timeout
+
+                    def _wait_for_completion() -> None:
+                        client.wait_for_run_completion(
+                            run_id=result.run_id, timeout=settings.timeout
+                        )
+
+                    return SubmissionResult(
+                        wait_for_completion=_wait_for_completion
                     )
         except urllib3.exceptions.HTTPError as error:
             if kubernetes_context:
@@ -815,6 +777,8 @@ class KubeflowOrchestrator(ContainerizedOrchestrator):
             logger.warning(
                 f"Failed to upload Kubeflow pipeline: {error}. {msg}",
             )
+
+        return None
 
     def get_orchestrator_run_id(self) -> str:
         """Returns the active orchestrator run id.
@@ -888,7 +852,7 @@ class KubeflowOrchestrator(ContainerizedOrchestrator):
                 f"Error while trying to fetch kubeflow cookie: {errh}"
             )
 
-        cookie_dict: Dict[str, str] = session.cookies.get_dict()  # type: ignore[no-untyped-call]
+        cookie_dict: Dict[str, str] = session.cookies.get_dict()  # type: ignore[no-untyped-call, unused-ignore]
 
         if "authservice_session" not in cookie_dict:
             raise RuntimeError("Invalid username and/or password!")

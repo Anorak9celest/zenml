@@ -1,6 +1,6 @@
 # Apache Software License 2.0
 #
-# Copyright (c) ZenML GmbH 2024. All rights reserved.
+# Copyright (c) ZenML GmbH 2025. All rights reserved.
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
 # you may not use this file except in compliance with the License.
@@ -64,7 +64,10 @@ def compute_performance_metrics_on_current_data(
     current_version = Model(name=latest_version.name, version=target_env)
 
     latest_version_number = latest_version.number
-    current_version_number = current_version.number
+    try:
+        current_version_number = current_version.number
+    except KeyError:
+        current_version_number = None
 
     if current_version_number is None:
         current_version_number = -1

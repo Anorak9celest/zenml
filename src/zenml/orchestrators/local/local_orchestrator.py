@@ -14,20 +14,23 @@
 """Implementation of the ZenML local orchestrator."""
 
 import time
-from typing import TYPE_CHECKING, Any, Dict, Optional, Type
+from typing import TYPE_CHECKING, Dict, List, Optional, Type
 from uuid import uuid4
 
+from zenml.enums import ExecutionMode
 from zenml.logger import get_logger
-from zenml.orchestrators import BaseOrchestrator
-from zenml.orchestrators.base_orchestrator import (
+from zenml.orchestrators import (
+    BaseOrchestrator,
     BaseOrchestratorConfig,
     BaseOrchestratorFlavor,
+    SubmissionResult,
 )
 from zenml.stack import Stack
 from zenml.utils import string_utils
+from zenml.utils.env_utils import temporary_environment
 
 if TYPE_CHECKING:
-    from zenml.models import PipelineDeploymentResponse
+    from zenml.models import PipelineRunResponse, PipelineSnapshotResponse
 
 logger = get_logger(__name__)
 
@@ -41,32 +44,108 @@ class LocalOrchestrator(BaseOrchestrator):
 
     _orchestrator_run_id: Optional[str] = None
 
-    def prepare_or_run_pipeline(
+    @property
+    def run_init_cleanup_at_step_level(self) -> bool:
+        """Whether the orchestrator runs the init and cleanup hooks at step level.
+
+        For orchestrators that run their steps in isolated step environments,
+        the run context cannot be shared between steps. In this case, the init
+        and cleanup hooks need to be run at step level for each individual step.
+
+        For orchestrators that run their steps in a shared environment with a
+        shared memory (e.g. the local orchestrator), the init and cleanup hooks
+        can be run at run level and this property should be overridden to return
+        True.
+
+        Returns:
+            Whether the orchestrator runs the init and cleanup hooks at step
+            level.
+        """
+        return False
+
+    def submit_pipeline(
         self,
-        deployment: "PipelineDeploymentResponse",
+        snapshot: "PipelineSnapshotResponse",
         stack: "Stack",
-        environment: Dict[str, str],
-    ) -> Any:
-        """Iterates through all steps and executes them sequentially.
+        base_environment: Dict[str, str],
+        step_environments: Dict[str, Dict[str, str]],
+        placeholder_run: Optional["PipelineRunResponse"] = None,
+    ) -> Optional[SubmissionResult]:
+        """Submits a pipeline to the orchestrator.
+
+        This method should only submit the pipeline and not wait for it to
+        complete. If the orchestrator is configured to wait for the pipeline run
+        to complete, a function that waits for the pipeline run to complete can
+        be passed as part of the submission result.
 
         Args:
-            deployment: The pipeline deployment to prepare or run.
-            stack: The stack on which the pipeline is deployed.
-            environment: Environment variables to set in the orchestration
-                environment.
-        """
-        if deployment.schedule:
-            logger.warning(
-                "Local Orchestrator currently does not support the "
-                "use of schedules. The `schedule` will be ignored "
-                "and the pipeline will be run immediately."
-            )
+            snapshot: The pipeline snapshot to submit.
+            stack: The stack the pipeline will run on.
+            base_environment: Base environment shared by all steps. This should
+                be set if your orchestrator for example runs one container that
+                is responsible for starting all the steps.
+            step_environments: Environment variables to set when executing
+                specific steps.
+            placeholder_run: An optional placeholder run for the snapshot.
 
+        Returns:
+            Optional submission result.
+
+        Raises:
+            step_exception: The exception that occurred while running a failed
+                step.
+            RuntimeError: If the pipeline run fails.
+        """
         self._orchestrator_run_id = str(uuid4())
         start_time = time.time()
 
+        execution_mode = snapshot.pipeline_configuration.execution_mode
+
+        failed_steps: List[str] = []
+        step_exception: Optional[Exception] = None
+        skipped_steps: List[str] = []
+
+        self.run_init_hook(snapshot=snapshot)
+
         # Run each step
-        for step_name, step in deployment.step_configurations.items():
+        for step_name, step in snapshot.step_configurations.items():
+            if (
+                execution_mode == ExecutionMode.STOP_ON_FAILURE
+                and failed_steps
+            ):
+                logger.warning(
+                    "Skipping step %s due to the failed step(s): %s (Execution mode %s)",
+                    step_name,
+                    ", ".join(failed_steps),
+                    execution_mode,
+                )
+                skipped_steps.append(step_name)
+                continue
+
+            if failed_upstream_steps := [
+                fs for fs in failed_steps if fs in step.spec.upstream_steps
+            ]:
+                logger.warning(
+                    "Skipping step %s due to failure in upstream step(s): %s (Execution mode %s)",
+                    step_name,
+                    ", ".join(failed_upstream_steps),
+                    execution_mode,
+                )
+                skipped_steps.append(step_name)
+                continue
+
+            if skipped_upstream_steps := [
+                fs for fs in skipped_steps if fs in step.spec.upstream_steps
+            ]:
+                logger.warning(
+                    "Skipping step %s due to the skipped upstream step(s) %s (Execution mode %s)",
+                    step_name,
+                    ", ".join(skipped_upstream_steps),
+                    execution_mode,
+                )
+                skipped_steps.append(step_name)
+                continue
+
             if self.requires_resources_in_orchestration_environment(step):
                 logger.warning(
                     "Specifying step resources is not supported for the local "
@@ -75,8 +154,28 @@ class LocalOrchestrator(BaseOrchestrator):
                     step_name,
                 )
 
-            self.run_step(
-                step=step,
+            step_environment = step_environments[step_name]
+            try:
+                with temporary_environment(step_environment):
+                    self.run_step(step=step)
+            except Exception as e:
+                failed_steps.append(step_name)
+                logger.exception("Step %s failed.", step_name)
+
+                if execution_mode == ExecutionMode.FAIL_FAST:
+                    step_exception = e
+                    break
+
+        self.run_cleanup_hook(snapshot=snapshot)
+
+        if execution_mode == ExecutionMode.FAIL_FAST and failed_steps:
+            assert step_exception is not None
+            raise step_exception
+
+        if failed_steps:
+            raise RuntimeError(
+                "Pipeline run has failed due to failure in step(s): "
+                f"{', '.join(failed_steps)}"
             )
 
         run_duration = time.time() - start_time
@@ -85,6 +184,45 @@ class LocalOrchestrator(BaseOrchestrator):
             string_utils.get_human_readable_time(run_duration),
         )
         self._orchestrator_run_id = None
+        return None
+
+    def submit_dynamic_pipeline(
+        self,
+        snapshot: "PipelineSnapshotResponse",
+        stack: "Stack",
+        environment: Dict[str, str],
+        placeholder_run: Optional["PipelineRunResponse"] = None,
+    ) -> Optional[SubmissionResult]:
+        """Submits a dynamic pipeline to the orchestrator.
+
+        Args:
+            snapshot: The pipeline snapshot to submit.
+            stack: The stack the pipeline will run on.
+            environment: Environment variables to set in the orchestration
+                environment.
+            placeholder_run: An optional placeholder run.
+
+        Returns:
+            Optional submission result.
+        """
+        from zenml.execution.pipeline.dynamic.runner import (
+            DynamicPipelineRunner,
+        )
+
+        self._orchestrator_run_id = str(uuid4())
+        start_time = time.time()
+
+        runner = DynamicPipelineRunner(snapshot=snapshot, run=placeholder_run)
+        with temporary_environment(environment):
+            runner.run_pipeline()
+
+        run_duration = time.time() - start_time
+        logger.info(
+            "Pipeline run has finished in `%s`.",
+            string_utils.get_human_readable_time(run_duration),
+        )
+        self._orchestrator_run_id = None
+        return None
 
     def get_orchestrator_run_id(self) -> str:
         """Returns the active orchestrator run id.
@@ -100,6 +238,19 @@ class LocalOrchestrator(BaseOrchestrator):
             raise RuntimeError("No run id set.")
 
         return self._orchestrator_run_id
+
+    @property
+    def supported_execution_modes(self) -> List[ExecutionMode]:
+        """Returns the supported execution modes for this flavor.
+
+        Returns:
+            A tuple of supported execution modes.
+        """
+        return [
+            ExecutionMode.FAIL_FAST,
+            ExecutionMode.STOP_ON_FAILURE,
+            ExecutionMode.CONTINUE_ON_FAILURE,
+        ]
 
 
 class LocalOrchestratorConfig(BaseOrchestratorConfig):

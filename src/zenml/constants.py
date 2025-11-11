@@ -134,25 +134,26 @@ APP_NAME = "zenml"
 # Environment variables
 ENV_ZENML_LOGGING_COLORS_DISABLED = "ZENML_LOGGING_COLORS_DISABLED"
 ENV_ZENML_ANALYTICS_OPT_IN = "ZENML_ANALYTICS_OPT_IN"
+ENV_ZENML_USER_ID = "ZENML_USER_ID"
 ENV_ZENML_CONFIG_PATH = "ZENML_CONFIG_PATH"
 ENV_ZENML_DEBUG = "ZENML_DEBUG"
 ENV_ZENML_LOGGING_VERBOSITY = "ZENML_LOGGING_VERBOSITY"
+ENV_ZENML_LOGGING_FORMAT = "ZENML_LOGGING_FORMAT"
 ENV_ZENML_REPOSITORY_PATH = "ZENML_REPOSITORY_PATH"
-ENV_ZENML_PREVENT_PIPELINE_EXECUTION = "ZENML_PREVENT_PIPELINE_EXECUTION"
 ENV_ZENML_ENABLE_RICH_TRACEBACK = "ZENML_ENABLE_RICH_TRACEBACK"
 ENV_ZENML_ACTIVE_STACK_ID = "ZENML_ACTIVE_STACK_ID"
-ENV_ZENML_ACTIVE_WORKSPACE_ID = "ZENML_ACTIVE_WORKSPACE_ID"
+ENV_ZENML_ACTIVE_PROJECT_ID = "ZENML_ACTIVE_PROJECT_ID"
 ENV_ZENML_SUPPRESS_LOGS = "ZENML_SUPPRESS_LOGS"
 ENV_ZENML_ENABLE_REPO_INIT_WARNINGS = "ZENML_ENABLE_REPO_INIT_WARNINGS"
 ENV_ZENML_SECRET_VALIDATION_LEVEL = "ZENML_SECRET_VALIDATION_LEVEL"
 ENV_ZENML_DEFAULT_USER_NAME = "ZENML_DEFAULT_USER_NAME"
 ENV_ZENML_DEFAULT_USER_PASSWORD = "ZENML_DEFAULT_USER_PASSWORD"
-ENV_ZENML_DEFAULT_WORKSPACE_NAME = "ZENML_DEFAULT_WORKSPACE_NAME"
+ENV_ZENML_DEFAULT_PROJECT_NAME = "ZENML_DEFAULT_PROJECT_NAME"
 ENV_ZENML_STORE_PREFIX = "ZENML_STORE_"
 ENV_ZENML_SECRETS_STORE_PREFIX = "ZENML_SECRETS_STORE_"
 ENV_ZENML_BACKUP_SECRETS_STORE_PREFIX = "ZENML_BACKUP_SECRETS_STORE_"
-ENV_ZENML_SKIP_PIPELINE_REGISTRATION = "ZENML_SKIP_PIPELINE_REGISTRATION"
 ENV_AUTO_OPEN_DASHBOARD = "AUTO_OPEN_DASHBOARD"
+ENV_ZENML_AUTO_OPEN_DASHBOARD = "ZENML_AUTO_OPEN_DASHBOARD"
 ENV_ZENML_DISABLE_DATABASE_MIGRATION = "DISABLE_DATABASE_MIGRATION"
 ENV_ZENML_LOCAL_STORES_PATH = "ZENML_LOCAL_STORES_PATH"
 ENV_ZENML_CONTAINER = "ZENML_CONTAINER"
@@ -160,31 +161,60 @@ ENV_ZENML_PAGINATION_DEFAULT_LIMIT = "ZENML_PAGINATION_DEFAULT_LIMIT"
 ENV_ZENML_DISABLE_CLIENT_SERVER_MISMATCH_WARNING = (
     "ZENML_DISABLE_CLIENT_SERVER_MISMATCH_WARNING"
 )
-ENV_ZENML_DISABLE_WORKSPACE_WARNINGS = "ZENML_DISABLE_WORKSPACE_WARNINGS"
 ENV_ZENML_SKIP_IMAGE_BUILDER_DEFAULT = "ZENML_SKIP_IMAGE_BUILDER_DEFAULT"
-ENV_ZENML_REQUIRES_CODE_DOWNLOAD = "ZENML_REQUIRES_CODE_DOWNLOAD"
+ENV_ZENML_SKIP_STACK_VALIDATION = "ZENML_SKIP_STACK_VALIDATION"
 ENV_ZENML_SERVER = "ZENML_SERVER"
-ENV_ZENML_LOCAL_SERVER = "ZENML_LOCAL_SERVER"
-ENV_ZENML_HUB_URL = "ZENML_HUB_URL"
+ENV_ZENML_SERVER_ALLOW_LOCAL_FILE_ACCESS = (
+    "ZENML_SERVER_ALLOW_LOCAL_FILE_ACCESS"
+)
 ENV_ZENML_ENFORCE_TYPE_ANNOTATIONS = "ZENML_ENFORCE_TYPE_ANNOTATIONS"
 ENV_ZENML_ENABLE_IMPLICIT_AUTH_METHODS = "ZENML_ENABLE_IMPLICIT_AUTH_METHODS"
+ENV_ZENML_DISABLE_PIPELINE_LOGS_STORAGE = "ZENML_DISABLE_PIPELINE_LOGS_STORAGE"
 ENV_ZENML_DISABLE_STEP_LOGS_STORAGE = "ZENML_DISABLE_STEP_LOGS_STORAGE"
-ENV_ZENML_PIPELINE_API_TOKEN_EXPIRES_MINUTES = (
-    "ZENML_PIPELINE_API_TOKEN_EXPIRES_MINUTES"
+ENV_ZENML_DISABLE_STEP_NAMES_IN_LOGS = "ZENML_DISABLE_STEP_NAMES_IN_LOGS"
+ENV_ZENML_STORAGE_LOGGING_VERBOSITY = "ZENML_STORAGE_LOGGING_VERBOSITY"
+ENV_ZENML_CAPTURE_PRINTS = "ZENML_CAPTURE_PRINTS"
+ENV_ZENML_LOGS_STORAGE_MAX_QUEUE_SIZE = "ZENML_LOGS_STORAGE_MAX_QUEUE_SIZE"
+ENV_ZENML_LOGS_STORAGE_QUEUE_TIMEOUT = "ZENML_LOGS_STORAGE_QUEUE_TIMEOUT"
+
+ENV_ZENML_LOGS_WRITE_INTERVAL_SECONDS = "ZENML_LOGS_WRITE_INTERVAL_SECONDS"
+ENV_ZENML_LOGS_MERGE_INTERVAL_SECONDS = "ZENML_LOGS_MERGE_INTERVAL_SECONDS"
+
+ENV_ZENML_CUSTOM_SOURCE_ROOT = "ZENML_CUSTOM_SOURCE_ROOT"
+ENV_ZENML_PIPELINE_RUN_API_TOKEN_EXPIRATION = (
+    "ZENML_PIPELINE_API_TOKEN_EXPIRATION"
 )
-ENV_ZENML_IGNORE_FAILURE_HOOK = "ZENML_IGNORE_FAILURE_HOOK"
+ENV_ZENML_CODE_REPOSITORY_IGNORE_UNTRACKED_FILES = (
+    "ZENML_CODE_REPOSITORY_IGNORE_UNTRACKED_FILES"
+)
+# Environment variable that indicates whether the current environment is running
+# a step operator.
+ENV_ZENML_STEP_OPERATOR = "ZENML_STEP_OPERATOR"
+
+# Materializer environment variables
+ENV_ZENML_MATERIALIZER_ALLOW_NON_ASCII_JSON_DUMPS = (
+    "ZENML_MATERIALIZER_ALLOW_NON_ASCII_JSON_DUMPS"
+)
+ENV_ZENML_DISABLE_PATH_MATERIALIZER = "ZENML_DISABLE_PATH_MATERIALIZER"
 
 # ZenML Server environment variables
 ENV_ZENML_SERVER_PREFIX = "ZENML_SERVER_"
+ENV_ZENML_SERVER_PRO_PREFIX = "ZENML_SERVER_PRO_"
 ENV_ZENML_SERVER_DEPLOYMENT_TYPE = f"{ENV_ZENML_SERVER_PREFIX}DEPLOYMENT_TYPE"
 ENV_ZENML_SERVER_AUTH_SCHEME = f"{ENV_ZENML_SERVER_PREFIX}AUTH_SCHEME"
-ENV_ZENML_SERVER_REPORTABLE_RESOURCES = (
-    f"{ENV_ZENML_SERVER_PREFIX}REPORTABLE_RESOURCES"
-)
-ENV_ZENML_SERVER_USE_LEGACY_DASHBOARD = (
-    f"{ENV_ZENML_SERVER_PREFIX}USE_LEGACY_DASHBOARD"
-)
 ENV_ZENML_SERVER_AUTO_ACTIVATE = f"{ENV_ZENML_SERVER_PREFIX}AUTO_ACTIVATE"
+
+ENV_ZENML_RUN_SINGLE_STEPS_WITHOUT_STACK = (
+    "ZENML_RUN_SINGLE_STEPS_WITHOUT_STACK"
+)
+ENV_ZENML_PREVENT_CLIENT_SIDE_CACHING = "ZENML_PREVENT_CLIENT_SIDE_CACHING"
+ENV_ZENML_DISABLE_CREDENTIALS_DISK_CACHING = "DISABLE_CREDENTIALS_DISK_CACHING"
+ENV_ZENML_RUNNER_PARENT_IMAGE = "ZENML_RUNNER_PARENT_IMAGE"
+ENV_ZENML_RUNNER_IMAGE_DISABLE_UV = "ZENML_RUNNER_IMAGE_DISABLE_UV"
+ENV_ZENML_RUNNER_POD_TIMEOUT = "ZENML_RUNNER_POD_TIMEOUT"
+ENV_ZENML_WORKLOAD_TOKEN_EXPIRATION_LEEWAY = (
+    "ZENML_WORKLOAD_TOKEN_EXPIRATION_LEEWAY"
+)
 
 # Logging variables
 IS_DEBUG_ENV: bool = handle_bool_env_var(ENV_ZENML_DEBUG, default=False)
@@ -193,9 +223,15 @@ if IS_DEBUG_ENV:
     ZENML_LOGGING_VERBOSITY = os.getenv(
         ENV_ZENML_LOGGING_VERBOSITY, default="DEBUG"
     ).upper()
+    ZENML_STORAGE_LOGGING_VERBOSITY = os.getenv(
+        ENV_ZENML_STORAGE_LOGGING_VERBOSITY, default="DEBUG"
+    ).upper()
 else:
     ZENML_LOGGING_VERBOSITY = os.getenv(
         ENV_ZENML_LOGGING_VERBOSITY, default="INFO"
+    ).upper()
+    ZENML_STORAGE_LOGGING_VERBOSITY = os.getenv(
+        ENV_ZENML_STORAGE_LOGGING_VERBOSITY, default="INFO"
     ).upper()
 
 INSIDE_ZENML_CONTAINER = handle_bool_env_var(ENV_ZENML_CONTAINER, False)
@@ -208,11 +244,6 @@ REMOTE_FS_PREFIX = ["gs://", "hdfs://", "s3://", "az://", "abfs://"]
 
 # ZenML Analytics Server - URL
 ANALYTICS_SERVER_URL = "https://analytics.zenml.io/"
-
-# Container utils
-SHOULD_PREVENT_PIPELINE_EXECUTION = handle_bool_env_var(
-    ENV_ZENML_PREVENT_PIPELINE_EXECUTION
-)
 
 # Repository and local store directory paths:
 REPOSITORY_DIRECTORY_NAME = ".zen"
@@ -229,7 +260,7 @@ SQL_STORE_BACKUP_DIRECTORY_NAME = "database_backup"
 
 DEFAULT_USERNAME = "default"
 DEFAULT_PASSWORD = ""
-DEFAULT_WORKSPACE_NAME = "default"
+DEFAULT_PROJECT_NAME = "default"
 DEFAULT_STACK_AND_COMPONENT_NAME = "default"
 
 # Rich config
@@ -250,11 +281,12 @@ DEFAULT_SERVICE_START_STOP_TIMEOUT = 60
 DEFAULT_LOCAL_SERVICE_IP_ADDRESS = "127.0.0.1"
 ZEN_SERVER_ENTRYPOINT = "zenml.zen_server.zen_server_api:app"
 
-STEP_SOURCE_PARAMETER_NAME = "step_source"
+CODE_HASH_PARAMETER_NAME = "step_source"
 
 # Server settings
 DEFAULT_ZENML_SERVER_NAME = "default"
 DEFAULT_ZENML_SERVER_THREAD_POOL_SIZE = 40
+DEFAULT_ZENML_SERVER_AUTH_THREAD_POOL_SIZE = 5
 DEFAULT_ZENML_JWT_TOKEN_LEEWAY = 10
 DEFAULT_ZENML_JWT_TOKEN_ALGORITHM = "HS256"
 DEFAULT_ZENML_AUTH_SCHEME = AuthScheme.OAUTH2_PASSWORD_BEARER
@@ -263,26 +295,39 @@ DEFAULT_ZENML_SERVER_MAX_DEVICE_AUTH_ATTEMPTS = 3
 DEFAULT_ZENML_SERVER_DEVICE_AUTH_TIMEOUT = 60 * 5  # 5 minutes
 DEFAULT_ZENML_SERVER_DEVICE_AUTH_POLLING = 5  # seconds
 DEFAULT_HTTP_TIMEOUT = 30
+DEFAULT_ZENML_SERVER_REQUEST_TIMEOUT = 20  # seconds
+DEFAULT_ZENML_SERVER_REQUEST_CACHE_TIMEOUT = 300  # seconds
+SERVICE_CONNECTOR_VERIFY_REQUEST_TIMEOUT = 120  # seconds
 ZENML_API_KEY_PREFIX = "ZENKEY_"
+ZENML_PRO_API_KEY_PREFIX = "ZENPROKEY_"
 DEFAULT_ZENML_SERVER_PIPELINE_RUN_AUTH_WINDOW = 60 * 48  # 48 hours
 DEFAULT_ZENML_SERVER_LOGIN_RATE_LIMIT_MINUTE = 5
 DEFAULT_ZENML_SERVER_LOGIN_RATE_LIMIT_DAY = 1000
+DEFAULT_ZENML_SERVER_GENERIC_API_TOKEN_LIFETIME = 60 * 60  # 1 hour
+DEFAULT_ZENML_SERVER_GENERIC_API_TOKEN_MAX_LIFETIME = (
+    60 * 60 * 24 * 7
+)  # 7 days
+DEFAULT_ZENML_SERVER_FILE_DOWNLOAD_SIZE_LIMIT = 2 * 1024 * 1024 * 1024  # 20 GB
+DEFAULT_ZENML_SERVER_MAX_CONCURRENT_SNAPSHOT_RUNS = 2
 
 DEFAULT_ZENML_SERVER_SECURE_HEADERS_HSTS = (
     "max-age=63072000; includeSubdomains"
 )
 DEFAULT_ZENML_SERVER_SECURE_HEADERS_XFO = "SAMEORIGIN"
-DEFAULT_ZENML_SERVER_SECURE_HEADERS_XXP = "0"
 DEFAULT_ZENML_SERVER_SECURE_HEADERS_CONTENT = "nosniff"
-_csp_script_src_urls = ["https://widgets-v3.featureos.app"]
+_csp_script_src_urls = [
+    "https://widgets-v3.featureos.app",
+    "https://static.reo.dev",
+]
 _csp_connect_src_urls = [
-    "https://sdkdocs.zenml.io",
-    "https://hubapi.zenml.io",
-    "https://analytics.zenml.io",
+    # We need a wildcard here to allow the dashboard deployment playground
+    # to send requests to deployments on any URL.
+    "*",
 ]
 _csp_img_src_urls = [
-    "https://public-flavor-logos.s3.eu-central-1.amazonaws.com",
-    "https://avatar.vercel.sh",
+    "*"
+    # "https://public-flavor-logos.s3.eu-central-1.amazonaws.com",
+    # "https://avatar.vercel.sh",
 ]
 _csp_frame_src_urls = [
     "https://zenml.hellonext.co",
@@ -312,17 +357,11 @@ DEFAULT_ZENML_SERVER_SECURE_HEADERS_PERMISSIONS = (
     "payment=(), sync-xhr=(), usb=()"
 )
 DEFAULT_ZENML_SERVER_SECURE_HEADERS_REPORT_TO = "default"
-DEFAULT_ZENML_SERVER_USE_LEGACY_DASHBOARD = False
+DEFAULT_ZENML_SERVER_REPORT_USER_ACTIVITY_TO_DB_SECONDS = 30
+DEFAULT_ZENML_SERVER_MAX_REQUEST_BODY_SIZE_IN_BYTES = 256 * 1024 * 1024
 
-# Configurations to decide which resources report their usage and check for
-# entitlement in the case of a cloud deployment. Expected Format is this:
-# ENV_ZENML_REPORTABLE_RESOURCES='["Foo", "bar"]'
-REPORTABLE_RESOURCES: List[str] = handle_json_env_var(
-    ENV_ZENML_SERVER_REPORTABLE_RESOURCES,
-    expected_type=list,
-    default=["pipeline", "pipeline_run", "model"],
-)
-REQUIRES_CUSTOM_RESOURCE_REPORTING = ["pipeline", "pipeline_run"]
+DEFAULT_REPORTABLE_RESOURCES = ["project", "pipeline", "pipeline_run", "model"]
+RUN_TEMPLATE_TRIGGERS_FEATURE_NAME = "template_run"
 
 # API Endpoint paths:
 ACTIVATE = "/activate"
@@ -334,33 +373,43 @@ API_TOKEN = "/api_token"
 ARTIFACTS = "/artifacts"
 ARTIFACT_VERSIONS = "/artifact_versions"
 ARTIFACT_VISUALIZATIONS = "/artifact_visualizations"
+AUTH = "/auth"
+BATCH = "/batch"
 CODE_REFERENCES = "/code_references"
 CODE_REPOSITORIES = "/code_repositories"
 COMPONENT_TYPES = "/component-types"
+CONFIG = "/config"
 CURRENT_USER = "/current-user"
+DATA = "/data"
 DEACTIVATE = "/deactivate"
 DEVICES = "/devices"
 DEVICE_AUTHORIZATION = "/device_authorization"
 DEVICE_VERIFY = "/verify"
+DOWNLOAD_TOKEN = "/download-token"
 EMAIL_ANALYTICS = "/email-opt-in"
 EVENT_FLAVORS = "/event-flavors"
 EVENT_SOURCES = "/event-sources"
 FLAVORS = "/flavors"
-FULL_STACK = "/full-stack"
-GET_OR_CREATE = "/get-or-create"
-GRAPH = "/graph"
 HEALTH = "/health"
+READY = "/ready"
 INFO = "/info"
+LOAD_INFO = "/load-info"
 LOGIN = "/login"
 LOGOUT = "/logout"
 LOGS = "/logs"
 PIPELINE_BUILDS = "/pipeline_builds"
 PIPELINE_CONFIGURATION = "/pipeline-configuration"
 PIPELINE_DEPLOYMENTS = "/pipeline_deployments"
+DEPLOYMENTS = "/deployments"
+CURATED_VISUALIZATIONS = "/curated_visualizations"
+PIPELINE_SNAPSHOTS = "/pipeline_snapshots"
 PIPELINES = "/pipelines"
 PIPELINE_SPEC = "/pipeline-spec"
 PLUGIN_FLAVORS = "/plugin-flavors"
+PROJECTS = "/projects"
+REFRESH = "/refresh"
 RUNS = "/runs"
+RUN_TEMPLATES = "/run_templates"
 RUN_METADATA = "/run-metadata"
 SCHEDULES = "/schedules"
 SECRETS = "/secrets"
@@ -373,6 +422,7 @@ SERVICE_CONNECTOR_CLIENT = "/client"
 SERVICE_CONNECTOR_RESOURCES = "/resources"
 SERVICE_CONNECTOR_TYPES = "/service_connector_types"
 SERVICE_CONNECTOR_VERIFY = "/verify"
+SERVICE_CONNECTOR_FULL_STACK = "/full_stack_resources"
 MODELS = "/models"
 MODEL_VERSIONS = "/model_versions"
 MODEL_VERSION_ARTIFACTS = "/model_version_artifacts"
@@ -387,25 +437,30 @@ STATISTICS = "/statistics"
 STATUS = "/status"
 STEP_CONFIGURATION = "/step-configuration"
 STEPS = "/steps"
+HEARTBEAT = "/heartbeat"
+STOP = "/stop"
 TAGS = "/tags"
+TAG_RESOURCES = "/tag_resources"
 TRIGGERS = "/triggers"
 TRIGGER_EXECUTIONS = "/trigger_executions"
+ONBOARDING_STATE = "/onboarding_state"
 USERS = "/users"
 URL = "/url"
 VERSION_1 = "/v1"
 VISUALIZE = "/visualize"
 WEBHOOKS = "/webhooks"
 WORKSPACES = "/workspaces"
+PROJECTS = "/projects"
 
 # model metadata yaml file name
 MODEL_METADATA_YAML_FILE_NAME = "model_metadata.yaml"
 
 # orchestrator constants
 ORCHESTRATOR_DOCKER_IMAGE_KEY = "orchestrator"
-PIPELINE_API_TOKEN_EXPIRES_MINUTES = handle_int_env_var(
-    ENV_ZENML_PIPELINE_API_TOKEN_EXPIRES_MINUTES,
-    default=60 * 24,  # 24 hours
-)
+
+# deployer constants
+DEPLOYER_DOCKER_IMAGE_KEY = "deployer"
+IN_MEMORY_ARTIFACT_URI_PREFIX = "memory://"
 
 # Secret constants
 SECRET_VALUES = "values"
@@ -419,9 +474,13 @@ PAGE_SIZE_MAXIMUM: int = handle_int_env_var(
     ENV_ZENML_PAGINATION_DEFAULT_LIMIT, default=10000
 )
 FILTERING_DATETIME_FORMAT: str = "%Y-%m-%d %H:%M:%S"
+SORT_PIPELINES_BY_LATEST_RUN_KEY = "latest_run"
+SORT_BY_LATEST_VERSION_KEY = "latest_version"
 
 # Metadata constants
 METADATA_ORCHESTRATOR_URL = "orchestrator_url"
+METADATA_ORCHESTRATOR_LOGS_URL = "orchestrator_logs_url"
+METADATA_ORCHESTRATOR_RUN_ID = "orchestrator_run_id"
 METADATA_EXPERIMENT_TRACKER_URL = "experiment_tracker_url"
 METADATA_DEPLOYED_MODEL_URL = "deployed_model_url"
 
@@ -434,36 +493,10 @@ KUBERNETES_CLUSTER_RESOURCE_TYPE = "kubernetes-cluster"
 
 # Stack Recipe constants
 STACK_RECIPES_GITHUB_REPO = "https://github.com/zenml-io/mlops-stacks.git"
-ALPHA_MESSAGE = (
-    "The mlstacks tool/package is in alpha and actively being developed. "
-    "Please avoid running mission-critical workloads on resources deployed "
-    "through these commands. If you encounter any problems, create an issue "
-    f"on the repository {STACK_RECIPES_GITHUB_REPO} and we'll help you out!"
-)
-NOT_INSTALLED_MESSAGE = (
-    "The prerequisites for using `mlstacks` (the `mlstacks` and "
-    "`python-terraform` packages seem to be unavailable on your machine "
-    "and/or in your environment. To install the missing dependencies: \n\n"
-    "`pip install mlstacks`"
-)
-TERRAFORM_NOT_INSTALLED_MESSAGE = (
-    "Terraform appears not to be installed on your machine and/or in your "
-    "environment. Please install Terraform and try again."
-)
-STACK_RECIPE_MODULAR_RECIPES = ["aws", "gcp", "k3d"]
-MLSTACKS_SUPPORTED_STACK_COMPONENTS = [
-    "artifact_store",
-    "container_registry",
-    "experiment_tracker",
-    "orchestrator",
-    "model_deployer",
-    "mlops_platform",
-    "step_operator",
-]
-
 
 # Parameters for internal ZenML Models
 TEXT_FIELD_MAX_LENGTH = 65535
+STR_ID_FIELD_MAX_LENGTH = 50
 STR_FIELD_MAX_LENGTH = 255
 MEDIUMTEXT_MAX_LENGTH = 2**24 - 1
 
@@ -480,7 +513,33 @@ MAX_RETRIES_FOR_VERSIONED_ENTITY_CREATION = (
 )
 
 
-FINISHED_ONBOARDING_SURVEY_KEY = "awareness_channels"
+FINISHED_ONBOARDING_SURVEY_KEY = "finished_onboarding_survey"
 
 # Name validation
 BANNED_NAME_CHARACTERS = "\t\n\r\v\f"
+
+
+STACK_DEPLOYMENT_API_TOKEN_EXPIRATION = 60 * 6  # 6 hours
+
+ZENML_PIPELINE_RUN_API_TOKEN_EXPIRATION = handle_int_env_var(
+    ENV_ZENML_PIPELINE_RUN_API_TOKEN_EXPIRATION, default=0
+)
+
+# Logs storage constants
+# Maximum number of log batches to queue.
+LOGS_STORAGE_MAX_QUEUE_SIZE = handle_int_env_var(
+    ENV_ZENML_LOGS_STORAGE_MAX_QUEUE_SIZE, default=100000
+)
+# Queue timeout controls log dropping vs application blocking:
+# - Positive value (e.g., 30): Wait N seconds, then drop logs if queue full
+# - Negative value (e.g., -1): Block indefinitely until queue has space (never drop logs)
+LOGS_STORAGE_QUEUE_TIMEOUT = handle_int_env_var(
+    ENV_ZENML_LOGS_STORAGE_QUEUE_TIMEOUT, default=-1
+)
+# Log batch-write and merge windows in seconds.
+LOGS_WRITE_INTERVAL_SECONDS = handle_int_env_var(
+    ENV_ZENML_LOGS_WRITE_INTERVAL_SECONDS, default=1
+)
+LOGS_MERGE_INTERVAL_SECONDS = handle_int_env_var(
+    ENV_ZENML_LOGS_MERGE_INTERVAL_SECONDS, default=10 * 60
+)

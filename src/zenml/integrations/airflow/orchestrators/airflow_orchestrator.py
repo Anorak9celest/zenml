@@ -38,10 +38,11 @@ from zenml.integrations.airflow.flavors.airflow_orchestrator_flavor import (
 )
 from zenml.io import fileio
 from zenml.logger import get_logger
-from zenml.orchestrators import ContainerizedOrchestrator
+from zenml.orchestrators import ContainerizedOrchestrator, SubmissionResult
 from zenml.orchestrators.utils import get_orchestrator_run_name
 from zenml.stack import StackValidator
 from zenml.utils import io_utils
+from zenml.utils.time_utils import utc_now
 
 if TYPE_CHECKING:
     from zenml.config import ResourceSettings
@@ -50,8 +51,11 @@ if TYPE_CHECKING:
         DagConfiguration,
         TaskConfiguration,
     )
-    from zenml.models import PipelineDeploymentResponse
-    from zenml.pipelines import Schedule
+    from zenml.models import (
+        PipelineRunResponse,
+        PipelineSnapshotResponse,
+        ScheduleResponse,
+    )
     from zenml.stack import Stack
 
 logger = get_logger(__name__)
@@ -173,37 +177,39 @@ class AirflowOrchestrator(ContainerizedOrchestrator):
                 custom_validation_function=_validate_remote_components,
             )
 
-    def prepare_pipeline_deployment(
+    def submit_pipeline(
         self,
-        deployment: "PipelineDeploymentResponse",
+        snapshot: "PipelineSnapshotResponse",
         stack: "Stack",
-    ) -> None:
-        """Builds a Docker image to run pipeline steps.
+        base_environment: Dict[str, str],
+        step_environments: Dict[str, Dict[str, str]],
+        placeholder_run: Optional["PipelineRunResponse"] = None,
+    ) -> Optional[SubmissionResult]:
+        """Submits a pipeline to the orchestrator.
+
+        This method should only submit the pipeline and not wait for it to
+        complete. If the orchestrator is configured to wait for the pipeline run
+        to complete, a function that waits for the pipeline run to complete can
+        be passed as part of the submission result.
 
         Args:
-            deployment: The pipeline deployment configuration.
-            stack: The stack on which the pipeline will be deployed.
+            snapshot: The pipeline snapshot to submit.
+            stack: The stack the pipeline will run on.
+            base_environment: Base environment shared by all steps. This should
+                be set if your orchestrator for example runs one container that
+                is responsible for starting all the steps.
+            step_environments: Environment variables to set when executing
+                specific steps.
+            placeholder_run: An optional placeholder run for the snapshot.
+
+        Returns:
+            Optional submission result.
         """
         if self.config.local:
             stack.check_local_paths()
 
-    def prepare_or_run_pipeline(
-        self,
-        deployment: "PipelineDeploymentResponse",
-        stack: "Stack",
-        environment: Dict[str, str],
-    ) -> Any:
-        """Creates and writes an Airflow DAG zip file.
-
-        Args:
-            deployment: The pipeline deployment to prepare or run.
-            stack: The stack the pipeline will run on.
-            environment: Environment variables to set in the orchestration
-                environment.
-
-        """
         pipeline_settings = cast(
-            AirflowOrchestratorSettings, self.get_settings(deployment)
+            AirflowOrchestratorSettings, self.get_settings(snapshot)
         )
 
         dag_generator_values = get_dag_generator_values(
@@ -213,13 +219,13 @@ class AirflowOrchestrator(ContainerizedOrchestrator):
         command = StepEntrypointConfiguration.get_entrypoint_command()
 
         tasks = []
-        for step_name, step in deployment.step_configurations.items():
+        for step_name, step in snapshot.step_configurations.items():
             settings = cast(
                 AirflowOrchestratorSettings, self.get_settings(step)
             )
-            image = self.get_image(deployment=deployment, step_name=step_name)
+            image = self.get_image(snapshot=snapshot, step_name=step_name)
             arguments = StepEntrypointConfiguration.get_entrypoint_arguments(
-                step_name=step_name, deployment_id=deployment.id
+                step_name=step_name, snapshot_id=snapshot.id
             )
             operator_args = settings.operator_args.copy()
             if self.requires_resources_in_orchestration_environment(step=step):
@@ -243,7 +249,7 @@ class AirflowOrchestrator(ContainerizedOrchestrator):
                 docker_image=image,
                 command=command,
                 arguments=arguments,
-                environment=environment,
+                environment=step_environments[step_name],
                 operator_source=settings.operator,
                 operator_args=operator_args,
             )
@@ -256,7 +262,7 @@ class AirflowOrchestrator(ContainerizedOrchestrator):
         )
 
         dag_id = pipeline_settings.dag_id or get_orchestrator_run_name(
-            pipeline_name=deployment.pipeline_configuration.name
+            pipeline_name=snapshot.pipeline_configuration.name
         )
         dag_config = dag_generator_values.dag_configuration_class(
             id=dag_id,
@@ -264,7 +270,7 @@ class AirflowOrchestrator(ContainerizedOrchestrator):
             tasks=tasks,
             tags=pipeline_settings.dag_tags,
             dag_args=pipeline_settings.dag_args,
-            **self._translate_schedule(deployment.schedule),
+            **self._translate_schedule(snapshot.schedule),
         )
 
         self._write_dag(
@@ -272,6 +278,7 @@ class AirflowOrchestrator(ContainerizedOrchestrator):
             dag_generator_values=dag_generator_values,
             output_dir=pipeline_settings.dag_output_dir or self.dags_directory,
         )
+        return None
 
     def _apply_resource_settings(
         self,
@@ -391,7 +398,7 @@ class AirflowOrchestrator(ContainerizedOrchestrator):
 
     @staticmethod
     def _translate_schedule(
-        schedule: Optional["Schedule"] = None,
+        schedule: Optional["ScheduleResponse"] = None,
     ) -> Dict[str, Any]:
         """Convert ZenML schedule into Airflow schedule.
 
@@ -409,7 +416,7 @@ class AirflowOrchestrator(ContainerizedOrchestrator):
         if schedule:
             if schedule.cron_expression:
                 start_time = schedule.start_time or (
-                    datetime.datetime.utcnow() - datetime.timedelta(7)
+                    utc_now() - datetime.timedelta(7)
                 )
                 return {
                     "schedule": schedule.cron_expression,
@@ -429,6 +436,6 @@ class AirflowOrchestrator(ContainerizedOrchestrator):
             "schedule": "@once",
             # set a start time in the past and disable catchup so airflow
             # runs the dag immediately
-            "start_date": datetime.datetime.utcnow() - datetime.timedelta(7),
+            "start_date": utc_now() - datetime.timedelta(7),
             "catchup": False,
         }

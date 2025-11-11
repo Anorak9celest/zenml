@@ -6,7 +6,7 @@ description: Deploying ZenML with custom Docker images.
 
 In most cases, deploying ZenML with the default `zenmlhub/zenml-server` Docker image should work just fine. However, there are some scenarios when you might need to deploy ZenML with a custom Docker image:
 
-* You have implemented a custom artifact store for which you want to enable [artifact visualizations](../../how-to/handle-data-artifacts/visualize-artifacts.md) or [step logs](../../how-to/setting-up-a-project-repository/best-practices.md#logging) in your dashboard.
+* You have implemented a custom artifact store for which you want to enable [artifact visualizations](../../how-to/artifacts/visualizations.md) or [step logs](../../how-to/steps-pipelines/logging.md) in your dashboard.
 * You have forked the ZenML repository and want to deploy a ZenML server based on your own fork because you made changes to the server / database logic.
 
 {% hint style="warning" %}
@@ -55,24 +55,6 @@ If you want to verify your custom image locally, you can follow the [Deploy a cu
 ### Deploy ZenML with your custom image
 
 Next, adjust your preferred deployment strategy to use the custom Docker image you just built.
-
-#### Deploy a custom ZenML image via CLI
-
-You can deploy your custom image via the `zenml deploy` CLI command by setting the `--config` argument to a custom configuration file that has both `zenmlserver_image_repo` and `zenmlserver_image_tag` set:
-
-1.  Define a custom `config.yaml` based on the [base deployment configuration file](deploy-with-zenml-cli.md#base-configuration-file) and set `zenmlserver_image_repo` and `zenmlserver_image_tag` according to the custom image you built:
-
-    ```yaml
-    zenmlserver_image_repo: <YOUR_CONTAINER_REGISTRY>/<IMAGE_NAME>
-    zenmlserver_image_tag: <IMAGE_TAG>
-    ```
-2.  Run `zenml deploy` with the custom config file:
-
-    ```shell
-    zenml deploy --config=/PATH/TO/FILE
-    ```
-
-See the general [ZenML CLI Deployment Guide](deploy-with-zenml-cli.md) for more information on how to use the `zenml deploy` CLI command and what other options can be configured.
 
 #### Deploy a custom ZenML image via Docker
 

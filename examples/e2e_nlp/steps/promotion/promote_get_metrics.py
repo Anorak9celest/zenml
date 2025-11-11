@@ -1,6 +1,6 @@
 # Apache Software License 2.0
 #
-# Copyright (c) ZenML GmbH 2024. All rights reserved.
+# Copyright (c) ZenML GmbH 2025. All rights reserved.
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
 # you may not use this file except in compliance with the License.
@@ -30,12 +30,10 @@ model_registry = Client().active_stack.model_registry
 
 
 @step
-def promote_get_metrics() -> (
-    Tuple[
-        Annotated[Dict[str, Any], "latest_metrics"],
-        Annotated[Dict[str, Any], "current_metrics`"],
-    ]
-):
+def promote_get_metrics() -> Tuple[
+    Annotated[Dict[str, Any], "latest_metrics"],
+    Annotated[Dict[str, Any], "current_metrics`"],
+]:
     """Get metrics for comparison for promoting a model.
 
     This is an example of a metric retrieval step. It is used to retrieve
@@ -56,9 +54,7 @@ def promote_get_metrics() -> (
 
     # Get current model version metric in current run
     model = get_step_context().model
-    current_metrics = (
-        model.get_model_artifact("model").run_metadata["metrics"].value
-    )
+    current_metrics = model.get_model_artifact("model").run_metadata["metrics"]
     logger.info(f"Current model version metrics are {current_metrics}")
 
     # Get latest saved model version metric in target environment
@@ -72,11 +68,9 @@ def promote_get_metrics() -> (
     except KeyError:
         latest_version = None
     if latest_version:
-        latest_metrics = (
-            latest_version.get_model_artifact("model")
-            .run_metadata["metrics"]
-            .value
-        )
+        latest_metrics = latest_version.get_model_artifact(
+            "model"
+        ).run_metadata["metrics"]
         logger.info(f"Latest model version metrics are {latest_metrics}")
     else:
         logger.info("No currently promoted model version found.")

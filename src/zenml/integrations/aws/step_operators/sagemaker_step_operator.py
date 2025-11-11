@@ -13,10 +13,21 @@
 #  permissions and limitations under the License.
 """Implementation of the Sagemaker Step Operator."""
 
-from typing import TYPE_CHECKING, Dict, List, Optional, Tuple, Type, cast
+from typing import (
+    TYPE_CHECKING,
+    Dict,
+    List,
+    Optional,
+    Tuple,
+    Type,
+    Union,
+    cast,
+)
 
 import boto3
-import sagemaker
+from sagemaker.estimator import Estimator
+from sagemaker.inputs import TrainingInput
+from sagemaker.session import Session
 
 from zenml.client import Client
 from zenml.config.build_configuration import BuildConfiguration
@@ -41,7 +52,7 @@ from zenml.utils.string_utils import random_str
 if TYPE_CHECKING:
     from zenml.config.base_settings import BaseSettings
     from zenml.config.step_run_info import StepRunInfo
-    from zenml.models import PipelineDeploymentBase
+    from zenml.models import PipelineSnapshotBase
 
 logger = get_logger(__name__)
 
@@ -129,19 +140,19 @@ class SagemakerStepOperator(BaseStepOperator):
         )
 
     def get_docker_builds(
-        self, deployment: "PipelineDeploymentBase"
+        self, snapshot: "PipelineSnapshotBase"
     ) -> List["BuildConfiguration"]:
         """Gets the Docker builds required for the component.
 
         Args:
-            deployment: The pipeline deployment for which to get the builds.
+            snapshot: The pipeline snapshot for which to get the builds.
 
         Returns:
             The required Docker builds.
         """
         builds = []
-        for step_name, step in deployment.step_configurations.items():
-            if step.config.step_operator == self.name:
+        for step_name, step in snapshot.step_configurations.items():
+            if step.config.uses_step_operator(self.name):
                 build = BuildConfiguration(
                     key=SAGEMAKER_DOCKER_IMAGE_KEY,
                     settings=step.config.docker_settings,
@@ -181,6 +192,11 @@ class SagemakerStepOperator(BaseStepOperator):
                 self.name,
             )
 
+        settings = cast(SagemakerStepOperatorSettings, self.get_settings(info))
+
+        if settings.environment:
+            environment.update(settings.environment)
+
         # Sagemaker does not allow environment variables longer than 512
         # characters to be passed to Estimator steps. If an environment variable
         # is longer than 512 characters, we split it into multiple environment
@@ -193,8 +209,6 @@ class SagemakerStepOperator(BaseStepOperator):
 
         image_name = info.get_image(key=SAGEMAKER_DOCKER_IMAGE_KEY)
         environment[_ENTRYPOINT_ENV_VARIABLE] = " ".join(entrypoint_command)
-
-        settings = cast(SagemakerStepOperatorSettings, self.get_settings(info))
 
         # Get and default fill SageMaker estimator arguments for full ZenML support
         estimator_args = settings.estimator_args
@@ -213,7 +227,7 @@ class SagemakerStepOperator(BaseStepOperator):
         else:
             boto_session = boto3.Session()
 
-        session = sagemaker.Session(
+        session = Session(
             boto_session=boto_session, default_bucket=self.config.bucket
         )
 
@@ -221,14 +235,15 @@ class SagemakerStepOperator(BaseStepOperator):
             "instance_type", settings.instance_type or "ml.m5.large"
         )
 
+        # Convert environment to a dict of strings
+        environment = {key: str(value) for key, value in environment.items()}
+
         estimator_args["environment"] = environment
         estimator_args["instance_count"] = 1
         estimator_args["sagemaker_session"] = session
 
         # Create Estimator
-        estimator = sagemaker.estimator.Estimator(
-            image_name, self.config.role, **estimator_args
-        )
+        estimator = Estimator(image_name, self.config.role, **estimator_args)
 
         # SageMaker allows 63 characters at maximum for job name - ZenML uses 60 for safety margin.
         step_name = Client().get_run_step(info.step_run_id).name
@@ -242,18 +257,14 @@ class SagemakerStepOperator(BaseStepOperator):
         )
 
         # Construct training input object, if necessary
-        inputs = None
+        inputs: Optional[Union[TrainingInput, Dict[str, TrainingInput]]] = None
 
         if isinstance(settings.input_data_s3_uri, str):
-            inputs = sagemaker.inputs.TrainingInput(
-                s3_data=settings.input_data_s3_uri
-            )
+            inputs = TrainingInput(s3_data=settings.input_data_s3_uri)
         elif isinstance(settings.input_data_s3_uri, dict):
             inputs = {}
             for channel, s3_uri in settings.input_data_s3_uri.items():
-                inputs[channel] = sagemaker.inputs.TrainingInput(
-                    s3_data=s3_uri
-                )
+                inputs[channel] = TrainingInput(s3_data=s3_uri)
 
         experiment_config = {}
         if settings.experiment_name:

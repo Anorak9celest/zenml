@@ -13,32 +13,31 @@
 #  permissions and limitations under the License.
 """Endpoint definitions for builds."""
 
-from typing import Optional
+from typing import Optional, Union
 from uuid import UUID
 
-from fastapi import APIRouter, BackgroundTasks, Depends, Security
+from fastapi import APIRouter, Depends, Security
 
-from zenml.config.pipeline_run_configuration import PipelineRunConfiguration
 from zenml.constants import API, PIPELINE_BUILDS, VERSION_1
 from zenml.models import (
     Page,
     PipelineBuildFilter,
+    PipelineBuildRequest,
     PipelineBuildResponse,
-    PipelineRunResponse,
 )
 from zenml.zen_server.auth import AuthContext, authorize
 from zenml.zen_server.exceptions import error_response
 from zenml.zen_server.rbac.endpoint_utils import (
+    verify_permissions_and_create_entity,
     verify_permissions_and_delete_entity,
     verify_permissions_and_get_entity,
     verify_permissions_and_list_entities,
 )
-from zenml.zen_server.rbac.models import Action, ResourceType
-from zenml.zen_server.rbac.utils import verify_permission
+from zenml.zen_server.rbac.models import ResourceType
+from zenml.zen_server.routers.projects_endpoints import workspace_router
 from zenml.zen_server.utils import (
-    handle_exceptions,
+    async_fastapi_endpoint_wrapper,
     make_dependable,
-    server_config,
     zen_store,
 )
 
@@ -49,16 +48,61 @@ router = APIRouter(
 )
 
 
+@router.post(
+    "",
+    responses={401: error_response, 409: error_response, 422: error_response},
+)
+# TODO: the workspace scoped endpoint is only kept for dashboard compatibility
+# and can be removed after the migration
+@workspace_router.post(
+    "/{project_name_or_id}" + PIPELINE_BUILDS,
+    responses={401: error_response, 409: error_response, 422: error_response},
+    deprecated=True,
+    tags=["builds"],
+)
+@async_fastapi_endpoint_wrapper
+def create_build(
+    build: PipelineBuildRequest,
+    project_name_or_id: Optional[Union[str, UUID]] = None,
+    _: AuthContext = Security(authorize),
+) -> PipelineBuildResponse:
+    """Creates a build, optionally in a specific project.
+
+    Args:
+        build: Build to create.
+        project_name_or_id: Optional name or ID of the project.
+
+    Returns:
+        The created build.
+    """
+    if project_name_or_id:
+        project = zen_store().get_project(project_name_or_id)
+        build.project = project.id
+
+    return verify_permissions_and_create_entity(
+        request_model=build,
+        create_method=zen_store().create_build,
+    )
+
+
 @router.get(
     "",
-    response_model=Page[PipelineBuildResponse],
     responses={401: error_response, 404: error_response, 422: error_response},
 )
-@handle_exceptions
+# TODO: the workspace scoped endpoint is only kept for dashboard compatibility
+# and can be removed after the migration
+@workspace_router.get(
+    "/{project_name_or_id}" + PIPELINE_BUILDS,
+    responses={401: error_response, 404: error_response, 422: error_response},
+    deprecated=True,
+    tags=["builds"],
+)
+@async_fastapi_endpoint_wrapper(deduplicate=True)
 def list_builds(
     build_filter_model: PipelineBuildFilter = Depends(
         make_dependable(PipelineBuildFilter)
     ),
+    project_name_or_id: Optional[Union[str, UUID]] = None,
     hydrate: bool = False,
     _: AuthContext = Security(authorize),
 ) -> Page[PipelineBuildResponse]:
@@ -67,12 +111,16 @@ def list_builds(
     Args:
         build_filter_model: Filter model used for pagination, sorting,
             filtering.
+        project_name_or_id: Optional name or ID of the project to filter by.
         hydrate: Flag deciding whether to hydrate the output model(s)
             by including metadata fields in the response.
 
     Returns:
-        List of build objects.
+        List of build objects matching the filter criteria.
     """
+    if project_name_or_id:
+        build_filter_model.project = project_name_or_id
+
     return verify_permissions_and_list_entities(
         filter_model=build_filter_model,
         resource_type=ResourceType.PIPELINE_BUILD,
@@ -83,10 +131,9 @@ def list_builds(
 
 @router.get(
     "/{build_id}",
-    response_model=PipelineBuildResponse,
     responses={401: error_response, 404: error_response, 422: error_response},
 )
-@handle_exceptions
+@async_fastapi_endpoint_wrapper(deduplicate=True)
 def get_build(
     build_id: UUID,
     hydrate: bool = True,
@@ -111,7 +158,7 @@ def get_build(
     "/{build_id}",
     responses={401: error_response, 404: error_response, 422: error_response},
 )
-@handle_exceptions
+@async_fastapi_endpoint_wrapper
 def delete_build(
     build_id: UUID,
     _: AuthContext = Security(authorize),
@@ -126,62 +173,3 @@ def delete_build(
         get_method=zen_store().get_build,
         delete_method=zen_store().delete_build,
     )
-
-
-if server_config().workload_manager_enabled:
-
-    @router.post(
-        "/{build_id}/runs",
-        responses={
-            401: error_response,
-            404: error_response,
-            422: error_response,
-        },
-    )
-    @handle_exceptions
-    def run_build(
-        build_id: UUID,
-        background_tasks: BackgroundTasks,
-        config: Optional[PipelineRunConfiguration] = None,
-        auth_context: AuthContext = Security(authorize),
-    ) -> PipelineRunResponse:
-        """Run a pipeline from a pipeline build.
-
-        Args:
-            build_id: The ID of the build.
-            background_tasks: Background tasks.
-            config: Configuration for the pipeline run.
-            auth_context: Authentication context.
-
-        Raises:
-            ValueError: If the build does not have an associated deployment.
-
-        Returns:
-            The created run.
-        """
-        from zenml.zen_server.pipeline_deployment.utils import (
-            run_pipeline,
-        )
-
-        build = verify_permissions_and_get_entity(
-            id=build_id, get_method=zen_store().get_build, hydrate=True
-        )
-
-        verify_permission(
-            resource_type=ResourceType.PIPELINE_RUN, action=Action.CREATE
-        )
-
-        if not build.template_deployment_id:
-            raise ValueError("Build does not have template deployment.")
-
-        deployment = zen_store().get_deployment(
-            deployment_id=build.template_deployment_id, hydrate=True
-        )
-        deployment.get_metadata().build = build
-
-        return run_pipeline(
-            deployment=deployment,
-            run_config=config,
-            background_tasks=background_tasks,
-            auth_context=auth_context,
-        )

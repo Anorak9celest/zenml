@@ -14,34 +14,51 @@
 """Models representing stacks."""
 
 import json
-from typing import TYPE_CHECKING, Any, ClassVar, Dict, List, Optional, Union
+from typing import (
+    TYPE_CHECKING,
+    Any,
+    ClassVar,
+    Dict,
+    List,
+    Optional,
+    Type,
+    TypeVar,
+    Union,
+)
 from uuid import UUID
 
-from pydantic import Field
-from sqlmodel import and_
+from pydantic import Field, field_validator, model_validator
 
 from zenml.constants import STR_FIELD_MAX_LENGTH
 from zenml.enums import StackComponentType
 from zenml.models.v2.base.base import BaseUpdate
 from zenml.models.v2.base.scoped import (
-    WorkspaceScopedFilter,
-    WorkspaceScopedRequest,
-    WorkspaceScopedResponse,
-    WorkspaceScopedResponseBody,
-    WorkspaceScopedResponseMetadata,
-    WorkspaceScopedResponseResources,
+    UserScopedFilter,
+    UserScopedRequest,
+    UserScopedResponse,
+    UserScopedResponseBody,
+    UserScopedResponseMetadata,
+    UserScopedResponseResources,
 )
-from zenml.models.v2.core.component import ComponentResponse
+from zenml.models.v2.misc.info_models import (
+    ComponentInfo,
+    ServiceConnectorInfo,
+)
 
 if TYPE_CHECKING:
     from sqlalchemy.sql.elements import ColumnElement
+
+    from zenml.models.v2.core.component import ComponentResponse
+    from zenml.zen_stores.schemas import BaseSchema
+
+    AnySchema = TypeVar("AnySchema", bound=BaseSchema)
 
 
 # ------------------ Request Model ------------------
 
 
-class StackRequest(WorkspaceScopedRequest):
-    """Request model for stacks."""
+class StackRequest(UserScopedRequest):
+    """Request model for stack creation."""
 
     name: str = Field(
         title="The name of the stack.", max_length=STR_FIELD_MAX_LENGTH
@@ -55,38 +72,86 @@ class StackRequest(WorkspaceScopedRequest):
         default=None,
         title="The path to the stack spec used for mlstacks deployments.",
     )
-    components: Optional[Dict[StackComponentType, List[UUID]]] = Field(
+    components: Dict[StackComponentType, List[Union[UUID, ComponentInfo]]] = (
+        Field(
+            title="The mapping for the components of the full stack registration.",
+            description="The mapping from component types to either UUIDs of "
+            "existing components or request information for brand new "
+            "components.",
+        )
+    )
+    environment: Optional[Dict[str, str]] = Field(
         default=None,
-        title="A mapping of stack component types to the actual"
-        "instances of components of this type.",
+        title="Environment variables to set when running on this stack.",
+    )
+    secrets: Optional[List[Union[UUID, str]]] = Field(
+        default=None,
+        title="Secrets to set as environment variables when running on this "
+        "stack.",
     )
     labels: Optional[Dict[str, Any]] = Field(
         default=None,
         title="The stack labels.",
     )
+    service_connectors: List[Union[UUID, ServiceConnectorInfo]] = Field(
+        default=[],
+        title="The service connectors dictionary for the full stack "
+        "registration.",
+        description="The UUID of an already existing service connector or "
+        "request information to create a service connector from "
+        "scratch.",
+    )
 
-    @property
-    def is_valid(self) -> bool:
-        """Check if the stack is valid.
+    @field_validator("components")
+    def _validate_components(
+        cls, value: Dict[StackComponentType, List[Union[UUID, ComponentInfo]]]
+    ) -> Dict[StackComponentType, List[Union[UUID, ComponentInfo]]]:
+        """Validate the components of the stack.
+
+        Args:
+            value: The components of the stack.
+
+        Raises:
+            ValueError: If the stack does not contain an orchestrator and
+                artifact store.
 
         Returns:
-            True if the stack is valid, False otherwise.
+            The components of the stack.
         """
-        if not self.components:
-            return False
-        return (
-            StackComponentType.ARTIFACT_STORE in self.components
-            and StackComponentType.ORCHESTRATOR in self.components
+        if value:
+            artifact_stores = value.get(StackComponentType.ARTIFACT_STORE, [])
+            orchestrators = value.get(StackComponentType.ORCHESTRATOR, [])
+
+            if orchestrators and artifact_stores:
+                return value
+
+        raise ValueError(
+            "Stack must contain at least an orchestrator and artifact store."
         )
 
+    @model_validator(mode="after")
+    def _validate_indexes_in_components(self) -> "StackRequest":
+        for components in self.components.values():
+            for component in components:
+                if isinstance(component, ComponentInfo):
+                    if component.service_connector_index is not None:
+                        if (
+                            component.service_connector_index < 0
+                            or component.service_connector_index
+                            >= len(self.service_connectors)
+                        ):
+                            raise ValueError(
+                                f"Service connector index "
+                                f"{component.service_connector_index} "
+                                "is out of range. Please provide a valid index "
+                                "referring to the position in the list of service "
+                                "connectors."
+                            )
+        return self
 
-class InternalStackRequest(StackRequest):
-    """Internal stack request model."""
 
-    user: Optional[UUID] = Field(  # type: ignore[assignment]
-        title="The id of the user that created this resource.",
-        default=None,
-    )
+class DefaultStackRequest(StackRequest):
+    """Internal stack request model used only for default stacks."""
 
 
 # ------------------ Update Model ------------------
@@ -114,23 +179,68 @@ class StackUpdate(BaseUpdate):
         "instances of components of this type.",
         default=None,
     )
+    environment: Optional[Dict[str, str]] = Field(
+        default=None,
+        title="Environment variables to set when running on this stack.",
+    )
     labels: Optional[Dict[str, Any]] = Field(
         default=None,
         title="The stack labels.",
     )
+    add_secrets: Optional[List[Union[UUID, str]]] = Field(
+        default=None,
+        title="New secrets to add to the stack.",
+    )
+    remove_secrets: Optional[List[Union[UUID, str]]] = Field(
+        default=None,
+        title="Secrets to remove from the stack.",
+    )
+
+    @field_validator("components")
+    def _validate_components(
+        cls,
+        value: Optional[
+            Dict[StackComponentType, List[Union[UUID, ComponentInfo]]]
+        ],
+    ) -> Optional[Dict[StackComponentType, List[Union[UUID, ComponentInfo]]]]:
+        """Validate the components of the stack.
+
+        Args:
+            value: The components of the stack.
+
+        Raises:
+            ValueError: If the stack does not contain an orchestrator and
+                artifact store.
+
+        Returns:
+            The components of the stack.
+        """
+        if value is None:
+            return None
+
+        if value:
+            artifact_stores = value.get(StackComponentType.ARTIFACT_STORE, [])
+            orchestrators = value.get(StackComponentType.ORCHESTRATOR, [])
+
+            if orchestrators and artifact_stores:
+                return value
+
+        raise ValueError(
+            "Stack must contain at least an orchestrator and artifact store."
+        )
 
 
 # ------------------ Response Model ------------------
 
 
-class StackResponseBody(WorkspaceScopedResponseBody):
+class StackResponseBody(UserScopedResponseBody):
     """Response body for stacks."""
 
 
-class StackResponseMetadata(WorkspaceScopedResponseMetadata):
+class StackResponseMetadata(UserScopedResponseMetadata):
     """Response metadata for stacks."""
 
-    components: Dict[StackComponentType, List[ComponentResponse]] = Field(
+    components: Dict[StackComponentType, List["ComponentResponse"]] = Field(
         title="A mapping of stack component types to the actual"
         "instances of components of this type."
     )
@@ -143,19 +253,30 @@ class StackResponseMetadata(WorkspaceScopedResponseMetadata):
         default=None,
         title="The path to the stack spec used for mlstacks deployments.",
     )
+    environment: Dict[str, str] = Field(
+        default={},
+        title="Environment variables to set when running on this stack.",
+    )
+    secrets: List[UUID] = Field(
+        default=[],
+        title="Secrets to set as environment variables when running on this "
+        "stack.",
+    )
     labels: Optional[Dict[str, Any]] = Field(
         default=None,
         title="The stack labels.",
     )
 
 
-class StackResponseResources(WorkspaceScopedResponseResources):
-    """Class for all resource models associated with the stack entity."""
+class StackResponseResources(UserScopedResponseResources):
+    """Response resources for stacks."""
 
 
 class StackResponse(
-    WorkspaceScopedResponse[
-        StackResponseBody, StackResponseMetadata, StackResponseResources
+    UserScopedResponse[
+        StackResponseBody,
+        StackResponseMetadata,
+        StackResponseResources,
     ]
 ):
     """Response model for stacks."""
@@ -199,7 +320,7 @@ class StackResponse(
             component_dict = dict(
                 name=component.name,
                 type=str(component.type),
-                flavor=component.flavor,
+                flavor=component.flavor_name,
             )
             configuration = json.loads(
                 component.get_metadata().model_dump_json(
@@ -226,7 +347,9 @@ class StackResponse(
             Dict of analytics metadata.
         """
         metadata = super().get_analytics_metadata()
-        metadata.update({ct: c[0].flavor for ct, c in self.components.items()})
+        metadata.update(
+            {ct: c[0].flavor_name for ct, c in self.components.items()}
+        )
 
         if self.labels is not None:
             metadata.update(
@@ -257,13 +380,33 @@ class StackResponse(
         return self.get_metadata().stack_spec_path
 
     @property
-    def components(self) -> Dict[StackComponentType, List[ComponentResponse]]:
+    def components(
+        self,
+    ) -> Dict[StackComponentType, List["ComponentResponse"]]:
         """The `components` property.
 
         Returns:
             the value of the property.
         """
         return self.get_metadata().components
+
+    @property
+    def environment(self) -> Dict[str, str]:
+        """The `environment` property.
+
+        Returns:
+            the value of the property.
+        """
+        return self.get_metadata().environment
+
+    @property
+    def secrets(self) -> List[UUID]:
+        """The `secrets` property.
+
+        Returns:
+            the value of the property.
+        """
+        return self.get_metadata().secrets
 
     @property
     def labels(self) -> Optional[Dict[str, Any]]:
@@ -278,21 +421,13 @@ class StackResponse(
 # ------------------ Filter Model ------------------
 
 
-class StackFilter(WorkspaceScopedFilter):
-    """Model to enable advanced filtering of all StackModels.
+class StackFilter(UserScopedFilter):
+    """Model to enable advanced stack filtering."""
 
-    The Stack Model needs additional scoping. As such the `_scope_user` field
-    can be set to the user that is doing the filtering. The
-    `generate_filter()` method of the baseclass is overwritten to include the
-    scoping.
-    """
-
-    # `component_id` refers to a relationship through a link-table
-    #  rather than a field in the db, hence it needs to be handled
-    #  explicitly
     FILTER_EXCLUDE_FIELDS: ClassVar[List[str]] = [
-        *WorkspaceScopedFilter.FILTER_EXCLUDE_FIELDS,
-        "component_id",  # This is a relationship, not a field
+        *UserScopedFilter.FILTER_EXCLUDE_FIELDS,
+        "component_id",
+        "component",
     ]
 
     name: Optional[str] = Field(
@@ -302,34 +437,35 @@ class StackFilter(WorkspaceScopedFilter):
     description: Optional[str] = Field(
         default=None, description="Description of the stack"
     )
-    workspace_id: Optional[Union[UUID, str]] = Field(
-        default=None,
-        description="Workspace of the stack",
-        union_mode="left_to_right",
-    )
-    user_id: Optional[Union[UUID, str]] = Field(
-        default=None,
-        description="User of the stack",
-        union_mode="left_to_right",
-    )
     component_id: Optional[Union[UUID, str]] = Field(
         default=None,
         description="Component in the stack",
         union_mode="left_to_right",
     )
+    component: Optional[Union[UUID, str]] = Field(
+        default=None, description="Name/ID of a component in the stack."
+    )
 
-    def get_custom_filters(self) -> List["ColumnElement[bool]"]:
+    def get_custom_filters(
+        self, table: Type["AnySchema"]
+    ) -> List["ColumnElement[bool]"]:
         """Get custom filters.
+
+        Args:
+            table: The query table.
 
         Returns:
             A list of custom filters.
         """
-        custom_filters = super().get_custom_filters()
+        from sqlmodel import and_
 
-        from zenml.zen_stores.schemas.stack_schemas import (
+        from zenml.zen_stores.schemas import (
+            StackComponentSchema,
             StackCompositionSchema,
             StackSchema,
         )
+
+        custom_filters = super().get_custom_filters(table)
 
         if self.component_id:
             component_id_filter = and_(
@@ -337,5 +473,16 @@ class StackFilter(WorkspaceScopedFilter):
                 StackCompositionSchema.component_id == self.component_id,
             )
             custom_filters.append(component_id_filter)
+
+        if self.component:
+            component_filter = and_(
+                StackCompositionSchema.stack_id == StackSchema.id,
+                StackCompositionSchema.component_id == StackComponentSchema.id,
+                self.generate_name_or_id_query_conditions(
+                    value=self.component,
+                    table=StackComponentSchema,
+                ),
+            )
+            custom_filters.append(component_filter)
 
         return custom_filters

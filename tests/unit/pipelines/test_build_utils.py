@@ -35,10 +35,10 @@ from zenml.models import (
     PipelineBuildResponse,
     PipelineBuildResponseBody,
     PipelineBuildResponseMetadata,
-    PipelineDeploymentBase,
-    PipelineDeploymentResponse,
+    PipelineSnapshotBase,
+    PipelineSnapshotResponse,
 )
-from zenml.new.pipelines import build_utils
+from zenml.pipelines import build_utils
 from zenml.stack import Stack
 from zenml.utils.pipeline_docker_image_builder import (
     PipelineDockerImageBuilder,
@@ -47,10 +47,14 @@ from zenml.utils.pipeline_docker_image_builder import (
 
 class StubCodeRepository(BaseCodeRepository):
     def __init__(
-        self, id: UUID = uuid4(), config=None, local_context=None
+        self,
+        id: UUID = uuid4(),
+        name: str = "",
+        config=None,
+        local_context=None,
     ) -> None:
         config = config or {}
-        super().__init__(id, config)
+        super().__init__(id, name, config)
         self._local_context = local_context
 
     def login(self) -> None:
@@ -70,13 +74,13 @@ class StubCodeRepository(BaseCodeRepository):
 class StubLocalRepositoryContext(LocalRepositoryContext):
     def __init__(
         self,
-        code_repository_id: UUID = uuid4(),
+        code_repository: "BaseCodeRepository" = StubCodeRepository(),
         root: str = ".",
         is_dirty: bool = False,
         has_local_changes: bool = False,
         commit: str = "",
     ) -> None:
-        super().__init__(code_repository_id=code_repository_id)
+        super().__init__(code_repository=code_repository)
         self._root = root
         self._is_dirty = is_dirty
         self._has_local_changes = has_local_changes
@@ -108,7 +112,7 @@ def test_build_is_skipped_when_not_required(mocker):
         return_value=("image_name", "", ""),
     )
 
-    deployment = PipelineDeploymentBase(
+    snapshot = PipelineSnapshotBase(
         run_name_template="",
         pipeline_configuration={"name": "pipeline"},
         step_configurations={},
@@ -116,7 +120,7 @@ def test_build_is_skipped_when_not_required(mocker):
         server_version="0.12.3",
     )
 
-    assert build_utils.create_pipeline_build(deployment=deployment) is None
+    assert build_utils.create_pipeline_build(snapshot=snapshot) is None
     mock_build_docker_image.assert_not_called()
 
 
@@ -142,7 +146,7 @@ def test_stack_with_container_registry_creates_non_local_build(
         return_value=("image_name", "", ""),
     )
 
-    deployment = PipelineDeploymentBase(
+    snapshot = PipelineSnapshotBase(
         run_name_template="",
         pipeline_configuration={"name": "pipeline"},
         step_configurations={},
@@ -150,7 +154,7 @@ def test_stack_with_container_registry_creates_non_local_build(
         server_version="0.12.3",
     )
 
-    build = build_utils.create_pipeline_build(deployment=deployment)
+    build = build_utils.create_pipeline_build(snapshot=snapshot)
     assert build.is_local is False
 
 
@@ -158,7 +162,7 @@ def test_build_uses_correct_settings(mocker, empty_pipeline):  # noqa: F811
     """Tests that the build settings and pipeline ID get correctly forwarded."""
     build_config = BuildConfiguration(
         key="key",
-        settings=DockerSettings(),
+        settings=DockerSettings(allow_download_from_artifact_store=False),
         step_name="step_name",
         entrypoint="entrypoint",
         extra_files={"key": "value"},
@@ -172,7 +176,7 @@ def test_build_uses_correct_settings(mocker, empty_pipeline):  # noqa: F811
         return_value=("image_name", "", ""),
     )
 
-    deployment = PipelineDeploymentBase(
+    snapshot = PipelineSnapshotBase(
         run_name_template="",
         pipeline_configuration={"name": "pipeline"},
         step_configurations={},
@@ -183,7 +187,7 @@ def test_build_uses_correct_settings(mocker, empty_pipeline):  # noqa: F811
     pipeline_instance = empty_pipeline
     pipeline_id = pipeline_instance.register().id
     build = build_utils.create_pipeline_build(
-        deployment=deployment, pipeline_id=pipeline_id
+        snapshot=snapshot, pipeline_id=pipeline_id
     )
 
     mock_build_docker_image.assert_called_with(
@@ -193,8 +197,8 @@ def test_build_uses_correct_settings(mocker, empty_pipeline):  # noqa: F811
         entrypoint=build_config.entrypoint,
         extra_files=build_config.extra_files,
         include_files=True,
-        download_files=False,
         code_repository=None,
+        extra_requirements_files={},
     )
     assert build.pipeline.id == pipeline_id
     assert build.is_local is True
@@ -209,8 +213,12 @@ def test_build_uses_correct_settings(mocker, empty_pipeline):  # noqa: F811
 def test_building_with_identical_keys_and_settings(mocker):
     """Tests that two build configurations with identical keys and identical
     settings don't lead to two builds."""
-    build_config_1 = BuildConfiguration(key="key", settings=DockerSettings())
-    build_config_2 = BuildConfiguration(key="key", settings=DockerSettings())
+    build_config_1 = BuildConfiguration(
+        key="key", settings=DockerSettings(image_tag="v1")
+    )
+    build_config_2 = BuildConfiguration(
+        key="key", settings=DockerSettings(image_tag="v1")
+    )
 
     mocker.patch.object(
         Stack,
@@ -223,7 +231,7 @@ def test_building_with_identical_keys_and_settings(mocker):
         return_value=("image_name", "", ""),
     )
 
-    deployment = PipelineDeploymentBase(
+    snapshot = PipelineSnapshotBase(
         run_name_template="",
         pipeline_configuration={"name": "pipeline"},
         step_configurations={},
@@ -231,11 +239,13 @@ def test_building_with_identical_keys_and_settings(mocker):
         server_version="0.12.3",
     )
 
-    build = build_utils.create_pipeline_build(deployment=deployment)
+    build = build_utils.create_pipeline_build(snapshot=snapshot)
     assert len(build.images) == 1
     assert build.images["key"].image == "image_name"
 
     mock_build_docker_image.assert_called_once()
+
+    assert mock_build_docker_image.call_args[1]["tag"] == "v1"
 
 
 def test_building_with_identical_keys_and_different_settings(mocker):
@@ -257,7 +267,7 @@ def test_building_with_identical_keys_and_different_settings(mocker):
         return_value=("image_name", "", ""),
     )
 
-    deployment = PipelineDeploymentBase(
+    snapshot = PipelineSnapshotBase(
         run_name_template="",
         pipeline_configuration={"name": "pipeline"},
         step_configurations={},
@@ -266,7 +276,7 @@ def test_building_with_identical_keys_and_different_settings(mocker):
     )
 
     with pytest.raises(RuntimeError):
-        build_utils.create_pipeline_build(deployment=deployment)
+        build_utils.create_pipeline_build(snapshot=snapshot)
 
 
 def test_building_with_different_keys_and_identical_settings(mocker):
@@ -286,7 +296,7 @@ def test_building_with_different_keys_and_identical_settings(mocker):
         return_value=("image_name", "", ""),
     )
 
-    deployment = PipelineDeploymentBase(
+    snapshot = PipelineSnapshotBase(
         run_name_template="",
         pipeline_configuration={"name": "pipeline"},
         step_configurations={},
@@ -294,17 +304,16 @@ def test_building_with_different_keys_and_identical_settings(mocker):
         server_version="0.12.3",
     )
 
-    build = build_utils.create_pipeline_build(deployment=deployment)
+    build = build_utils.create_pipeline_build(snapshot=snapshot)
     assert len(build.images) == 2
     assert build.images["key1"].image == "image_name"
     assert build.images["key2"].image == "image_name"
-
-    mock_build_docker_image.assert_called_once()
+    assert mock_build_docker_image.call_args[1]["tag"] == "pipeline-key1"
 
 
 def test_custom_build_verification(
     mocker,
-    sample_deployment_response_model,
+    sample_snapshot_response_model,
 ):
     """Tests the verification of a custom build."""
     mocker.patch.object(
@@ -320,10 +329,10 @@ def test_custom_build_verification(
         body=PipelineBuildResponseBody(
             created=datetime.now(),
             updated=datetime.now(),
-            user=sample_deployment_response_model.user,
+            user_id=sample_snapshot_response_model.user_id,
+            project_id=sample_snapshot_response_model.project_id,
         ),
         metadata=PipelineBuildResponseMetadata(
-            workspace=sample_deployment_response_model.workspace,
             images={"wrong_key": {"image": "docker_image_name"}},
             is_local=False,
             contains_code=True,
@@ -334,7 +343,7 @@ def test_custom_build_verification(
         # Image key missing
         build_utils.verify_custom_build(
             build=missing_image_build,
-            deployment=sample_deployment_response_model,
+            snapshot=sample_snapshot_response_model,
         )
 
     correct_build = missing_image_build.model_copy(deep=True)
@@ -349,7 +358,7 @@ def test_custom_build_verification(
         # All keys present
         build_utils.verify_custom_build(
             build=correct_build,
-            deployment=sample_deployment_response_model,
+            snapshot=sample_snapshot_response_model,
         )
 
     build_that_requires_download = missing_image_build.model_copy(deep=True)
@@ -366,11 +375,8 @@ def test_custom_build_verification(
             }
         )
     )
-
-    mocker.patch.object(
-        PipelineDeploymentBase,
-        "requires_code_download",
-        new_callable=mocker.PropertyMock,
+    mocker.patch(
+        "zenml.pipelines.build_utils.requires_download_from_code_repository",
         return_value=True,
     )
 
@@ -378,14 +384,14 @@ def test_custom_build_verification(
         # Missing code repo for download
         build_utils.verify_custom_build(
             build=build_that_requires_download,
-            deployment=sample_deployment_response_model,
+            snapshot=sample_snapshot_response_model,
         )
 
     code_repo = StubCodeRepository()
     with does_not_raise():
         build_utils.verify_custom_build(
             build=build_that_requires_download,
-            deployment=sample_deployment_response_model,
+            snapshot=sample_snapshot_response_model,
             code_repository=code_repo,
         )
 
@@ -424,22 +430,19 @@ def test_build_checksum_computation(mocker):
 
 
 def test_local_repo_verification(
-    mocker, sample_deployment_response_model: PipelineDeploymentResponse
+    mocker, sample_snapshot_response_model: PipelineSnapshotResponse
 ):
     """Test the local repo verification."""
-
-    deployment = PipelineDeploymentBase(
-        run_name_template=sample_deployment_response_model.run_name_template,
-        pipeline_configuration=sample_deployment_response_model.pipeline_configuration,
-        step_configurations=sample_deployment_response_model.step_configurations,
-        client_environment=sample_deployment_response_model.client_environment,
-        client_version=sample_deployment_response_model.client_version,
-        server_version=sample_deployment_response_model.server_version,
+    snapshot = PipelineSnapshotBase(
+        run_name_template=sample_snapshot_response_model.run_name_template,
+        pipeline_configuration=sample_snapshot_response_model.pipeline_configuration,
+        step_configurations=sample_snapshot_response_model.step_configurations,
+        client_environment=sample_snapshot_response_model.client_environment,
+        client_version=sample_snapshot_response_model.client_version,
+        server_version=sample_snapshot_response_model.server_version,
     )
-    mocker.patch.object(
-        PipelineDeploymentBase,
-        "requires_code_download",
-        new_callable=mocker.PropertyMock,
+    mocker.patch(
+        "zenml.pipelines.build_utils.requires_download_from_code_repository",
         return_value=False,
     )
 
@@ -449,24 +452,22 @@ def test_local_repo_verification(
     )
 
     assert not build_utils.verify_local_repository_context(
-        deployment=deployment, local_repo_context=None
+        snapshot=snapshot, local_repo_context=None
     )
     assert not build_utils.verify_local_repository_context(
-        deployment=deployment,
+        snapshot=snapshot,
         local_repo_context=context_with_local_changes,
     )
 
-    mocker.patch.object(
-        PipelineDeploymentBase,
-        "requires_code_download",
-        new_callable=mocker.PropertyMock,
+    mocker.patch(
+        "zenml.pipelines.build_utils.requires_download_from_code_repository",
         return_value=True,
     )
     mocker.patch.object(Stack, "get_docker_builds", return_value=[])
 
     # Code download not required if no build is necessary
     assert not build_utils.verify_local_repository_context(
-        deployment=deployment,
+        snapshot=snapshot,
         local_repo_context=None,
     )
 
@@ -478,29 +479,31 @@ def test_local_repo_verification(
     with pytest.raises(RuntimeError):
         # No local repo
         build_utils.verify_local_repository_context(
-            deployment=deployment,
+            snapshot=snapshot,
             local_repo_context=None,
         )
 
     with pytest.raises(RuntimeError):
         build_utils.verify_local_repository_context(
-            deployment=deployment,
+            snapshot=snapshot,
             local_repo_context=dirty_local_context,
         )
 
     with pytest.raises(RuntimeError):
         build_utils.verify_local_repository_context(
-            deployment=deployment,
+            snapshot=snapshot,
             local_repo_context=context_with_local_changes,
         )
 
     repo_response = CodeRepositoryResponse(
         id=uuid4(),
+        project_id=sample_snapshot_response_model.project_id,
         name="name",
         body=CodeRepositoryResponseBody(
+            user_id=sample_snapshot_response_model.user_id,
+            project_id=sample_snapshot_response_model.project_id,
             created=datetime.now(),
             updated=datetime.now(),
-            user=sample_deployment_response_model.user,
             source=Source(
                 module=StubCodeRepository.__module__,
                 attribute=StubCodeRepository.__name__,
@@ -508,7 +511,6 @@ def test_local_repo_verification(
             ),
         ),
         metadata=CodeRepositoryResponseMetadata(
-            workspace=sample_deployment_response_model.workspace,
             config={"key": "value"},
         ),
     )
@@ -520,13 +522,15 @@ def test_local_repo_verification(
         is_dirty=False, has_local_changes=False
     )
     code_repo = build_utils.verify_local_repository_context(
-        deployment=deployment,
+        snapshot=snapshot,
         local_repo_context=clean_local_context,
     )
     assert isinstance(code_repo, StubCodeRepository)
 
 
-def test_finding_existing_build(mocker, sample_deployment_response_model):
+def test_finding_existing_build(
+    mocker, sample_snapshot_response_model, remote_container_registry
+):
     """Tests finding an existing build."""
     mock_list_builds = mocker.patch(
         "zenml.client.Client.list_builds",
@@ -539,13 +543,13 @@ def test_finding_existing_build(mocker, sample_deployment_response_model):
         ),
     )
     mocker.patch(
-        "zenml.new.pipelines.build_utils.compute_build_checksum",
+        "zenml.pipelines.build_utils.compute_build_checksum",
         return_value="checksum",
     )
     mocker.patch.object(Stack, "get_docker_builds", return_value=[])
 
     build_utils.find_existing_build(
-        deployment=sample_deployment_response_model,
+        snapshot=sample_snapshot_response_model,
         code_repository=StubCodeRepository(),
     )
     # No required builds -> no need to look for build to reuse
@@ -559,14 +563,30 @@ def test_finding_existing_build(mocker, sample_deployment_response_model):
         ],
     )
 
-    build = build_utils.find_existing_build(
-        deployment=sample_deployment_response_model,
+    build_utils.find_existing_build(
+        snapshot=sample_snapshot_response_model,
         code_repository=StubCodeRepository(),
     )
+    # No container registry -> no non-local build to pull
+    mock_list_builds.assert_not_called()
+
+    mocker.patch.object(
+        Stack,
+        "container_registry",
+        new_callable=mocker.PropertyMock,
+        return_value=remote_container_registry,
+    )
+
+    build = build_utils.find_existing_build(
+        snapshot=sample_snapshot_response_model,
+        code_repository=StubCodeRepository(),
+    )
+
     mock_list_builds.assert_called_once_with(
         sort_by="desc:created",
         size=1,
         stack_id=Client().active_stack.id,
+        container_registry_id=remote_container_registry.id,
         is_local=False,
         contains_code=False,
         zenml_version=zenml.__version__,

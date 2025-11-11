@@ -13,14 +13,13 @@
 #  permissions and limitations under the License.
 """Entrypoint configuration for the Kubernetes master/orchestrator pod."""
 
-from typing import TYPE_CHECKING, List, Set
+from typing import TYPE_CHECKING, List, Optional, Set
 
 if TYPE_CHECKING:
     from uuid import UUID
 
-RUN_NAME_OPTION = "run_name"
-DEPLOYMENT_ID_OPTION = "deployment_id"
-NAMESPACE_OPTION = "kubernetes_namespace"
+SNAPSHOT_ID_OPTION = "snapshot_id"
+RUN_ID_OPTION = "run_id"
 
 
 class KubernetesOrchestratorEntrypointConfiguration:
@@ -34,9 +33,7 @@ class KubernetesOrchestratorEntrypointConfiguration:
             Entrypoint options.
         """
         options = {
-            RUN_NAME_OPTION,
-            DEPLOYMENT_ID_OPTION,
-            NAMESPACE_OPTION,
+            SNAPSHOT_ID_OPTION,
         }
         return options
 
@@ -57,27 +54,25 @@ class KubernetesOrchestratorEntrypointConfiguration:
     @classmethod
     def get_entrypoint_arguments(
         cls,
-        run_name: str,
-        deployment_id: "UUID",
-        kubernetes_namespace: str,
+        snapshot_id: "UUID",
+        run_id: Optional["UUID"] = None,
     ) -> List[str]:
         """Gets all arguments that the entrypoint command should be called with.
 
         Args:
-            run_name: Name of the ZenML run.
-            deployment_id: ID of the deployment.
-            kubernetes_namespace: Name of the Kubernetes namespace.
+            snapshot_id: ID of the snapshot.
+            run_id: Optional ID of the pipeline run. Not set for scheduled runs.
 
         Returns:
             List of entrypoint arguments.
         """
         args = [
-            f"--{RUN_NAME_OPTION}",
-            run_name,
-            f"--{DEPLOYMENT_ID_OPTION}",
-            str(deployment_id),
-            f"--{NAMESPACE_OPTION}",
-            kubernetes_namespace,
+            f"--{SNAPSHOT_ID_OPTION}",
+            str(snapshot_id),
         ]
+
+        if run_id:
+            args.append(f"--{RUN_ID_OPTION}")
+            args.append(str(run_id))
 
         return args

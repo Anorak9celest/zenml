@@ -20,6 +20,7 @@ services:
 
 """
 
+import base64
 import datetime
 import json
 import os
@@ -77,6 +78,7 @@ from zenml.service_connectors.service_connector import (
 from zenml.utils.enum_utils import StrEnum
 from zenml.utils.pydantic_utils import before_validator_handler
 from zenml.utils.secret_utils import PlainSerializedSecretStr
+from zenml.utils.time_utils import to_utc_timezone, utc_now
 
 logger = get_logger(__name__)
 
@@ -89,7 +91,7 @@ class GCPUserAccountCredentials(AuthenticationConfig):
     """GCP user account credentials."""
 
     user_account_json: PlainSerializedSecretStr = Field(
-        title="GCP User Account Credentials JSON",
+        title="GCP User Account Credentials JSON optionally base64 encoded.",
     )
 
     generate_temporary_tokens: bool = Field(
@@ -113,9 +115,24 @@ class GCPUserAccountCredentials(AuthenticationConfig):
 
         Returns:
             The validated configuration values.
+
+        Raises:
+            ValueError: If the user account credentials JSON is invalid.
         """
-        if isinstance(data.get("user_account_json"), dict):
+        user_account_json = data.get("user_account_json")
+        if isinstance(user_account_json, dict):
             data["user_account_json"] = json.dumps(data["user_account_json"])
+        elif isinstance(user_account_json, str):
+            # Check if the user account JSON is base64 encoded and decode it
+            if re.match(r"^[A-Za-z0-9+/=]+$", user_account_json):
+                try:
+                    data["user_account_json"] = base64.b64decode(
+                        user_account_json
+                    ).decode("utf-8")
+                except Exception as e:
+                    raise ValueError(
+                        f"Failed to decode base64 encoded user account JSON: {e}"
+                    )
         return data
 
     @field_validator("user_account_json")
@@ -153,7 +170,7 @@ class GCPUserAccountCredentials(AuthenticationConfig):
         if missing_fields:
             raise ValueError(
                 f"GCP user account credentials JSON is missing required "
-                f'fields: {", ".join(list(missing_fields))}'
+                f"fields: {', '.join(list(missing_fields))}"
             )
 
         if user_account_info["type"] != "authorized_user":
@@ -170,7 +187,7 @@ class GCPServiceAccountCredentials(AuthenticationConfig):
     """GCP service account credentials."""
 
     service_account_json: PlainSerializedSecretStr = Field(
-        title="GCP Service Account Key JSON",
+        title="GCP Service Account Key JSON optionally base64 encoded.",
     )
 
     generate_temporary_tokens: bool = Field(
@@ -194,11 +211,27 @@ class GCPServiceAccountCredentials(AuthenticationConfig):
 
         Returns:
             The validated configuration values.
+
+        Raises:
+            ValueError: If the service account credentials JSON is invalid.
         """
-        if isinstance(data.get("service_account_json"), dict):
+        service_account_json = data.get("service_account_json")
+        if isinstance(service_account_json, dict):
             data["service_account_json"] = json.dumps(
                 data["service_account_json"]
             )
+        elif isinstance(service_account_json, str):
+            # Check if the service account JSON is base64 encoded and decode it
+            if re.match(r"^[A-Za-z0-9+/=]+$", service_account_json):
+                try:
+                    data["service_account_json"] = base64.b64decode(
+                        service_account_json
+                    ).decode("utf-8")
+                except Exception as e:
+                    raise ValueError(
+                        f"Failed to decode base64 encoded service account JSON: {e}"
+                    )
+
         return data
 
     @field_validator("service_account_json")
@@ -244,7 +277,7 @@ class GCPServiceAccountCredentials(AuthenticationConfig):
         if missing_fields:
             raise ValueError(
                 f"GCP service account credentials JSON is missing required "
-                f'fields: {", ".join(list(missing_fields))}'
+                f"fields: {', '.join(list(missing_fields))}"
             )
 
         if service_account_info["type"] != "service_account":
@@ -261,7 +294,7 @@ class GCPExternalAccountCredentials(AuthenticationConfig):
     """GCP external account credentials."""
 
     external_account_json: PlainSerializedSecretStr = Field(
-        title="GCP External Account JSON",
+        title="GCP External Account JSON optionally base64 encoded.",
     )
 
     generate_temporary_tokens: bool = Field(
@@ -285,11 +318,27 @@ class GCPExternalAccountCredentials(AuthenticationConfig):
 
         Returns:
             The validated configuration values.
+
+        Raises:
+            ValueError: If the external account credentials JSON is invalid.
         """
-        if isinstance(data.get("external_account_json"), dict):
+        external_account_json = data.get("external_account_json")
+        if isinstance(external_account_json, dict):
             data["external_account_json"] = json.dumps(
                 data["external_account_json"]
             )
+        elif isinstance(external_account_json, str):
+            # Check if the external account JSON is base64 encoded and decode it
+            if re.match(r"^[A-Za-z0-9+/=]+$", external_account_json):
+                try:
+                    data["external_account_json"] = base64.b64decode(
+                        external_account_json
+                    ).decode("utf-8")
+                except Exception as e:
+                    raise ValueError(
+                        f"Failed to decode base64 encoded external account JSON: {e}"
+                    )
+
         return data
 
     @field_validator("external_account_json")
@@ -328,7 +377,7 @@ class GCPExternalAccountCredentials(AuthenticationConfig):
         if missing_fields:
             raise ValueError(
                 f"GCP external account credentials JSON is missing required "
-                f'fields: {", ".join(list(missing_fields))}'
+                f"fields: {', '.join(list(missing_fields))}"
             )
 
         if external_account_info["type"] != "external_account":
@@ -389,7 +438,7 @@ class GCPUserAccountConfig(GCPBaseProjectIDConfig, GCPUserAccountCredentials):
 class GCPServiceAccountConfig(GCPBaseConfig, GCPServiceAccountCredentials):
     """GCP service account configuration."""
 
-    _project_id: Optional[str] = None
+    project_id: Optional[str] = None
 
     @property
     def gcp_project_id(self) -> str:
@@ -401,14 +450,14 @@ class GCPServiceAccountConfig(GCPBaseConfig, GCPServiceAccountCredentials):
         Returns:
             The GCP project ID.
         """
-        if self._project_id is None:
-            self._project_id = json.loads(
+        if self.project_id is None:
+            self.project_id = json.loads(
                 self.service_account_json.get_secret_value()
             )["project_id"]
             # Guaranteed by the field validator
-            assert self._project_id is not None
+            assert self.project_id is not None
 
-        return self._project_id
+        return self.project_id
 
 
 class GCPExternalAccountConfig(
@@ -448,6 +497,108 @@ class GCPAuthenticationMethods(StrEnum):
     IMPERSONATION = "impersonation"
 
 
+try:
+    from google.auth.aws import _DefaultAwsSecurityCredentialsSupplier
+
+    class ZenMLAwsSecurityCredentialsSupplier(
+        _DefaultAwsSecurityCredentialsSupplier  # type: ignore[misc]
+    ):
+        """An improved version of the GCP external account credential supplier for AWS.
+
+        The original GCP external account credential supplier only provides
+        rudimentary support for extracting AWS credentials from environment
+        variables or the AWS metadata service. This version improves on that by
+        using the boto3 library itself (if available), which uses the entire range
+        of implicit authentication features packed into it.
+
+        Without this improvement, `sts.AssumeRoleWithWebIdentity` authentication is
+        not supported for EKS pods and the EC2 attached role credentials are
+        used instead (see: https://medium.com/@derek10cloud/gcp-workload-identity-federation-doesnt-yet-support-eks-irsa-in-aws-a3c71877671a).
+        """
+
+        def get_aws_security_credentials(
+            self, context: Any, request: Any
+        ) -> gcp_aws.AwsSecurityCredentials:
+            """Get the security credentials from the local environment.
+
+            This method is a copy of the original method from the
+            `google.auth.aws._DefaultAwsSecurityCredentialsSupplier` class. It has
+            been modified to use the boto3 library to extract the AWS credentials
+            from the local environment.
+
+            Args:
+                context: The context to use to get the security credentials.
+                request: The request to use to get the security credentials.
+
+            Returns:
+                The AWS temporary security credentials.
+            """
+            try:
+                import boto3
+
+                session = boto3.Session()
+                credentials = session.get_credentials()
+                if credentials is not None:
+                    creds = credentials.get_frozen_credentials()
+                    return gcp_aws.AwsSecurityCredentials(
+                        creds.access_key,
+                        creds.secret_key,
+                        creds.token,
+                    )
+            except ImportError:
+                pass
+
+            logger.debug(
+                "Failed to extract AWS credentials from the local environment "
+                "using the boto3 library. Falling back to the original "
+                "implementation."
+            )
+
+            return super().get_aws_security_credentials(context, request)
+
+        def get_aws_region(self, context: Any, request: Any) -> str:
+            """Get the AWS region from the local environment.
+
+            This method is a copy of the original method from the
+            `google.auth.aws._DefaultAwsSecurityCredentialsSupplier` class. It has
+            been modified to use the boto3 library to extract the AWS
+            region from the local environment.
+
+            Args:
+                context: The context to use to get the security credentials.
+                request: The request to use to get the security credentials.
+
+            Returns:
+                The AWS region.
+            """
+            try:
+                import boto3
+
+                session = boto3.Session()
+                if session.region_name:
+                    return session.region_name  # type: ignore[no-any-return]
+            except ImportError:
+                pass
+
+            logger.debug(
+                "Failed to extract AWS region from the local environment "
+                "using the boto3 library. Falling back to the original "
+                "implementation."
+            )
+
+            return super().get_aws_region(  # type: ignore[no-any-return]
+                context, request
+            )
+
+except ImportError:
+    # The `google.auth.aws._DefaultAwsSecurityCredentialsSupplier`
+    # class has been introduced in the `google-auth` library version 2.29.0.
+    # Before that, the AWS logic was part of the `google.auth.awsCredentials`
+    # class itself.
+    ZenMLAwsSecurityCredentialsSupplier = None  # type: ignore[assignment,misc]
+    pass
+
+
 class ZenMLGCPAWSExternalAccountCredentials(gcp_aws.Credentials):  # type: ignore[misc]
     """An improved version of the GCP external account credential for AWS.
 
@@ -460,6 +611,13 @@ class ZenMLGCPAWSExternalAccountCredentials(gcp_aws.Credentials):  # type: ignor
     Without this improvement, `sts.AssumeRoleWithWebIdentity` authentication is
     not supported for EKS pods and the EC2 attached role credentials are
     used instead (see: https://medium.com/@derek10cloud/gcp-workload-identity-federation-doesnt-yet-support-eks-irsa-in-aws-a3c71877671a).
+
+    IMPORTANT: subclassing this class only works with the `google-auth` library
+    version lower than 2.29.0. Starting from version 2.29.0, the AWS logic
+    has been moved to a separate `google.auth.aws._DefaultAwsSecurityCredentialsSupplier`
+    class that can be subclassed instead and supplied as the
+    `aws_security_credentials_supplier` parameter to the
+    `google.auth.aws.Credentials` class.
     """
 
     def _get_security_credentials(
@@ -491,12 +649,14 @@ class ZenMLGCPAWSExternalAccountCredentials(gcp_aws.Credentials):  # type: ignor
                     "secret_access_key": creds.secret_key,
                     "security_token": creds.token,
                 }
-        except Exception:
-            logger.debug(
-                "Failed to extract AWS credentials from the local environment "
-                "using the boto3 library. Falling back to the original "
-                "implementation."
-            )
+        except ImportError:
+            pass
+
+        logger.debug(
+            "Failed to extract AWS credentials from the local environment "
+            "using the boto3 library. Falling back to the original "
+            "implementation."
+        )
 
         return super()._get_security_credentials(  # type: ignore[no-any-return]
             request, imdsv2_session_token
@@ -638,7 +798,8 @@ connector will distribute the service account credentials JSON to clients
 instead (not recommended).
 
 A GCP project is required and the connector may only be used to access GCP
-resources in the specified project.
+resources in the specified project. If the `project_id` is not provided, the
+connector will use the one extracted from the service account key JSON.
 
 If you already have the GOOGLE_APPLICATION_CREDENTIALS environment variable
 configured to point to a service account key JSON file, it will be automatically
@@ -965,10 +1126,9 @@ class GCPServiceConnector(ServiceConnector):
                 return session, None
 
             # Refresh expired sessions
-            now = datetime.datetime.now(datetime.timezone.utc)
-            expires_at = expires_at.replace(tzinfo=datetime.timezone.utc)
+
             # check if the token expires in the near future
-            if expires_at > now + datetime.timedelta(
+            if expires_at > utc_now(tz_aware=expires_at) + datetime.timedelta(
                 minutes=GCP_SESSION_EXPIRATION_BUFFER
             ):
                 return session, expires_at
@@ -1040,14 +1200,13 @@ class GCPServiceConnector(ServiceConnector):
         elif auth_method == GCPAuthenticationMethods.OAUTH2_TOKEN:
             assert isinstance(cfg, GCPOAuth2TokenConfig)
 
-            expires_at = self.expires_at
-            if expires_at:
-                # Remove the UTC timezone
-                expires_at = expires_at.replace(tzinfo=None)
-
             credentials = gcp_credentials.Credentials(
                 token=cfg.token.get_secret_value(),
-                expiry=expires_at,
+                # Currently GCP expects the expiry to be a timezone-naive
+                # UTC datetime.
+                expiry=to_utc_timezone(self.expires_at).replace(tzinfo=None)
+                if self.expires_at
+                else None,
                 scopes=scopes,
             )
 
@@ -1078,6 +1237,12 @@ class GCPServiceConnector(ServiceConnector):
                     account_info.get("subject_token_type")
                     == _AWS_SUBJECT_TOKEN_TYPE
                 ):
+                    if ZenMLAwsSecurityCredentialsSupplier is not None:
+                        account_info["aws_security_credentials_supplier"] = (
+                            ZenMLAwsSecurityCredentialsSupplier(
+                                account_info.pop("credential_source"),
+                            )
+                        )
                     credentials = (
                         ZenMLGCPAWSExternalAccountCredentials.from_info(
                             account_info,
@@ -1137,10 +1302,12 @@ class GCPServiceConnector(ServiceConnector):
                 )
 
         if credentials.expiry:
-            # Add the UTC timezone to the expiration time
-            expires_at = credentials.expiry.replace(
-                tzinfo=datetime.timezone.utc
-            )
+            expires_at = credentials.expiry
+
+        if expires_at:
+            # Add the UTC timezone to the expiration time, if it's not already
+            # set
+            expires_at = to_utc_timezone(expires_at)
 
         return credentials, expires_at
 

@@ -1,0 +1,239 @@
+---
+name: release-prepare
+on:
+  push:
+    branches:
+      - "misc/prepare-release-*"
+env:
+  ZENML_ANALYTICS_OPT_IN: false
+  GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+jobs:
+  fetch-versions:
+    if: github.repository == 'zenml-io/zenml'
+    runs-on: ubuntu-latest
+    outputs:
+      old_version: ${{ steps.old-version.outputs.old_version }}
+      new_version: ${{ steps.new-version.outputs.new_version }}
+    steps:
+      # Extract the version
+      - name: Extract version from branch name
+        id: new-version
+        run: |
+          BRANCH_NAME=${GITHUB_REF#refs/heads/}
+          NEW_VERSION=${BRANCH_NAME#misc/prepare-release-}
+          echo "new_version=$NEW_VERSION" >> $GITHUB_OUTPUT
+      # Check out main to get the old version
+      - name: Checkout code
+        id: checkout-code
+        uses: actions/checkout@v4.2.2
+        with:
+          ref: main
+      # Configure Git
+      - name: Configure git
+        shell: bash
+        run: |
+          git config --global user.email "info@zenml.io"
+          git config --global user.name "ZenML GmbH"
+      # Extract the old version
+      - name: Fetch the old version
+        id: old-version
+        run: |
+          LATEST_RELEASE=$(gh release view --json tagName,publishedAt -q '{tag: .tagName, date: .publishedAt}')
+          OLD_VERSION=$(echo "$LATEST_RELEASE" | jq -r .tag)
+          echo "old_version=$OLD_VERSION" >> $GITHUB_OUTPUT
+  prepare-changes:
+    needs: fetch-versions
+    runs-on: ubuntu-latest
+    steps:
+      # Check out the code
+      - name: Checkout code
+        uses: actions/checkout@v4.2.2
+      # Configure Git
+      - name: Configure git
+        shell: bash
+        run: |
+          git config --global user.email "info@zenml.io"
+          git config --global user.name "ZenML GmbH"
+      # Validate the new version
+      - name: Validate new version
+        shell: bash
+        run: |
+          scripts/validate-new-version.sh ${{ needs.fetch-versions.outputs.new_version }}
+      # Set up Python
+      - name: Set up Python
+        uses: actions/setup-python@v5.3.0
+        with:
+          python-version: '3.12'
+      # Install ZenML
+      - name: Install ZenML and dependencies
+        shell: bash
+        run: |
+          scripts/install-zenml-dev.sh --system --integrations "no"
+          uv pip list
+          uv pip check || true
+      # Alembic migration file
+      - name: Run Alembic merge
+        # Only run this part once when the release branch is created
+        if: ${{ github.event.created }}
+        shell: bash
+        run: |
+          alembic merge -m "Release" heads --rev-id ${{ needs.fetch-versions.outputs.new_version }}
+          scripts/format.sh
+          git add src/zenml/zen_stores/migrations/versions
+      # Update the README, pyproject.toml, version and helm files
+      - name: Update main files
+        run: |
+          sed -i "s/${{ needs.fetch-versions.outputs.old_version }}/${{ needs.fetch-versions.outputs.new_version }}/g" README.md pyproject.toml src/zenml/VERSION helm/Chart.yaml helm/README.md
+          git add README.md pyproject.toml src/zenml/VERSION helm/Chart.yaml helm/README.md
+      # Update the Quickstart references
+      - name: Replace the references in the quickstart example
+        run: |
+          find examples/quickstart -type f \( -name "*.txt" -o -name "*.yaml" -o -name "*.ipynb" \) -print0 | 
+          while IFS= read -r -d '' file; do
+            if [[ "$file" == *.ipynb ]]; then
+              # For .ipynb files, we need to parse JSON
+              jq --arg OLD ${{ needs.fetch-versions.outputs.old_version }} --arg NEW ${{ needs.fetch-versions.outputs.new_version }} \
+                '(.cells[] | select(.cell_type == "code") | .source) |= map(gsub($OLD; $NEW))' "$file" > "${file}.tmp" && mv "${file}.tmp" "$file"
+            else
+              # For .txt and .yaml files, we can use sed
+              sed -i "s/${{ needs.fetch-versions.outputs.old_version }}/${{ needs.fetch-versions.outputs.new_version }}/g" "$file"
+            fi
+          done
+          git add examples/quickstart
+      # Generate and append release notes
+      - name: Generate release notes
+        # Only run this part once when the release branch is created
+        if: ${{ github.event.created }}
+        run: |
+          RELEASE_NOTES=$(gh api repos/${{ github.repository }}/releases/generate-notes -F tag_name=${{ needs.fetch-versions.outputs.new_version }} -F target_commitish=${{ github.sha }} -F previous_tag_name=${{ needs.fetch-versions.outputs.old_version }} | jq -r '.body')
+          {
+          head -n 1 RELEASE_NOTES.md
+          echo ""
+          echo "# ${{ needs.fetch-versions.outputs.new_version }}"
+          echo ""
+          echo "$RELEASE_NOTES"
+          echo ""
+          tail -n +2 RELEASE_NOTES.md
+          } > RELEASE_NOTES.md.new && mv RELEASE_NOTES.md.new RELEASE_NOTES.md
+          git add RELEASE_NOTES.md
+      # Push the changes
+      - name: Push the changes
+        run: |
+          if git diff --cached --quiet; then
+            echo "No changes to commit"
+          else
+            git commit -m "Adding the new version to the necessary files."
+            git push origin HEAD:${{ github.ref }}
+          fi
+      # Create a PR
+      - name: Create a pull request
+        # Only run this part once when the release branch is created
+        if: ${{ github.event.created }}
+        run: |
+          gh pr create --base "develop" --head "${{ github.ref }}" \
+            --title "Prepare release ${{ needs.fetch-versions.outputs.new_version }}" \
+            --body "This PR prepares the release of version ${{ needs.fetch-versions.outputs.new_version }}." \
+            --label "internal" --label "python" --label "run-slow-ci" --label "release"
+      # Send a message to Discord to alert everyone for the release
+      - name: Send message to Discord
+        # Only run this part once when the release branch is created
+        if: ${{ github.event.created }}
+        run: |
+          curl -X POST \
+           -H "Content-Type: application/json" \
+           -d '{
+             "content": "${{ github.event.sender.login }} is preparing the release .\n\n@growth and @product, please do not merge anything to develop until the process is completed.",
+             "thread_name": "Preparing release: ${{ needs.fetch-versions.outputs.new_version }}"
+           }' \
+           ${{ secrets.DISCORD_WEBHOOK_RELEASE }}
+  build-test-images:
+    runs-on: ubuntu-latest
+    needs: [fetch-versions, prepare-changes]
+    permissions:
+      contents: read
+      id-token: write
+    steps:
+      # Check out the prepare-release branch
+      - name: Checkout code
+        uses: actions/checkout@v4.2.2
+      # Sign in to Google
+      - uses: google-github-actions/setup-gcloud@v0
+        with:
+          service_account_email: ${{ secrets.GCP_CLOUDBUILD_EMAIL }}
+          service_account_key: ${{ secrets.GCP_CLOUDBUILD_KEY }}
+          project_id: ${{ secrets.GCP_CLOUDBUILD_PROJECT }}
+      # Submit the Cloudbuild job
+      - name: Build docker images
+        run: |
+          gcloud builds submit \
+            --quiet \
+            --config=release-cloudbuild-preparation.yaml \
+            --substitutions=_ZENML_NEW_VERSION=${{ needs.fetch-versions.outputs.new_version }}
+  setup-prep-release-tenant:
+    needs: [fetch-versions, build-test-images]
+    env:
+      ZENML_STORE_URL: ${{ secrets.RELEASE_TENANT_URL }}
+      ZENML_STORE_API_KEY: ${{ secrets.RELEASE_TENANT_SERVICE_ACCOUNT_KEY }}
+    runs-on: ubuntu-latest
+    steps:
+      # Check out the code
+      - name: Checkout code
+        uses: actions/checkout@v4.2.2
+      # Setting up Python
+      - name: Set up Python
+        uses: actions/setup-python@v2
+        with:
+          python-version: '3.12'
+      # Install requests
+      - name: Install dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install requests
+      # Deactivate and redeploy the tenant
+      - name: Run tenant management script
+        env:
+          CLOUD_STAGING_CLIENT_ID: ${{ secrets.CLOUD_STAGING_CLIENT_ID }}
+          CLOUD_STAGING_CLIENT_SECRET: ${{ secrets.CLOUD_STAGING_CLIENT_SECRET }}
+          RELEASE_TENANT_ID: ${{ secrets.RELEASE_TENANT_ID }}
+          ZENML_NEW_VERSION: ${{ needs.fetch-versions.outputs.new_version }}
+        run: python scripts/redeploy-release-prep-tenant.py
+  run_quickstart_pipelines:
+    needs: [fetch-versions, setup-prep-release-tenant]
+    runs-on: ubuntu-latest
+    env:
+      ZENML_STORE_URL: ${{ secrets.RELEASE_TENANT_URL }}
+      ZENML_STORE_API_KEY: ${{ secrets.RELEASE_TENANT_SERVICE_ACCOUNT_KEY }}
+      OPENAI_API_KEY: ${{ secrets.OPENAI_API_KEY }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - cloud: aws
+          - cloud: azure
+          - cloud: gcp
+    steps:
+      - name: Maximize space for Docker
+        uses: easimon/maximize-build-space@v10
+        with:
+          root-reserve-mb: 20000
+          swap-size-mb: 1024
+          remove-dotnet: 'true'
+          remove-android: 'true'
+          remove-haskell: 'true'
+          build-mount-path: /var/lib/docker/
+      - name: Reload Docker
+        run: sudo systemctl restart docker
+      - name: Checkout code
+        uses: actions/checkout@v4.2.2
+      - name: Set up Python
+        uses: actions/setup-python@v2
+        with:
+          python-version: '3.12'
+      - name: Install ZenML
+        run: |
+          scripts/install-zenml-dev.sh --system --integrations "no"
+      - name: Run Quickstart release flow on ${{ matrix.cloud }}
+        run: |
+          scripts/qs_run_release_flow.sh \
+            --cloud "${{ matrix.cloud }}" \
+            --new-version "${{ needs.fetch-versions.outputs.new_version }}"

@@ -13,6 +13,7 @@
 #  permissions and limitations under the License.
 
 from typing import TYPE_CHECKING, Tuple
+from unittest.mock import patch
 from uuid import uuid4
 
 import pytest
@@ -25,6 +26,7 @@ from tests.integration.functional.zen_stores.utils import (
 from zenml import pipeline, step
 from zenml.artifacts.artifact_config import ArtifactConfig
 from zenml.config.schedule import Schedule
+from zenml.enums import ArtifactType
 from zenml.model.model import Model
 
 if TYPE_CHECKING:
@@ -48,22 +50,29 @@ def initialize_store():
 
 @pytest.fixture
 def clean_client_with_run(clean_client, connected_two_step_pipeline):
-    """Fixture to get a clean workspace with an existing pipeline run in it."""
+    """Fixture to get a clean client with an existing pipeline run in it."""
     connected_two_step_pipeline(
-        step_1=constant_int_output_test_step(),
-        step_2=int_plus_one_test_step(),
-    ).run()
+        step_1=constant_int_output_test_step,
+        step_2=int_plus_one_test_step,
+    )()
     return clean_client
 
 
 @pytest.fixture
-def clean_client_with_scheduled_run(clean_client, connected_two_step_pipeline):
-    """Fixture to get a clean workspace with an existing scheduled run in it."""
+def clean_client_with_scheduled_run(
+    clean_client: "Client", connected_two_step_pipeline
+):
+    """Fixture to get a clean client with an existing scheduled run in it."""
     schedule = Schedule(cron_expression="*/5 * * * *")
-    connected_two_step_pipeline(
-        step_1=constant_int_output_test_step(),
-        step_2=int_plus_one_test_step(),
-    ).run(schedule=schedule)
+
+    with patch(
+        "zenml.orchestrators.base_orchestrator.BaseOrchestratorConfig.is_schedulable",
+        new_callable=lambda: True,
+    ):
+        connected_two_step_pipeline(
+            step_1=constant_int_output_test_step,
+            step_2=int_plus_one_test_step,
+        ).with_options(schedule=schedule)()
     return clean_client
 
 
@@ -77,16 +86,16 @@ def step_1() -> Annotated[int, NAME + "a"]:
 
 
 @step
-def step_2() -> (
-    Tuple[
-        Annotated[
-            int, ArtifactConfig(name=NAME + "b", is_model_artifact=True)
-        ],
-        Annotated[
-            int, ArtifactConfig(name=NAME + "c", is_deployment_artifact=True)
-        ],
-    ]
-):
+def step_2() -> Tuple[
+    Annotated[
+        int,
+        ArtifactConfig(name=NAME + "b", artifact_type=ArtifactType.MODEL),
+    ],
+    Annotated[
+        int,
+        ArtifactConfig(name=NAME + "c", artifact_type=ArtifactType.SERVICE),
+    ],
+]:
     return 2, 3
 
 
@@ -94,13 +103,13 @@ def step_2() -> (
     model=Model(name=NAME),
     name=NAME,
 )
-def pipeline():
+def pipeline_():
     step_1()
     step_2()
 
 
 @pytest.fixture
 def clean_client_with_models(clean_client: "Client"):
-    """Fixture to get a clean workspace with an existing pipeline run in it."""
-    pipeline.with_options(run_name=NAME)()
+    """Fixture to get a clean client with an existing pipeline run in it."""
+    pipeline_.with_options(run_name=NAME)()
     return clean_client

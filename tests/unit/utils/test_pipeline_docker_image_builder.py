@@ -12,6 +12,7 @@
 #  or implied. See the License for the specific language governing
 #  permissions and limitations under the License.
 
+import subprocess
 from pathlib import Path
 
 import pytest
@@ -31,7 +32,6 @@ def test_check_user_is_set():
         PipelineDockerImageBuilder._generate_zenml_pipeline_dockerfile(
             "image:tag",
             docker_settings,
-            download_files=False,
         )
     )
     assert "USER" not in generated_dockerfile
@@ -41,24 +41,67 @@ def test_check_user_is_set():
         PipelineDockerImageBuilder._generate_zenml_pipeline_dockerfile(
             "image:tag",
             docker_settings,
-            download_files=False,
         )
     )
     assert "USER test_user" in generated_dockerfile
 
 
-def test_requirements_file_generation(
-    mocker, local_stack, tmp_path: Path, sample_hub_plugin_response_model
-):
+def test_requirements_file_generation(mocker, local_stack, tmp_path: Path):
     """Tests that the requirements get included in the correct order and only when configured."""
     mocker.patch("subprocess.check_output", return_value=b"local_requirements")
+
+    mocker.patch(
+        "subprocess.run",
+        return_value=subprocess.CompletedProcess(
+            args="", returncode=0, stdout=b"pyproject_requirements"
+        ),
+    )
     mocker.patch.object(
         local_stack, "requirements", return_value={"stack_requirements"}
     )
-    mocker.patch(
-        "zenml._hub.client.HubClient.get_plugin",
-        return_value=sample_hub_plugin_response_model,
+    from zenml.utils import source_utils
+
+    mocker.patch.object(
+        source_utils,
+        "get_source_root",
+        return_value=str(tmp_path),
     )
+
+    # Nothing specified -> No requirements
+    settings = DockerSettings(
+        install_stack_requirements=False,
+    )
+    files = PipelineDockerImageBuilder.gather_requirements_files(
+        settings, stack=local_stack
+    )
+    assert len(files) == 0
+
+    # Nothing specified, no requirements.txt exists -> Use pyproject.toml
+    pyproject_file = tmp_path / "pyproject.toml"
+    pyproject_file.write_text("pyproject")
+
+    settings = DockerSettings(
+        install_stack_requirements=False,
+        disable_automatic_requirements_detection=False,
+    )
+    files = PipelineDockerImageBuilder.gather_requirements_files(
+        settings, stack=local_stack
+    )
+    assert len(files) == 1
+    assert files[0][1] == "pyproject_requirements"
+
+    # Nothing specified, requirements.txt exists -> Use requirements.txt
+    requirements_file = tmp_path / "requirements.txt"
+    requirements_file.write_text("user_requirements")
+
+    files = PipelineDockerImageBuilder.gather_requirements_files(
+        settings, stack=local_stack
+    )
+    assert len(files) == 1
+    assert files[0][1] == "user_requirements"
+
+    pyproject_file.unlink()
+    requirements_file.unlink()
 
     # just local requirements
     settings = DockerSettings(
@@ -102,38 +145,35 @@ def test_requirements_file_generation(
     # all values set
     requirements_file = tmp_path / "requirements.txt"
     requirements_file.write_text("user_requirements")
+
+    pyproject_file = tmp_path / "pyproject.toml"
+    pyproject_file.write_text("pyproject")
+
     settings = DockerSettings(
+        disable_automatic_requirements_detection=False,
         install_stack_requirements=True,
         requirements=str(requirements_file),
         required_integrations=[SKLEARN],
-        required_hub_plugins=[sample_hub_plugin_response_model.name],
         replicate_local_python_environment="pip_freeze",
+        pyproject_path=str(pyproject_file),
     )
     files = PipelineDockerImageBuilder.gather_requirements_files(
         settings, stack=local_stack
     )
-    assert len(files) == 6
+    assert len(files) == 5
     # first up the local python requirements
     assert files[0][1] == "local_requirements"
-    # then the hub requirements
-    expected_hub_internal_requirements = (
-        f"-i {sample_hub_plugin_response_model.index_url}\n"
-        f"{sample_hub_plugin_response_model.package_name}"
-    )
-    assert files[1][1] == expected_hub_internal_requirements
-    expected_hub_pypi_requirements = "\n".join(
-        sample_hub_plugin_response_model.requirements
-    )
-    assert files[2][1] == expected_hub_pypi_requirements
     # then the stack requirements
-    assert files[3][1] == "stack_requirements"
+    assert files[1][1] == "stack_requirements"
     # then the integration requirements
     expected_integration_requirements = "\n".join(
         sorted(SklearnIntegration.REQUIREMENTS)
     )
-    assert files[4][1] == expected_integration_requirements
+    assert files[2][1] == expected_integration_requirements
+    # then the pyproject requirements
+    assert files[3][1] == "pyproject_requirements"
     # last the user requirements
-    assert files[5][1] == "user_requirements"
+    assert files[4][1] == "user_requirements"
 
 
 def test_build_skipping():
@@ -145,7 +185,6 @@ def test_build_skipping():
         tag="tag",
         stack=Client().active_stack,
         include_files=True,
-        download_files=False,
     )
     assert image_digest
 
@@ -165,13 +204,12 @@ def test_python_package_installer_args():
         PipelineDockerImageBuilder._generate_zenml_pipeline_dockerfile(
             "image:tag",
             docker_settings,
-            download_files=False,
             requirements_files=requirements_files,
         )
     )
 
     assert (
-        "RUN pip install --no-cache-dir --default-timeout=99 --other-arg=value --option"
+        "RUN uv pip install --no-cache-dir --default-timeout=99 --other-arg=value --option"
         in generated_dockerfile
     )
 
@@ -189,5 +227,4 @@ def test_dockerfile_needs_to_exist():
             tag="tag",
             stack=Client().active_stack,
             include_files=True,
-            download_files=False,
         )

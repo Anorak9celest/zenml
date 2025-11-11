@@ -118,6 +118,7 @@ venv.bak/
 
 # mkdocs documentation
 /site
+docs/site/
 
 # mypy
 .mypy_cache/
@@ -168,8 +169,9 @@ zenml_examples/
 # GitHub Folder YAML files not to be ignored
 !.github/ISSUE_TEMPLATE/**
 
-# VS Code gunk
+# VS Code and Cursor gunk
 .vscode/
+design/
 
 # pyenv local version file
 .python-version
@@ -187,14 +189,25 @@ test_terraform/
 # feast registry database
 examples/feast_feature_store/feast_feature_repo/data/registry.db
 
+# Computer vision example
+examples/computer_vision/*.jpg
+examples/computer_vision/*.jpeg
+examples/computer_vision/*.pt
+examples/computer_vision/data
+examples/computer_vision/runs
+examples/computer_vision/predictions
+examples/computer_vision/test_fixed_training
+examples/computer_vision/test_runs
+
 #neptune
 *.neptune/
 
 #generated folder by zenml
 zenml_tutorial/
 
-# script for testing
-mlstacks_reset.sh
+# Claude settings
+**/.claude/settings.local.json
+.claude/
 
 .local/
 # PLEASE KEEP THIS LINE AT THE EOF: never include here src/zenml/zen_server/dashboard, since it is affecting release flow

@@ -17,6 +17,7 @@ import sys
 from datetime import datetime
 from pathlib import Path
 from typing import Generator, Tuple
+from unittest.mock import MagicMock, patch
 from uuid import uuid4
 
 import pytest
@@ -27,7 +28,7 @@ from tests.harness.environment import TestEnvironment
 from tests.harness.utils import (
     check_test_requirements,
     clean_default_client_session,
-    clean_workspace_session,
+    clean_project_session,
     environment_session,
 )
 from tests.venv_clone_utils import clone_virtualenv
@@ -89,7 +90,7 @@ def pytest_addoption(parser):
         "--no-cleanup",
         action="store_true",
         default=False,
-        help="Do not cleanup the temporary resources (e.g. stacks, workspaces) "
+        help="Do not cleanup the temporary resources (e.g. stacks, projects) "
         "set up for tests after tests have run.",
     )
     parser.addoption(
@@ -167,16 +168,16 @@ def check_module_requirements(
 
 
 @pytest.fixture
-def clean_workspace(
+def clean_project(
     tmp_path_factory: pytest.TempPathFactory,
 ) -> Generator[Client, None, None]:
     """Fixture to create, activate and use a separate ZenML repository and
-    workspace for an individual test.
+    project for an individual test.
 
     Yields:
-        A ZenML client configured to use the workspace.
+        A ZenML client configured to use the project.
     """
-    with clean_workspace_session(
+    with clean_project_session(
         tmp_path_factory=tmp_path_factory,
         clean_repo=True,
     ) as client:
@@ -184,16 +185,16 @@ def clean_workspace(
 
 
 @pytest.fixture(scope="module")
-def module_clean_workspace(
+def module_clean_project(
     tmp_path_factory: pytest.TempPathFactory,
 ) -> Generator[Client, None, None]:
     """Fixture to create, activate and use a separate ZenML repository and
-    workspace for an entire test module.
+    project for an entire test module.
 
     Yields:
-        A ZenML client configured to use the workspace.
+        A ZenML client configured to use the project.
     """
-    with clean_workspace_session(
+    with clean_project_session(
         tmp_path_factory=tmp_path_factory,
         clean_repo=True,
     ) as client:
@@ -219,6 +220,32 @@ def clean_client(
         tmp_path_factory=tmp_path_factory,
     ) as client:
         yield client
+
+
+@pytest.fixture
+def clean_client_with_repo(
+    clean_client: Client,
+    tmp_path: Path,
+) -> Generator[Client, None, None]:
+    """Fixture to get and use a clean local client with its own global
+    configuration as well as a local repository.
+
+    The working directory is changed to the local repository path.
+
+    Args:
+        clean_client: A clean ZenML client.
+        tmp_path: A temporary path to create a new repository.
+
+    Yields:
+        A clean ZenML client with its own local repository.
+    """
+    try:
+        cwd = os.getcwd()
+        os.chdir(tmp_path)
+        clean_client.initialize(root=tmp_path)
+        yield clean_client
+    finally:
+        os.chdir(cwd)
 
 
 @pytest.fixture(scope="module")
@@ -360,7 +387,6 @@ def local_stack():
         flavor="default",
         type=StackComponentType.ORCHESTRATOR,
         user=uuid4(),
-        workspace=uuid4(),
         created=datetime.now(),
         updated=datetime.now(),
     )
@@ -371,7 +397,6 @@ def local_stack():
         flavor="default",
         type=StackComponentType.ARTIFACT_STORE,
         user=uuid4(),
-        workspace=uuid4(),
         created=datetime.now(),
         updated=datetime.now(),
     )
@@ -393,7 +418,6 @@ def local_orchestrator():
         flavor="local",
         type=StackComponentType.ORCHESTRATOR,
         user=uuid4(),
-        workspace=uuid4(),
         created=datetime.now(),
         updated=datetime.now(),
     )
@@ -409,7 +433,6 @@ def local_artifact_store():
         flavor="local",
         type=StackComponentType.ARTIFACT_STORE,
         user=uuid4(),
-        workspace=uuid4(),
         created=datetime.now(),
         updated=datetime.now(),
     )
@@ -432,7 +455,6 @@ def gcp_artifact_store():
         flavor="gcp",
         type=StackComponentType.ARTIFACT_STORE,
         user=uuid4(),
-        workspace=uuid4(),
         created=datetime.now(),
         updated=datetime.now(),
     )
@@ -448,17 +470,17 @@ def s3_artifact_store():
         S3ArtifactStoreConfig,
     )
 
-    return S3ArtifactStore(
-        name="",
-        id=uuid4(),
-        config=S3ArtifactStoreConfig(path="s3://tmp"),
-        flavor="s3",
-        type=StackComponentType.ARTIFACT_STORE,
-        user=uuid4(),
-        workspace=uuid4(),
-        created=datetime.now(),
-        updated=datetime.now(),
-    )
+    with patch("boto3.resource", MagicMock()):
+        return S3ArtifactStore(
+            name="",
+            id=uuid4(),
+            config=S3ArtifactStoreConfig(path="s3://tmp"),
+            flavor="s3",
+            type=StackComponentType.ARTIFACT_STORE,
+            user=uuid4(),
+            created=datetime.now(),
+            updated=datetime.now(),
+        )
 
 
 @pytest.fixture
@@ -471,7 +493,6 @@ def local_container_registry():
         flavor="default",
         type=StackComponentType.CONTAINER_REGISTRY,
         user=uuid4(),
-        workspace=uuid4(),
         created=datetime.now(),
         updated=datetime.now(),
     )
@@ -487,7 +508,6 @@ def remote_container_registry():
         flavor="gcp",
         type=StackComponentType.CONTAINER_REGISTRY,
         user=uuid4(),
-        workspace=uuid4(),
         created=datetime.now(),
         updated=datetime.now(),
     )

@@ -15,21 +15,24 @@
 
 import os
 import re
+import time
 from datetime import datetime
 from pathlib import Path
+from threading import RLock
 from typing import (
     Any,
     ClassVar,
     Dict,
     List,
     Optional,
+    Sequence,
     Tuple,
     Type,
     TypeVar,
     Union,
 )
 from urllib.parse import urlparse
-from uuid import UUID
+from uuid import UUID, uuid4
 
 import requests
 import urllib3
@@ -37,6 +40,8 @@ from pydantic import (
     BaseModel,
     ConfigDict,
     Field,
+    PrivateAttr,
+    ValidationError,
     field_validator,
     model_validator,
 )
@@ -56,18 +61,21 @@ from zenml.constants import (
     ARTIFACT_VERSIONS,
     ARTIFACT_VISUALIZATIONS,
     ARTIFACTS,
+    BATCH,
     CODE_REFERENCES,
     CODE_REPOSITORIES,
+    CONFIG,
+    CURATED_VISUALIZATIONS,
     CURRENT_USER,
     DEACTIVATE,
     DEFAULT_HTTP_TIMEOUT,
+    DEPLOYMENTS,
     DEVICES,
     DISABLE_CLIENT_SERVER_MISMATCH_WARNING,
     ENV_ZENML_DISABLE_CLIENT_SERVER_MISMATCH_WARNING,
     EVENT_SOURCES,
     FLAVORS,
-    FULL_STACK,
-    GET_OR_CREATE,
+    HEARTBEAT,
     INFO,
     LOGIN,
     LOGS,
@@ -76,9 +84,11 @@ from zenml.constants import (
     MODEL_VERSIONS,
     MODELS,
     PIPELINE_BUILDS,
-    PIPELINE_DEPLOYMENTS,
+    PIPELINE_SNAPSHOTS,
     PIPELINES,
+    PROJECTS,
     RUN_METADATA,
+    RUN_TEMPLATES,
     RUNS,
     SCHEDULES,
     SECRETS,
@@ -91,6 +101,7 @@ from zenml.constants import (
     SERVICE_CONNECTOR_RESOURCES,
     SERVICE_CONNECTOR_TYPES,
     SERVICE_CONNECTOR_VERIFY,
+    SERVICE_CONNECTOR_VERIFY_REQUEST_TIMEOUT,
     SERVICE_CONNECTORS,
     SERVICES,
     STACK,
@@ -98,22 +109,34 @@ from zenml.constants import (
     STACK_DEPLOYMENT,
     STACKS,
     STEPS,
+    TAG_RESOURCES,
     TAGS,
     TRIGGER_EXECUTIONS,
     TRIGGERS,
-    URL,
     USERS,
     VERSION_1,
-    WORKSPACES,
+    ZENML_PRO_API_KEY_PREFIX,
 )
 from zenml.enums import (
+    APITokenType,
     OAuthGrantTypes,
     StackDeploymentProvider,
     StoreType,
 )
-from zenml.exceptions import AuthorizationException, MethodNotAllowedError
+from zenml.exceptions import (
+    AuthorizationException,
+    CredentialsNotValid,
+    MethodNotAllowedError,
+)
 from zenml.io import fileio
 from zenml.logger import get_logger
+from zenml.login.credentials import APIToken
+from zenml.login.credentials_store import get_credentials_store
+from zenml.login.pro.client import ZenMLProClient
+from zenml.login.pro.constants import ZENML_PRO_API_URL
+from zenml.login.pro.utils import (
+    get_troubleshooting_instructions,
+)
 from zenml.models import (
     ActionFilter,
     ActionRequest,
@@ -145,7 +168,14 @@ from zenml.models import (
     ComponentRequest,
     ComponentResponse,
     ComponentUpdate,
+    CuratedVisualizationRequest,
+    CuratedVisualizationResponse,
+    CuratedVisualizationUpdate,
     DeployedStack,
+    DeploymentFilter,
+    DeploymentRequest,
+    DeploymentResponse,
+    DeploymentUpdate,
     EventSourceFilter,
     EventSourceRequest,
     EventSourceResponse,
@@ -154,7 +184,6 @@ from zenml.models import (
     FlavorRequest,
     FlavorResponse,
     FlavorUpdate,
-    FullStackRequest,
     LogsResponse,
     ModelFilter,
     ModelRequest,
@@ -173,13 +202,11 @@ from zenml.models import (
     OAuthDeviceFilter,
     OAuthDeviceResponse,
     OAuthDeviceUpdate,
+    OAuthTokenResponse,
     Page,
     PipelineBuildFilter,
     PipelineBuildRequest,
     PipelineBuildResponse,
-    PipelineDeploymentFilter,
-    PipelineDeploymentRequest,
-    PipelineDeploymentResponse,
     PipelineFilter,
     PipelineRequest,
     PipelineResponse,
@@ -187,10 +214,21 @@ from zenml.models import (
     PipelineRunRequest,
     PipelineRunResponse,
     PipelineRunUpdate,
+    PipelineSnapshotFilter,
+    PipelineSnapshotRequest,
+    PipelineSnapshotResponse,
+    PipelineSnapshotRunRequest,
+    PipelineSnapshotUpdate,
     PipelineUpdate,
-    RunMetadataFilter,
+    ProjectFilter,
+    ProjectRequest,
+    ProjectResponse,
+    ProjectUpdate,
     RunMetadataRequest,
-    RunMetadataResponse,
+    RunTemplateFilter,
+    RunTemplateRequest,
+    RunTemplateResponse,
+    RunTemplateUpdate,
     ScheduleFilter,
     ScheduleRequest,
     ScheduleResponse,
@@ -216,17 +254,21 @@ from zenml.models import (
     ServiceRequest,
     ServiceResponse,
     ServiceUpdate,
+    StackDeploymentConfig,
     StackDeploymentInfo,
     StackFilter,
     StackRequest,
     StackResponse,
     StackUpdate,
+    StepHeartbeatResponse,
     StepRunFilter,
     StepRunRequest,
     StepRunResponse,
     StepRunUpdate,
     TagFilter,
     TagRequest,
+    TagResourceRequest,
+    TagResourceResponse,
     TagResponse,
     TagUpdate,
     TriggerExecutionFilter,
@@ -239,11 +281,6 @@ from zenml.models import (
     UserRequest,
     UserResponse,
     UserUpdate,
-    WorkspaceFilter,
-    WorkspaceRequest,
-    WorkspaceResponse,
-    WorkspaceScopedRequest,
-    WorkspaceUpdate,
 )
 from zenml.service_connectors.service_connector_registry import (
     service_connector_registry,
@@ -251,6 +288,8 @@ from zenml.service_connectors.service_connector_registry import (
 from zenml.utils.networking_utils import (
     replace_localhost_with_internal_hostname,
 )
+from zenml.utils.pydantic_utils import before_validator_handler
+from zenml.utils.time_utils import utc_now
 from zenml.zen_server.exceptions import exception_from_response
 from zenml.zen_stores.base_zen_store import BaseZenStore
 
@@ -262,10 +301,6 @@ Json = Union[Dict[str, Any], List[Any], str, int, float, bool, None]
 
 AnyRequest = TypeVar("AnyRequest", bound=BaseRequest)
 AnyResponse = TypeVar("AnyResponse", bound=BaseIdentifiedResponse)  # type: ignore[type-arg]
-AnyWorkspaceScopedRequest = TypeVar(
-    "AnyWorkspaceScopedRequest",
-    bound=WorkspaceScopedRequest,
-)
 
 
 class RestZenStoreConfiguration(StoreConfiguration):
@@ -276,44 +311,26 @@ class RestZenStoreConfiguration(StoreConfiguration):
         username: The username to use to connect to the Zen server.
         password: The password to use to connect to the Zen server.
         api_key: The service account API key to use to connect to the Zen
-            server.
-        api_token: The API token to use to connect to the Zen server. Generated
-            by the client and stored in the configuration file on the first
-            login and every time the API key is refreshed.
+            server. This is only set if the API key is configured explicitly via
+            environment variables or the ZenML global configuration file. API
+            keys configured via the CLI are stored in the credentials store
+            instead.
         verify_ssl: Either a boolean, in which case it controls whether we
             verify the server's TLS certificate, or a string, in which case it
             must be a path to a CA bundle to use or the CA bundle value itself.
         http_timeout: The timeout to use for all requests.
+        connection_pool_size: The size of the connection pool to use for all
+            requests.
 
     """
 
     type: StoreType = StoreType.REST
 
-    username: Optional[str] = None
-    password: Optional[str] = None
-    api_key: Optional[str] = None
-    api_token: Optional[str] = None
-    verify_ssl: Union[bool, str] = Field(True, union_mode="left_to_right")
+    verify_ssl: Union[bool, str] = Field(
+        default=True, union_mode="left_to_right"
+    )
     http_timeout: int = DEFAULT_HTTP_TIMEOUT
-
-    @model_validator(mode="after")
-    def validate_credentials(self) -> "RestZenStoreConfiguration":
-        """Validates the credentials provided in the values dictionary.
-
-        Raises:
-            ValueError: If neither api_token nor username nor api_key is set.
-
-        Returns:
-            The values dictionary.
-        """
-        # Check if the values dictionary contains either an API token, an API
-        # key or a username as non-empty strings.
-        if self.api_token or self.username or self.api_key:
-            return self
-        raise ValueError(
-            "Neither api_token nor username nor api_key is set in the "
-            "store config."
-        )
+    connection_pool_size: int = 10
 
     @field_validator("url")
     @classmethod
@@ -368,17 +385,16 @@ class RestZenStoreConfiguration(StoreConfiguration):
 
         if os.path.isfile(verify_ssl):
             with open(verify_ssl, "r") as f:
-                verify_ssl = f.read()
+                cert_content = f.read()
 
         fileio.makedirs(str(secret_folder))
         file_path = Path(secret_folder, "ca_bundle.pem")
         with os.fdopen(
             os.open(file_path, flags=os.O_RDWR | os.O_CREAT, mode=0o600), "w"
         ) as f:
-            f.write(verify_ssl)
-        verify_ssl = str(file_path)
+            f.write(cert_content)
 
-        return verify_ssl
+        return str(file_path)
 
     @classmethod
     def supports_url_scheme(cls, url: str) -> bool:
@@ -392,22 +408,52 @@ class RestZenStoreConfiguration(StoreConfiguration):
         """
         return urlparse(url).scheme in ("http", "https")
 
-    def expand_certificates(self) -> None:
-        """Expands the certificates in the verify_ssl field."""
-        # Load the certificate values back into the configuration
-        if isinstance(self.verify_ssl, str) and os.path.isfile(
-            self.verify_ssl
-        ):
-            with open(self.verify_ssl, "r") as f:
-                self.verify_ssl = f.read()
+    @model_validator(mode="before")
+    @classmethod
+    @before_validator_handler
+    def _move_credentials(cls, data: Dict[str, Any]) -> Dict[str, Any]:
+        """Moves credentials (API keys, API tokens, passwords) from the config to the credentials store.
+
+        Args:
+            data: The values dict used to instantiate the model.
+
+        Returns:
+            The values dict without credentials.
+        """
+        url = data.get("url")
+        if not url:
+            return data
+
+        url = replace_localhost_with_internal_hostname(url)
+
+        if api_token := data.pop("api_token", None):
+            credentials_store = get_credentials_store()
+            credentials_store.set_bare_token(url, api_token)
+
+        username = data.pop("username", None)
+        password = data.pop("password", None)
+        if username is not None and password is not None:
+            credentials_store = get_credentials_store()
+            credentials_store.set_password(url, username, password)
+
+        if api_key := data.pop("api_key", None):
+            credentials_store = get_credentials_store()
+            if api_key.startswith(ZENML_PRO_API_KEY_PREFIX):
+                credentials_store.set_api_key(
+                    ZENML_PRO_API_URL, api_key, is_zenml_pro=True
+                )
+            else:
+                credentials_store.set_api_key(url, api_key)
+
+        return data
 
     model_config = ConfigDict(
         # Don't validate attributes when assigning them. This is necessary
         # because the `verify_ssl` attribute can be expanded to the contents
         # of the certificate file.
         validate_assignment=False,
-        # Forbid extra attributes set in the class.
-        extra="forbid",
+        # Ignore extra attributes set in the class.
+        extra="ignore",
     )
 
 
@@ -417,8 +463,11 @@ class RestZenStore(BaseZenStore):
     config: RestZenStoreConfiguration
     TYPE: ClassVar[StoreType] = StoreType.REST
     CONFIG_TYPE: ClassVar[Type[StoreConfiguration]] = RestZenStoreConfiguration
-    _api_token: Optional[str] = None
+    _api_token: Optional[APIToken] = None
     _session: Optional[requests.Session] = None
+    _server_info: Optional[ServerModel] = None
+    _session_lock: RLock = PrivateAttr(default_factory=RLock)
+    _last_authenticated: Optional[datetime] = None
 
     # ====================================
     # ZenML Store interface implementation
@@ -429,9 +478,54 @@ class RestZenStore(BaseZenStore):
     # --------------------------------
 
     def _initialize(self) -> None:
-        """Initialize the REST store."""
-        client_version = zenml.__version__
-        server_version = self.get_store_info().version
+        """Initialize the REST store.
+
+        Raises:
+            RuntimeError: If the store cannot be initialized.
+            AuthorizationException: If the store cannot be initialized due to
+                authentication errors.
+        """
+        try:
+            client_version = zenml.__version__
+            server_version = self.server_info.version
+
+        # Handle cases where the ZenML server is not available
+        except ConnectionError as e:
+            error_message = (
+                f"Cannot connect to the ZenML server at {self.url}."
+            )
+            if urlparse(self.url).hostname in [
+                "localhost",
+                "127.0.0.1",
+                "host.docker.internal",
+            ]:
+                recommendation = (
+                    "Please run `zenml login --local --restart` to restart the "
+                    "server."
+                )
+            else:
+                recommendation = (
+                    f"Please run `zenml login {self.url}` to reconnect to the "
+                    "server."
+                )
+            raise RuntimeError(f"{error_message}\n{recommendation}") from e
+
+        except AuthorizationException as e:
+            raise AuthorizationException(
+                f"Authorization failed for store at '{self.url}'. Please check "
+                f"your credentials: {str(e)}"
+            )
+
+        except Exception as e:
+            zenml_pro_extra = ""
+            if ".zenml.io" in self.url:
+                zenml_pro_extra = (
+                    "\nHINT: " + get_troubleshooting_instructions(self.url)
+                )
+            raise RuntimeError(
+                f"Error connecting to URL "
+                f"'{self.url}': {str(e)}" + zenml_pro_extra
+            ) from e
 
         if not DISABLE_CLIENT_SERVER_MISMATCH_WARNING and (
             server_version != client_version
@@ -446,6 +540,17 @@ class RestZenStore(BaseZenStore):
                 ENV_ZENML_DISABLE_CLIENT_SERVER_MISMATCH_WARNING,
             )
 
+    @property
+    def server_info(self) -> ServerModel:
+        """Get cached information about the server.
+
+        Returns:
+            Cached information about the server.
+        """
+        if self._server_info is None:
+            return self.get_store_info()
+        return self._server_info
+
     def get_store_info(self) -> ServerModel:
         """Get information about the server.
 
@@ -453,7 +558,8 @@ class RestZenStore(BaseZenStore):
             Information about the server.
         """
         body = self.get(INFO)
-        return ServerModel.model_validate(body)
+        self._server_info = ServerModel.model_validate(body)
+        return self._server_info
 
     def get_deployment_id(self) -> UUID:
         """Get the ID of the deployment.
@@ -461,7 +567,7 @@ class RestZenStore(BaseZenStore):
         Returns:
             The ID of the deployment.
         """
-        return self.get_store_info().id
+        return self.server_info.id
 
     # -------------------- Server Settings --------------------
 
@@ -633,20 +739,6 @@ class RestZenStore(BaseZenStore):
             response_model=APIKeyResponse,
             params={"hydrate": hydrate},
         )
-
-    def set_api_key(self, api_key: str) -> None:
-        """Set the API key to use for authentication.
-
-        Args:
-            api_key: The API key to use for authentication.
-        """
-        self.config.api_key = api_key
-        self.clear_session()
-        # TODO: find a way to persist the API key in the configuration file
-        #  without calling _write_config() here.
-        # This is the only place where we need to explicitly call
-        # _write_config() to persist the global configuration.
-        GlobalConfiguration()._write_config()
 
     def list_api_keys(
         self,
@@ -929,6 +1021,23 @@ class RestZenStore(BaseZenStore):
             route=ARTIFACT_VERSIONS,
         )
 
+    def batch_create_artifact_versions(
+        self, artifact_versions: List[ArtifactVersionRequest]
+    ) -> List[ArtifactVersionResponse]:
+        """Creates a batch of artifact versions.
+
+        Args:
+            artifact_versions: The artifact versions to create.
+
+        Returns:
+            The created artifact versions.
+        """
+        return self._batch_create_resources(
+            resources=artifact_versions,
+            response_model=ArtifactVersionResponse,
+            route=ARTIFACT_VERSIONS,
+        )
+
     def get_artifact_version(
         self, artifact_version_id: UUID, hydrate: bool = True
     ) -> ArtifactVersionResponse:
@@ -1006,15 +1115,22 @@ class RestZenStore(BaseZenStore):
 
     def prune_artifact_versions(
         self,
+        project_name_or_id: Union[str, UUID],
         only_versions: bool = True,
     ) -> None:
         """Prunes unused artifact versions and their artifacts.
 
         Args:
+            project_name_or_id: The project name or ID to prune artifact
+                versions for.
             only_versions: Only delete artifact versions, keeping artifacts
         """
         self.delete(
-            path=ARTIFACT_VERSIONS, params={"only_versions": only_versions}
+            path=ARTIFACT_VERSIONS,
+            params={
+                "only_versions": only_versions,
+                "project_name_or_id": project_name_or_id,
+            },
         )
 
     # ------------------------ Artifact Visualizations ------------------------
@@ -1075,7 +1191,7 @@ class RestZenStore(BaseZenStore):
         Returns:
             The newly created code repository.
         """
-        return self._create_workspace_scoped_resource(
+        return self._create_resource(
             resource=code_repository,
             response_model=CodeRepositoryResponse,
             route=CODE_REPOSITORIES,
@@ -1167,7 +1283,7 @@ class RestZenStore(BaseZenStore):
         Returns:
             The created stack component.
         """
-        return self._create_workspace_scoped_resource(
+        return self._create_resource(
             resource=component,
             route=STACK_COMPONENTS,
             response_model=ComponentResponse,
@@ -1361,7 +1477,7 @@ class RestZenStore(BaseZenStore):
     # ----------------------------- Pipelines -----------------------------
 
     def create_pipeline(self, pipeline: PipelineRequest) -> PipelineResponse:
-        """Creates a new pipeline in a workspace.
+        """Creates a new pipeline.
 
         Args:
             pipeline: The pipeline to create.
@@ -1369,7 +1485,7 @@ class RestZenStore(BaseZenStore):
         Returns:
             The newly created pipeline.
         """
-        return self._create_workspace_scoped_resource(
+        return self._create_resource(
             resource=pipeline,
             route=PIPELINES,
             response_model=PipelineResponse,
@@ -1454,7 +1570,7 @@ class RestZenStore(BaseZenStore):
         self,
         build: PipelineBuildRequest,
     ) -> PipelineBuildResponse:
-        """Creates a new build in a workspace.
+        """Creates a new build.
 
         Args:
             build: The build to create.
@@ -1462,7 +1578,7 @@ class RestZenStore(BaseZenStore):
         Returns:
             The newly created build.
         """
-        return self._create_workspace_scoped_resource(
+        return self._create_resource(
             resource=build,
             route=PIPELINE_BUILDS,
             response_model=PipelineBuildResponse,
@@ -1522,42 +1638,148 @@ class RestZenStore(BaseZenStore):
             route=PIPELINE_BUILDS,
         )
 
-    def run_build(
+    # -------------------------- Pipeline Snapshots --------------------------
+
+    def create_snapshot(
         self,
-        build_id: UUID,
-        run_configuration: Optional[PipelineRunConfiguration] = None,
-    ) -> PipelineRunResponse:
-        """Run a pipeline from a build.
+        snapshot: PipelineSnapshotRequest,
+    ) -> PipelineSnapshotResponse:
+        """Creates a new snapshot.
 
         Args:
-            build_id: The ID of the build to run.
-            run_configuration: Configuration for the run.
-
-        Raises:
-            RuntimeError: If the server does not support running a build.
+            snapshot: The snapshot to create.
 
         Returns:
-            Model of the pipeline run.
+            The newly created snapshot.
         """
-        run_configuration = run_configuration or PipelineRunConfiguration()
+        return self._create_resource(
+            resource=snapshot,
+            route=PIPELINE_SNAPSHOTS,
+            response_model=PipelineSnapshotResponse,
+        )
+
+    def get_snapshot(
+        self,
+        snapshot_id: UUID,
+        hydrate: bool = True,
+        step_configuration_filter: Optional[List[str]] = None,
+        include_config_schema: Optional[bool] = None,
+    ) -> PipelineSnapshotResponse:
+        """Get a snapshot with a given ID.
+
+        Args:
+            snapshot_id: ID of the snapshot.
+            hydrate: Flag deciding whether to hydrate the output model(s)
+                by including metadata fields in the response.
+            step_configuration_filter: List of step configurations to include in
+                the response. If not given, all step configurations will be
+                included.
+            include_config_schema: Whether the config schema will be filled.
+
+        Returns:
+            The snapshot.
+        """
+        return self._get_resource(
+            resource_id=snapshot_id,
+            route=PIPELINE_SNAPSHOTS,
+            response_model=PipelineSnapshotResponse,
+            params={
+                "hydrate": hydrate,
+                "step_configuration_filter": step_configuration_filter,
+                "include_config_schema": include_config_schema,
+            },
+        )
+
+    def list_snapshots(
+        self,
+        snapshot_filter_model: PipelineSnapshotFilter,
+        hydrate: bool = False,
+    ) -> Page[PipelineSnapshotResponse]:
+        """List all snapshots matching the given filter criteria.
+
+        Args:
+            snapshot_filter_model: All filter parameters including pagination
+                params.
+            hydrate: Flag deciding whether to hydrate the output model(s)
+                by including metadata fields in the response.
+
+        Returns:
+            A page of all snapshots matching the filter criteria.
+        """
+        return self._list_paginated_resources(
+            route=PIPELINE_SNAPSHOTS,
+            response_model=PipelineSnapshotResponse,
+            filter_model=snapshot_filter_model,
+            params={"hydrate": hydrate},
+        )
+
+    def update_snapshot(
+        self,
+        snapshot_id: UUID,
+        snapshot_update: PipelineSnapshotUpdate,
+    ) -> PipelineSnapshotResponse:
+        """Update a snapshot.
+
+        Args:
+            snapshot_id: The ID of the snapshot to update.
+            snapshot_update: The update to apply.
+
+        Returns:
+            The updated snapshot.
+        """
+        return self._update_resource(
+            resource_id=snapshot_id,
+            resource_update=snapshot_update,
+            route=PIPELINE_SNAPSHOTS,
+            response_model=PipelineSnapshotResponse,
+        )
+
+    def delete_snapshot(self, snapshot_id: UUID) -> None:
+        """Deletes a snapshot.
+
+        Args:
+            snapshot_id: The ID of the snapshot to delete.
+        """
+        self._delete_resource(
+            resource_id=snapshot_id,
+            route=PIPELINE_SNAPSHOTS,
+        )
+
+    def run_snapshot(
+        self,
+        snapshot_id: UUID,
+        run_request: PipelineSnapshotRunRequest,
+    ) -> PipelineRunResponse:
+        """Run a snapshot.
+
+        Args:
+            snapshot_id: The ID of the snapshot to run.
+            run_request: Configuration for the run.
+
+        Raises:
+            RuntimeError: If the server does not support running a snapshot.
+
+        Returns:
+            The created pipeline run.
+        """
         try:
             response_body = self.post(
-                f"{PIPELINE_BUILDS}/{build_id}/runs", body=run_configuration
+                f"{PIPELINE_SNAPSHOTS}/{snapshot_id}/runs",
+                body=run_request,
             )
         except MethodNotAllowedError as e:
             raise RuntimeError(
-                "Running a build is not supported for this server."
+                "Running a snapshot is not supported for this server."
             ) from e
 
         return PipelineRunResponse.model_validate(response_body)
 
-    # -------------------------- Pipeline Deployments --------------------------
+    # -------------------- Deployments --------------------
 
     def create_deployment(
-        self,
-        deployment: PipelineDeploymentRequest,
-    ) -> PipelineDeploymentResponse:
-        """Creates a new deployment in a workspace.
+        self, deployment: DeploymentRequest
+    ) -> DeploymentResponse:
+        """Create a new deployment.
 
         Args:
             deployment: The deployment to create.
@@ -1565,15 +1787,15 @@ class RestZenStore(BaseZenStore):
         Returns:
             The newly created deployment.
         """
-        return self._create_workspace_scoped_resource(
+        return self._create_resource(
             resource=deployment,
-            route=PIPELINE_DEPLOYMENTS,
-            response_model=PipelineDeploymentResponse,
+            route=DEPLOYMENTS,
+            response_model=DeploymentResponse,
         )
 
     def get_deployment(
         self, deployment_id: UUID, hydrate: bool = True
-    ) -> PipelineDeploymentResponse:
+    ) -> DeploymentResponse:
         """Get a deployment with a given ID.
 
         Args:
@@ -1586,16 +1808,16 @@ class RestZenStore(BaseZenStore):
         """
         return self._get_resource(
             resource_id=deployment_id,
-            route=PIPELINE_DEPLOYMENTS,
-            response_model=PipelineDeploymentResponse,
+            route=DEPLOYMENTS,
+            response_model=DeploymentResponse,
             params={"hydrate": hydrate},
         )
 
     def list_deployments(
         self,
-        deployment_filter_model: PipelineDeploymentFilter,
+        deployment_filter_model: DeploymentFilter,
         hydrate: bool = False,
-    ) -> Page[PipelineDeploymentResponse]:
+    ) -> Page[DeploymentResponse]:
         """List all deployments matching the given filter criteria.
 
         Args:
@@ -1608,36 +1830,221 @@ class RestZenStore(BaseZenStore):
             A page of all deployments matching the filter criteria.
         """
         return self._list_paginated_resources(
-            route=PIPELINE_DEPLOYMENTS,
-            response_model=PipelineDeploymentResponse,
+            route=DEPLOYMENTS,
+            response_model=DeploymentResponse,
             filter_model=deployment_filter_model,
             params={"hydrate": hydrate},
         )
 
+    def update_deployment(
+        self, deployment_id: UUID, deployment_update: DeploymentUpdate
+    ) -> DeploymentResponse:
+        """Update a deployment.
+
+        Args:
+            deployment_id: The ID of the deployment to update.
+            deployment_update: The update to apply.
+
+        Returns:
+            The updated deployment.
+        """
+        return self._update_resource(
+            resource_id=deployment_id,
+            resource_update=deployment_update,
+            route=DEPLOYMENTS,
+            response_model=DeploymentResponse,
+        )
+
     def delete_deployment(self, deployment_id: UUID) -> None:
-        """Deletes a deployment.
+        """Delete a deployment.
 
         Args:
             deployment_id: The ID of the deployment to delete.
         """
         self._delete_resource(
             resource_id=deployment_id,
-            route=PIPELINE_DEPLOYMENTS,
+            route=DEPLOYMENTS,
         )
 
-    def run_deployment(
-        self,
-        deployment_id: UUID,
-        run_configuration: Optional[PipelineRunConfiguration] = None,
-    ) -> PipelineRunResponse:
-        """Run a pipeline from a deployment.
+    def create_curated_visualization(
+        self, visualization: CuratedVisualizationRequest
+    ) -> CuratedVisualizationResponse:
+        """Create a curated visualization via REST API.
 
         Args:
-            deployment_id: The ID of the deployment to run.
+            visualization: The curated visualization to create.
+
+        Returns:
+            The created curated visualization.
+        """
+        return self._create_resource(
+            resource=visualization,
+            response_model=CuratedVisualizationResponse,
+            route=CURATED_VISUALIZATIONS,
+            params={"hydrate": True},
+        )
+
+    def get_curated_visualization(
+        self, visualization_id: UUID, hydrate: bool = True
+    ) -> CuratedVisualizationResponse:
+        """Get a curated visualization by ID.
+
+        Args:
+            visualization_id: The ID of the curated visualization to get.
+            hydrate: Flag deciding whether to hydrate the output model(s)
+                by including metadata fields in the response.
+
+        Returns:
+            The curated visualization with the given ID.
+        """
+        return self._get_resource(
+            resource_id=visualization_id,
+            route=CURATED_VISUALIZATIONS,
+            response_model=CuratedVisualizationResponse,
+            params={"hydrate": hydrate},
+        )
+
+    def update_curated_visualization(
+        self,
+        visualization_id: UUID,
+        visualization_update: CuratedVisualizationUpdate,
+    ) -> CuratedVisualizationResponse:
+        """Update a curated visualization via REST API.
+
+        Args:
+            visualization_id: The ID of the curated visualization to update.
+            visualization_update: The update to apply to the curated
+                visualization.
+
+        Returns:
+            The updated curated visualization.
+        """
+        return self._update_resource(
+            resource_id=visualization_id,
+            resource_update=visualization_update,
+            response_model=CuratedVisualizationResponse,
+            route=CURATED_VISUALIZATIONS,
+        )
+
+    def delete_curated_visualization(self, visualization_id: UUID) -> None:
+        """Delete a curated visualization via REST API.
+
+        Args:
+            visualization_id: The ID of the curated visualization to delete.
+        """
+        self._delete_resource(
+            resource_id=visualization_id,
+            route=CURATED_VISUALIZATIONS,
+        )
+
+    # -------------------- Run templates --------------------
+
+    def create_run_template(
+        self,
+        template: RunTemplateRequest,
+    ) -> RunTemplateResponse:
+        """Create a new run template.
+
+        Args:
+            template: The template to create.
+
+        Returns:
+            The newly created template.
+        """
+        return self._create_resource(
+            resource=template,
+            route=RUN_TEMPLATES,
+            response_model=RunTemplateResponse,
+        )
+
+    def get_run_template(
+        self, template_id: UUID, hydrate: bool = True
+    ) -> RunTemplateResponse:
+        """Get a run template with a given ID.
+
+        Args:
+            template_id: ID of the template.
+            hydrate: Flag deciding whether to hydrate the output model(s)
+                by including metadata fields in the response.
+
+        Returns:
+            The template.
+        """
+        return self._get_resource(
+            resource_id=template_id,
+            route=RUN_TEMPLATES,
+            response_model=RunTemplateResponse,
+            params={"hydrate": hydrate},
+        )
+
+    def list_run_templates(
+        self,
+        template_filter_model: RunTemplateFilter,
+        hydrate: bool = False,
+    ) -> Page[RunTemplateResponse]:
+        """List all run templates matching the given filter criteria.
+
+        Args:
+            template_filter_model: All filter parameters including pagination
+                params.
+            hydrate: Flag deciding whether to hydrate the output model(s)
+                by including metadata fields in the response.
+
+        Returns:
+            A list of all templates matching the filter criteria.
+        """
+        return self._list_paginated_resources(
+            route=RUN_TEMPLATES,
+            response_model=RunTemplateResponse,
+            filter_model=template_filter_model,
+            params={"hydrate": hydrate},
+        )
+
+    def update_run_template(
+        self,
+        template_id: UUID,
+        template_update: RunTemplateUpdate,
+    ) -> RunTemplateResponse:
+        """Updates a run template.
+
+        Args:
+            template_id: The ID of the template to update.
+            template_update: The update to apply.
+
+        Returns:
+            The updated template.
+        """
+        return self._update_resource(
+            resource_id=template_id,
+            resource_update=template_update,
+            route=RUN_TEMPLATES,
+            response_model=RunTemplateResponse,
+        )
+
+    def delete_run_template(self, template_id: UUID) -> None:
+        """Delete a run template.
+
+        Args:
+            template_id: The ID of the template to delete.
+        """
+        self._delete_resource(
+            resource_id=template_id,
+            route=RUN_TEMPLATES,
+        )
+
+    def run_template(
+        self,
+        template_id: UUID,
+        run_configuration: Optional[PipelineRunConfiguration] = None,
+    ) -> PipelineRunResponse:
+        """Run a template.
+
+        Args:
+            template_id: The ID of the template to run.
             run_configuration: Configuration for the run.
 
         Raises:
-            RuntimeError: If the server does not support running a deployment.
+            RuntimeError: If the server does not support running a template.
 
         Returns:
             Model of the pipeline run.
@@ -1646,12 +2053,12 @@ class RestZenStore(BaseZenStore):
 
         try:
             response_body = self.post(
-                f"{PIPELINE_DEPLOYMENTS}/{deployment_id}/runs",
+                f"{RUN_TEMPLATES}/{template_id}/runs",
                 body=run_configuration,
             )
         except MethodNotAllowedError as e:
             raise RuntimeError(
-                "Running a deployment is not supported for this server."
+                "Running a template is not supported for this server."
             ) from e
 
         return PipelineRunResponse.model_validate(response_body)
@@ -1754,47 +2161,60 @@ class RestZenStore(BaseZenStore):
 
     # ----------------------------- Pipeline runs -----------------------------
 
-    def create_run(
+    def get_or_create_run(
         self, pipeline_run: PipelineRunRequest
-    ) -> PipelineRunResponse:
-        """Creates a pipeline run.
+    ) -> Tuple[PipelineRunResponse, bool]:
+        """Gets or creates a pipeline run.
+
+        If a run with the same ID or name already exists, it is returned.
+        Otherwise, a new run is created.
 
         Args:
-            pipeline_run: The pipeline run to create.
+            pipeline_run: The pipeline run to get or create.
 
         Returns:
-            The created pipeline run.
+            The pipeline run, and a boolean indicating whether the run was
+            created or not.
         """
-        return self._create_workspace_scoped_resource(
+        return self._get_or_create_resource(
             resource=pipeline_run,
-            response_model=PipelineRunResponse,
             route=RUNS,
+            response_model=PipelineRunResponse,
         )
 
     def get_run(
-        self, run_name_or_id: Union[UUID, str], hydrate: bool = True
+        self,
+        run_id: UUID,
+        hydrate: bool = True,
+        include_full_metadata: bool = False,
     ) -> PipelineRunResponse:
         """Gets a pipeline run.
 
         Args:
-            run_name_or_id: The name or ID of the pipeline run to get.
+            run_id: The ID of the pipeline run to get.
             hydrate: Flag deciding whether to hydrate the output model(s)
                 by including metadata fields in the response.
+            include_full_metadata: If True, include metadata of all steps in
+                the response.
 
         Returns:
             The pipeline run.
         """
         return self._get_resource(
-            resource_id=run_name_or_id,
+            resource_id=run_id,
             route=RUNS,
             response_model=PipelineRunResponse,
-            params={"hydrate": hydrate},
+            params={
+                "hydrate": hydrate,
+                "include_full_metadata": include_full_metadata,
+            },
         )
 
     def list_runs(
         self,
         runs_filter_model: PipelineRunFilter,
         hydrate: bool = False,
+        include_full_metadata: bool = False,
     ) -> Page[PipelineRunResponse]:
         """List all pipeline runs matching the given filter criteria.
 
@@ -1803,6 +2223,8 @@ class RestZenStore(BaseZenStore):
                 params.
             hydrate: Flag deciding whether to hydrate the output model(s)
                 by including metadata fields in the response.
+            include_full_metadata: If True, include metadata of all steps in
+                the response.
 
         Returns:
             A list of all pipeline runs matching the filter criteria.
@@ -1811,7 +2233,10 @@ class RestZenStore(BaseZenStore):
             route=RUNS,
             response_model=PipelineRunResponse,
             filter_model=runs_filter_model,
-            params={"hydrate": hydrate},
+            params={
+                "hydrate": hydrate,
+                "include_full_metadata": include_full_metadata,
+            },
         )
 
     def update_run(
@@ -1845,90 +2270,15 @@ class RestZenStore(BaseZenStore):
             route=RUNS,
         )
 
-    def get_or_create_run(
-        self, pipeline_run: PipelineRunRequest
-    ) -> Tuple[PipelineRunResponse, bool]:
-        """Gets or creates a pipeline run.
-
-        If a run with the same ID or name already exists, it is returned.
-        Otherwise, a new run is created.
-
-        Args:
-            pipeline_run: The pipeline run to get or create.
-
-        Returns:
-            The pipeline run, and a boolean indicating whether the run was
-            created or not.
-        """
-        return self._get_or_create_workspace_scoped_resource(
-            resource=pipeline_run,
-            route=RUNS,
-            response_model=PipelineRunResponse,
-        )
-
     # ----------------------------- Run Metadata -----------------------------
 
-    def create_run_metadata(
-        self, run_metadata: RunMetadataRequest
-    ) -> List[RunMetadataResponse]:
+    def create_run_metadata(self, run_metadata: RunMetadataRequest) -> None:
         """Creates run metadata.
 
         Args:
             run_metadata: The run metadata to create.
-
-        Returns:
-            The created run metadata.
         """
-        route = f"{WORKSPACES}/{str(run_metadata.workspace)}{RUN_METADATA}"
-        response_body = self.post(f"{route}", body=run_metadata)
-        result: List[RunMetadataResponse] = []
-        if isinstance(response_body, list):
-            for metadata in response_body or []:
-                result.append(RunMetadataResponse.model_validate(metadata))
-        return result
-
-    def get_run_metadata(
-        self, run_metadata_id: UUID, hydrate: bool = True
-    ) -> RunMetadataResponse:
-        """Gets run metadata with the given ID.
-
-        Args:
-            run_metadata_id: The ID of the run metadata to get.
-            hydrate: Flag deciding whether to hydrate the output model(s)
-                by including metadata fields in the response.
-
-        Returns:
-            The run metadata.
-        """
-        return self._get_resource(
-            resource_id=run_metadata_id,
-            route=RUN_METADATA,
-            response_model=RunMetadataResponse,
-            params={"hydrate": hydrate},
-        )
-
-    def list_run_metadata(
-        self,
-        run_metadata_filter_model: RunMetadataFilter,
-        hydrate: bool = False,
-    ) -> Page[RunMetadataResponse]:
-        """List run metadata.
-
-        Args:
-            run_metadata_filter_model: All filter parameters including
-                pagination params.
-            hydrate: Flag deciding whether to hydrate the output model(s)
-                by including metadata fields in the response.
-
-        Returns:
-            The run metadata.
-        """
-        return self._list_paginated_resources(
-            route=RUN_METADATA,
-            response_model=RunMetadataResponse,
-            filter_model=run_metadata_filter_model,
-            params={"hydrate": hydrate},
-        )
+        self.post(RUN_METADATA, body=run_metadata)
 
     # ----------------------------- Schedules -----------------------------
 
@@ -1941,7 +2291,7 @@ class RestZenStore(BaseZenStore):
         Returns:
             The newly created schedule.
         """
-        return self._create_workspace_scoped_resource(
+        return self._create_resource(
             resource=schedule,
             route=SCHEDULES,
             response_model=ScheduleResponse,
@@ -1972,7 +2322,7 @@ class RestZenStore(BaseZenStore):
         schedule_filter_model: ScheduleFilter,
         hydrate: bool = False,
     ) -> Page[ScheduleResponse]:
-        """List all schedules in the workspace.
+        """List all schedules.
 
         Args:
             schedule_filter_model: All filter parameters including pagination
@@ -2030,10 +2380,8 @@ class RestZenStore(BaseZenStore):
         The new secret is also validated against the scoping rules enforced in
         the secrets store:
 
-          - only one workspace-scoped secret with the given name can exist
-            in the target workspace.
-          - only one user-scoped secret with the given name can exist in the
-            target workspace for the target user.
+          - only one private secret with the given name can exist.
+          - only one public secret with the given name can exist.
 
         Args:
             secret: The secret to create.
@@ -2041,7 +2389,7 @@ class RestZenStore(BaseZenStore):
         Returns:
             The newly created secret.
         """
-        return self._create_workspace_scoped_resource(
+        return self._create_resource(
             resource=secret,
             route=SECRETS,
             response_model=SecretResponse,
@@ -2108,10 +2456,8 @@ class RestZenStore(BaseZenStore):
         If the update includes a change of name or scope, the scoping rules
         enforced in the secrets store are used to validate the update:
 
-          - only one workspace-scoped secret with the given name can exist
-            in the target workspace.
-          - only one user-scoped secret with the given name can exist in the
-            target workspace for the target user.
+          - only one private secret with the given name can exist.
+          - only one public secret with the given name can exist.
 
         Args:
             secret_id: The ID of the secret to be updated.
@@ -2300,16 +2646,27 @@ class RestZenStore(BaseZenStore):
         Returns:
             The newly created service connector.
         """
-        connector_model = self._create_workspace_scoped_resource(
+        connector_model = self._create_resource(
             resource=service_connector,
             route=SERVICE_CONNECTORS,
             response_model=ServiceConnectorResponse,
         )
         self._populate_connector_type(connector_model)
+        # Call this to properly split the secrets from the configuration
+        try:
+            connector_model.validate_configuration()
+        except ValueError as e:
+            logger.error(
+                f"Error validating connector configuration for "
+                f"{connector_model.name}: {e}"
+            )
         return connector_model
 
     def get_service_connector(
-        self, service_connector_id: UUID, hydrate: bool = True
+        self,
+        service_connector_id: UUID,
+        hydrate: bool = True,
+        expand_secrets: bool = False,
     ) -> ServiceConnectorResponse:
         """Gets a specific service connector.
 
@@ -2317,6 +2674,8 @@ class RestZenStore(BaseZenStore):
             service_connector_id: The ID of the service connector to get.
             hydrate: Flag deciding whether to hydrate the output model(s)
                 by including metadata fields in the response.
+            expand_secrets: Flag deciding whether to include the secrets
+                associated with the service connector.
 
         Returns:
             The requested service connector, if it was found.
@@ -2325,15 +2684,25 @@ class RestZenStore(BaseZenStore):
             resource_id=service_connector_id,
             route=SERVICE_CONNECTORS,
             response_model=ServiceConnectorResponse,
-            params={"expand_secrets": False, "hydrate": hydrate},
+            params={"hydrate": hydrate, "expand_secrets": expand_secrets},
         )
         self._populate_connector_type(connector_model)
+        if expand_secrets:
+            try:
+                # Call this to properly split the secrets from the configuration
+                connector_model.validate_configuration()
+            except ValueError as e:
+                logger.error(
+                    f"Error validating connector configuration for "
+                    f"{connector_model.name}: {e}"
+                )
         return connector_model
 
     def list_service_connectors(
         self,
         filter_model: ServiceConnectorFilter,
         hydrate: bool = False,
+        expand_secrets: bool = False,
     ) -> Page[ServiceConnectorResponse]:
         """List all service connectors.
 
@@ -2342,6 +2711,8 @@ class RestZenStore(BaseZenStore):
                 params.
             hydrate: Flag deciding whether to hydrate the output model(s)
                 by including metadata fields in the response.
+            expand_secrets: Flag deciding whether to include the secrets
+                associated with the service connector.
 
         Returns:
             A page of all service connectors.
@@ -2350,9 +2721,19 @@ class RestZenStore(BaseZenStore):
             route=SERVICE_CONNECTORS,
             response_model=ServiceConnectorResponse,
             filter_model=filter_model,
-            params={"expand_secrets": False, "hydrate": hydrate},
+            params={"hydrate": hydrate, "expand_secrets": expand_secrets},
         )
         self._populate_connector_type(*connector_models.items)
+        if expand_secrets:
+            # Call this to properly split the secrets from the configuration
+            for connector_model in connector_models.items:
+                try:
+                    connector_model.validate_configuration()
+                except ValueError as e:
+                    logger.error(
+                        f"Error validating connector configuration for "
+                        f"{connector_model.name}: {e}"
+                    )
         return connector_models
 
     def update_service_connector(
@@ -2392,6 +2773,14 @@ class RestZenStore(BaseZenStore):
             route=SERVICE_CONNECTORS,
         )
         self._populate_connector_type(connector_model)
+        # Call this to properly split the secrets from the configuration
+        try:
+            connector_model.validate_configuration()
+        except ValueError as e:
+            logger.error(
+                f"Error validating connector configuration for "
+                f"{connector_model.name}: {e}"
+            )
         return connector_model
 
     def delete_service_connector(self, service_connector_id: UUID) -> None:
@@ -2476,6 +2865,10 @@ class RestZenStore(BaseZenStore):
             f"{SERVICE_CONNECTORS}{SERVICE_CONNECTOR_VERIFY}",
             body=service_connector,
             params={"list_resources": list_resources},
+            timeout=max(
+                self.config.http_timeout,
+                SERVICE_CONNECTOR_VERIFY_REQUEST_TIMEOUT,
+            ),
         )
 
         resources = ServiceConnectorResourcesModel.model_validate(
@@ -2513,6 +2906,10 @@ class RestZenStore(BaseZenStore):
         response_body = self.put(
             f"{SERVICE_CONNECTORS}/{str(service_connector_id)}{SERVICE_CONNECTOR_VERIFY}",
             params=params,
+            timeout=max(
+                self.config.http_timeout,
+                SERVICE_CONNECTOR_VERIFY_REQUEST_TIMEOUT,
+            ),
         )
 
         resources = ServiceConnectorResourcesModel.model_validate(
@@ -2550,37 +2947,37 @@ class RestZenStore(BaseZenStore):
 
         connector = ServiceConnectorResponse.model_validate(response_body)
         self._populate_connector_type(connector)
+        # Call this to properly split the secrets from the configuration
+        try:
+            connector.validate_configuration()
+        except ValueError as e:
+            logger.error(
+                f"Error validating connector configuration for connector client "
+                f"{connector.name}: {e}"
+            )
         return connector
 
     def list_service_connector_resources(
         self,
-        workspace_name_or_id: Union[str, UUID],
-        connector_type: Optional[str] = None,
-        resource_type: Optional[str] = None,
-        resource_id: Optional[str] = None,
+        filter_model: ServiceConnectorFilter,
     ) -> List[ServiceConnectorResourcesModel]:
         """List resources that can be accessed by service connectors.
 
         Args:
-            workspace_name_or_id: The name or ID of the workspace to scope to.
-            connector_type: The type of service connector to scope to.
-            resource_type: The type of resource to scope to.
-            resource_id: The ID of the resource to scope to.
+            filter_model: The filter model to use when fetching service
+                connectors.
 
         Returns:
             The matching list of resources that available service
             connectors have access to.
         """
-        params = {}
-        if connector_type:
-            params["connector_type"] = connector_type
-        if resource_type:
-            params["resource_type"] = resource_type
-        if resource_id:
-            params["resource_id"] = resource_id
         response_body = self.get(
-            f"{WORKSPACES}/{workspace_name_or_id}{SERVICE_CONNECTORS}{SERVICE_CONNECTOR_RESOURCES}",
-            params=params,
+            SERVICE_CONNECTORS + SERVICE_CONNECTOR_RESOURCES,
+            params=filter_model.model_dump(exclude_none=True),
+            timeout=max(
+                self.config.http_timeout,
+                SERVICE_CONNECTOR_VERIFY_REQUEST_TIMEOUT,
+            ),
         )
 
         assert isinstance(response_body, list)
@@ -2604,7 +3001,9 @@ class RestZenStore(BaseZenStore):
 
             # Retrieve the resource list locally
             assert resources.id is not None
-            connector = self.get_service_connector(resources.id)
+            connector = self.get_service_connector(
+                resources.id, expand_secrets=True
+            )
             connector_instance = (
                 service_connector_registry.instantiate_connector(
                     model=connector
@@ -2613,12 +3012,12 @@ class RestZenStore(BaseZenStore):
 
             try:
                 local_resources = connector_instance.verify(
-                    resource_type=resource_type,
-                    resource_id=resource_id,
+                    resource_type=filter_model.resource_type,
+                    resource_id=filter_model.resource_id,
                 )
             except (ValueError, AuthorizationException) as e:
                 logger.error(
-                    f'Failed to fetch {resource_type or "available"} '
+                    f"Failed to fetch {filter_model.resource_type or 'available'} "
                     f"resources from service connector {connector.name}/"
                     f"{connector.id}: {e}"
                 )
@@ -2747,27 +3146,10 @@ class RestZenStore(BaseZenStore):
         Returns:
             The registered stack.
         """
-        return self._create_workspace_scoped_resource(
-            resource=stack,
-            route=STACKS,
-            response_model=StackResponse,
-        )
-
-    def create_full_stack(self, full_stack: FullStackRequest) -> StackResponse:
-        """Register a full-stack.
-
-        Args:
-            full_stack: The full stack configuration.
-
-        Returns:
-            The registered stack.
-        """
-        assert full_stack.workspace is not None
-
         return self._create_resource(
-            resource=full_stack,
+            resource=stack,
             response_model=StackResponse,
-            route=f"{WORKSPACES}/{str(full_stack.workspace)}{FULL_STACK}",
+            route=STACKS,
         )
 
     def get_stack(self, stack_id: UUID, hydrate: bool = True) -> StackResponse:
@@ -2859,13 +3241,13 @@ class RestZenStore(BaseZenStore):
         )
         return StackDeploymentInfo.model_validate(body)
 
-    def get_stack_deployment_url(
+    def get_stack_deployment_config(
         self,
         provider: StackDeploymentProvider,
         stack_name: str,
         location: Optional[str] = None,
-    ) -> Tuple[str, str]:
-        """Return the URL to deploy the ZenML stack to the specified cloud provider.
+    ) -> StackDeploymentConfig:
+        """Return the cloud provider console URL and configuration needed to deploy the ZenML stack.
 
         Args:
             provider: The stack deployment provider.
@@ -2873,11 +3255,8 @@ class RestZenStore(BaseZenStore):
             location: The location where the stack should be deployed.
 
         Returns:
-            The URL to deploy the ZenML stack to the specified cloud provider
-            and a text description of the URL.
-
-        Raises:
-            ValueError: If the response body is not as expected.
+            The cloud provider console URL and configuration needed to deploy
+            the ZenML stack to the specified cloud provider.
         """
         params = {
             "provider": provider.value,
@@ -2885,14 +3264,8 @@ class RestZenStore(BaseZenStore):
         }
         if location:
             params["location"] = location
-        body = self.get(f"{STACK_DEPLOYMENT}{URL}", params=params)
-
-        if not isinstance(body, list) or len(body) != 2:
-            raise ValueError(
-                "Bad response body received from the stack deployment URL "
-                "endpoint."
-            )
-        return body[0], body[1]
+        body = self.get(f"{STACK_DEPLOYMENT}{CONFIG}", params=params)
+        return StackDeploymentConfig.model_validate(body)
 
     def get_stack_deployment_stack(
         self,
@@ -3010,6 +3383,24 @@ class RestZenStore(BaseZenStore):
             response_model=StepRunResponse,
             route=STEPS,
         )
+
+    def update_step_heartbeat(
+        self, step_run_id: UUID
+    ) -> StepHeartbeatResponse:
+        """Updates a step run heartbeat.
+
+        Args:
+            step_run_id: The ID of the step to update.
+
+        Returns:
+            The step heartbeat response.
+        """
+        response_body = self.put(
+            path=f"{STEPS}/{str(step_run_id)}{HEARTBEAT}",
+            timeout=5,
+        )
+
+        return StepHeartbeatResponse.model_validate(response_body)
 
     # -------------------- Triggers  --------------------
 
@@ -3283,96 +3674,94 @@ class RestZenStore(BaseZenStore):
             route=USERS,
         )
 
-    # ----------------------------- Workspaces -----------------------------
+    # ----------------------------- Projects -----------------------------
 
-    def create_workspace(
-        self, workspace: WorkspaceRequest
-    ) -> WorkspaceResponse:
-        """Creates a new workspace.
+    def create_project(self, project: ProjectRequest) -> ProjectResponse:
+        """Creates a new project.
 
         Args:
-            workspace: The workspace to create.
+            project: The project to create.
 
         Returns:
-            The newly created workspace.
+            The newly created project.
         """
         return self._create_resource(
-            resource=workspace,
-            route=WORKSPACES,
-            response_model=WorkspaceResponse,
+            resource=project,
+            route=PROJECTS,
+            response_model=ProjectResponse,
         )
 
-    def get_workspace(
-        self, workspace_name_or_id: Union[UUID, str], hydrate: bool = True
-    ) -> WorkspaceResponse:
-        """Get an existing workspace by name or ID.
+    def get_project(
+        self, project_name_or_id: Union[UUID, str], hydrate: bool = True
+    ) -> ProjectResponse:
+        """Get an existing project by name or ID.
 
         Args:
-            workspace_name_or_id: Name or ID of the workspace to get.
+            project_name_or_id: Name or ID of the project to get.
             hydrate: Flag deciding whether to hydrate the output model(s)
                 by including metadata fields in the response.
 
         Returns:
-            The requested workspace.
+            The requested project.
         """
         return self._get_resource(
-            resource_id=workspace_name_or_id,
-            route=WORKSPACES,
-            response_model=WorkspaceResponse,
+            resource_id=project_name_or_id,
+            route=PROJECTS,
+            response_model=ProjectResponse,
             params={"hydrate": hydrate},
         )
 
-    def list_workspaces(
+    def list_projects(
         self,
-        workspace_filter_model: WorkspaceFilter,
+        project_filter_model: ProjectFilter,
         hydrate: bool = False,
-    ) -> Page[WorkspaceResponse]:
-        """List all workspace matching the given filter criteria.
+    ) -> Page[ProjectResponse]:
+        """List all projects matching the given filter criteria.
 
         Args:
-            workspace_filter_model: All filter parameters including pagination
+            project_filter_model: All filter parameters including pagination
                 params.
             hydrate: Flag deciding whether to hydrate the output model(s)
                 by including metadata fields in the response.
 
         Returns:
-            A list of all workspace matching the filter criteria.
+            A list of all projects matching the filter criteria.
         """
         return self._list_paginated_resources(
-            route=WORKSPACES,
-            response_model=WorkspaceResponse,
-            filter_model=workspace_filter_model,
+            route=PROJECTS,
+            response_model=ProjectResponse,
+            filter_model=project_filter_model,
             params={"hydrate": hydrate},
         )
 
-    def update_workspace(
-        self, workspace_id: UUID, workspace_update: WorkspaceUpdate
-    ) -> WorkspaceResponse:
-        """Update an existing workspace.
+    def update_project(
+        self, project_id: UUID, project_update: ProjectUpdate
+    ) -> ProjectResponse:
+        """Update an existing project.
 
         Args:
-            workspace_id: The ID of the workspace to be updated.
-            workspace_update: The update to be applied to the workspace.
+            project_id: The ID of the project to be updated.
+            project_update: The update to be applied to the project.
 
         Returns:
-            The updated workspace.
+            The updated project.
         """
         return self._update_resource(
-            resource_id=workspace_id,
-            resource_update=workspace_update,
-            route=WORKSPACES,
-            response_model=WorkspaceResponse,
+            resource_id=project_id,
+            resource_update=project_update,
+            route=PROJECTS,
+            response_model=ProjectResponse,
         )
 
-    def delete_workspace(self, workspace_name_or_id: Union[str, UUID]) -> None:
-        """Deletes a workspace.
+    def delete_project(self, project_name_or_id: Union[str, UUID]) -> None:
+        """Deletes a project.
 
         Args:
-            workspace_name_or_id: Name or ID of the workspace to delete.
+            project_name_or_id: Name or ID of the project to delete.
         """
         self._delete_resource(
-            resource_id=workspace_name_or_id,
-            route=WORKSPACES,
+            resource_id=project_name_or_id,
+            route=PROJECTS,
         )
 
     # --------------------------- Model ---------------------------
@@ -3386,19 +3775,19 @@ class RestZenStore(BaseZenStore):
         Returns:
             The newly created model.
         """
-        return self._create_workspace_scoped_resource(
+        return self._create_resource(
             resource=model,
             response_model=ModelResponse,
             route=MODELS,
         )
 
-    def delete_model(self, model_name_or_id: Union[str, UUID]) -> None:
+    def delete_model(self, model_id: UUID) -> None:
         """Deletes a model.
 
         Args:
-            model_name_or_id: name or id of the model to be deleted.
+            model_id: id of the model to be deleted.
         """
-        self._delete_resource(resource_id=model_name_or_id, route=MODELS)
+        self._delete_resource(resource_id=model_id, route=MODELS)
 
     def update_model(
         self,
@@ -3421,13 +3810,11 @@ class RestZenStore(BaseZenStore):
             response_model=ModelResponse,
         )
 
-    def get_model(
-        self, model_name_or_id: Union[str, UUID], hydrate: bool = True
-    ) -> ModelResponse:
+    def get_model(self, model_id: UUID, hydrate: bool = True) -> ModelResponse:
         """Get an existing model.
 
         Args:
-            model_name_or_id: name or id of the model to be retrieved.
+            model_id: id of the model to be retrieved.
             hydrate: Flag deciding whether to hydrate the output model(s)
                 by including metadata fields in the response.
 
@@ -3435,7 +3822,7 @@ class RestZenStore(BaseZenStore):
             The model of interest.
         """
         return self._get_resource(
-            resource_id=model_name_or_id,
+            resource_id=model_id,
             route=MODELS,
             response_model=ModelResponse,
             params={"hydrate": hydrate},
@@ -3477,10 +3864,10 @@ class RestZenStore(BaseZenStore):
         Returns:
             The newly created model version.
         """
-        return self._create_workspace_scoped_resource(
+        return self._create_resource(
             resource=model_version,
             response_model=ModelVersionResponse,
-            route=f"{MODELS}/{model_version.model}{MODEL_VERSIONS}",
+            route=MODEL_VERSIONS,
         )
 
     def delete_model_version(
@@ -3494,7 +3881,7 @@ class RestZenStore(BaseZenStore):
         """
         self._delete_resource(
             resource_id=model_version_id,
-            route=f"{MODEL_VERSIONS}",
+            route=MODEL_VERSIONS,
         )
 
     def get_model_version(
@@ -3521,14 +3908,11 @@ class RestZenStore(BaseZenStore):
     def list_model_versions(
         self,
         model_version_filter_model: ModelVersionFilter,
-        model_name_or_id: Optional[Union[str, UUID]] = None,
         hydrate: bool = False,
     ) -> Page[ModelVersionResponse]:
         """Get all model versions by filter.
 
         Args:
-            model_name_or_id: name or id of the model containing the model
-                versions.
             model_version_filter_model: All filter parameters including
                 pagination params.
             hydrate: Flag deciding whether to hydrate the output model(s)
@@ -3537,20 +3921,12 @@ class RestZenStore(BaseZenStore):
         Returns:
             A page of all model versions.
         """
-        if model_name_or_id:
-            return self._list_paginated_resources(
-                route=f"{MODELS}/{model_name_or_id}{MODEL_VERSIONS}",
-                response_model=ModelVersionResponse,
-                filter_model=model_version_filter_model,
-                params={"hydrate": hydrate},
-            )
-        else:
-            return self._list_paginated_resources(
-                route=MODEL_VERSIONS,
-                response_model=ModelVersionResponse,
-                filter_model=model_version_filter_model,
-                params={"hydrate": hydrate},
-            )
+        return self._list_paginated_resources(
+            route=MODEL_VERSIONS,
+            response_model=ModelVersionResponse,
+            filter_model=model_version_filter_model,
+            params={"hydrate": hydrate},
+        )
 
     def update_model_version(
         self,
@@ -3588,10 +3964,10 @@ class RestZenStore(BaseZenStore):
         Returns:
             The newly created model version to artifact link.
         """
-        return self._create_workspace_scoped_resource(
+        return self._create_resource(
             resource=model_version_artifact_link,
             response_model=ModelVersionArtifactResponse,
-            route=f"{MODEL_VERSIONS}/{model_version_artifact_link.model_version}{ARTIFACTS}",
+            route=MODEL_VERSION_ARTIFACTS,
         )
 
     def list_model_version_artifact_links(
@@ -3668,10 +4044,10 @@ class RestZenStore(BaseZenStore):
             - Otherwise, returns the newly created model version to pipeline
                 run link.
         """
-        return self._create_workspace_scoped_resource(
+        return self._create_resource(
             resource=model_version_pipeline_run_link,
             response_model=ModelVersionPipelineRunResponse,
-            route=f"{MODEL_VERSIONS}/{model_version_pipeline_run_link.model_version}{RUNS}",
+            route=MODEL_VERSION_PIPELINE_RUNS,
         )
 
     def list_model_version_pipeline_run_links(
@@ -3784,22 +4160,25 @@ class RestZenStore(BaseZenStore):
         self._delete_resource(resource_id=device_id, route=DEVICES)
 
     # -------------------
-    # Pipeline API Tokens
+    # API Tokens
     # -------------------
 
     def get_api_token(
         self,
-        pipeline_id: Optional[UUID] = None,
+        token_type: APITokenType = APITokenType.WORKLOAD,
+        expires_in: Optional[int] = None,
         schedule_id: Optional[UUID] = None,
-        expires_minutes: Optional[int] = None,
+        pipeline_run_id: Optional[UUID] = None,
+        deployment_id: Optional[UUID] = None,
     ) -> str:
-        """Get an API token for a workload.
+        """Get an API token.
 
         Args:
-            pipeline_id: The ID of the pipeline to get a token for.
+            token_type: The type of the token to get.
+            expires_in: The time in seconds until the token expires.
             schedule_id: The ID of the schedule to get a token for.
-            expires_minutes: The number of minutes for which the token should
-                be valid. If not provided, the token will be valid indefinitely.
+            pipeline_run_id: The ID of the pipeline run to get a token for.
+            deployment_id: The ID of the deployment to get a token for.
 
         Returns:
             The API token.
@@ -3807,13 +4186,17 @@ class RestZenStore(BaseZenStore):
         Raises:
             ValueError: if the server response is not valid.
         """
-        params: Dict[str, Any] = {}
-        if pipeline_id:
-            params["pipeline_id"] = pipeline_id
+        params: Dict[str, Any] = {
+            "token_type": token_type.value,
+        }
+        if expires_in:
+            params["expires_in"] = expires_in
         if schedule_id:
             params["schedule_id"] = schedule_id
-        if expires_minutes:
-            params["expires_minutes"] = expires_minutes
+        if pipeline_run_id:
+            params["pipeline_run_id"] = pipeline_run_id
+        if deployment_id:
+            params["deployment_id"] = deployment_id
         response_body = self.get(API_TOKEN, params=params)
         if not isinstance(response_body, str):
             raise ValueError(
@@ -3843,22 +4226,27 @@ class RestZenStore(BaseZenStore):
 
     def delete_tag(
         self,
-        tag_name_or_id: Union[str, UUID],
+        tag_id: UUID,
     ) -> None:
         """Deletes a tag.
 
         Args:
-            tag_name_or_id: name or id of the tag to delete.
+            tag_id: id of the tag to delete.
         """
-        self._delete_resource(resource_id=tag_name_or_id, route=TAGS)
+        self._delete_resource(
+            resource_id=tag_id,
+            route=TAGS,
+        )
 
     def get_tag(
-        self, tag_name_or_id: Union[str, UUID], hydrate: bool = True
+        self,
+        tag_id: UUID,
+        hydrate: bool = True,
     ) -> TagResponse:
         """Get an existing tag.
 
         Args:
-            tag_name_or_id: name or id of the tag to be retrieved.
+            tag_id: id of the tag to be retrieved.
             hydrate: Flag deciding whether to hydrate the output model(s)
                 by including metadata fields in the response.
 
@@ -3866,7 +4254,7 @@ class RestZenStore(BaseZenStore):
             The tag of interest.
         """
         return self._get_resource(
-            resource_id=tag_name_or_id,
+            resource_id=tag_id,
             route=TAGS,
             response_model=TagResponse,
             params={"hydrate": hydrate},
@@ -3896,144 +4284,382 @@ class RestZenStore(BaseZenStore):
 
     def update_tag(
         self,
-        tag_name_or_id: Union[str, UUID],
+        tag_id: UUID,
         tag_update_model: TagUpdate,
     ) -> TagResponse:
         """Update tag.
 
         Args:
-            tag_name_or_id: name or id of the tag to be updated.
+            tag_id: id of the tag to be updated.
             tag_update_model: Tag to use for the update.
 
         Returns:
             An updated tag.
         """
-        tag = self.get_tag(tag_name_or_id)
         return self._update_resource(
-            resource_id=tag.id,
+            resource_id=tag_id,
             resource_update=tag_update_model,
             route=TAGS,
             response_model=TagResponse,
+        )
+
+    # ---------------------------- Tag Resource ----------------------------
+
+    def create_tag_resource(
+        self,
+        tag_resource: TagResourceRequest,
+    ) -> TagResourceResponse:
+        """Create a new tag resource.
+
+        Args:
+            tag_resource: The tag resource to be created.
+
+        Returns:
+            The newly created tag resource.
+        """
+        return self._create_resource(
+            resource=tag_resource,
+            response_model=TagResourceResponse,
+            route=TAG_RESOURCES,
+        )
+
+    def batch_create_tag_resource(
+        self, tag_resources: List[TagResourceRequest]
+    ) -> List[TagResourceResponse]:
+        """Create a batch of tag resource relationships.
+
+        Args:
+            tag_resources: The tag resource relationships to be created.
+
+        Returns:
+            The newly created tag resource relationships.
+        """
+        return self._batch_create_resources(
+            resources=tag_resources,
+            response_model=TagResourceResponse,
+            route=TAG_RESOURCES,
+        )
+
+    def delete_tag_resource(
+        self,
+        tag_resource: TagResourceRequest,
+    ) -> None:
+        """Delete a tag resource.
+
+        Args:
+            tag_resource: The tag resource relationship to delete.
+        """
+        self.delete(path=TAG_RESOURCES, body=tag_resource)
+
+    def batch_delete_tag_resource(
+        self, tag_resources: List[TagResourceRequest]
+    ) -> None:
+        """Delete a batch of tag resources.
+
+        Args:
+            tag_resources: The tag resource relationships to be deleted.
+        """
+        self._batch_delete_resources(
+            resources=tag_resources,
+            route=TAG_RESOURCES,
         )
 
     # =======================
     # Internal helper methods
     # =======================
 
-    def _get_auth_token(self) -> str:
-        """Get the authentication token for the REST store.
+    def get_or_generate_api_token(self) -> str:
+        """Get or generate an API token.
 
         Returns:
-            The authentication token.
+            The API token.
 
         Raises:
-            ValueError: if the response from the server isn't in the right
-                format.
+            CredentialsNotValid: if an API token cannot be fetched or
+                generated because the client credentials are not valid.
         """
-        if self._api_token is None:
-            # Check if the API token is already stored in the config
-            if self.config.api_token:
-                self._api_token = self.config.api_token
-            # Check if the username and password are provided in the config
-            elif (
-                self.config.username is not None
-                and self.config.password is not None
-                or self.config.api_key is not None
-            ):
-                data: Optional[Dict[str, str]] = None
-                if self.config.api_key is not None:
-                    data = {
-                        "grant_type": OAuthGrantTypes.ZENML_API_KEY.value,
-                        "password": self.config.api_key,
-                    }
-                elif (
-                    self.config.username is not None
-                    and self.config.password is not None
-                ):
-                    data = {
-                        "grant_type": OAuthGrantTypes.OAUTH_PASSWORD.value,
-                        "username": self.config.username,
-                        "password": self.config.password,
-                    }
+        if self._api_token is None or self._api_token.expired:
+            # Check if a valid API token is already in the cache
+            credentials_store = get_credentials_store()
+            credentials = credentials_store.get_credentials(self.url)
+            token = credentials.api_token if credentials else None
+            if credentials and token and not token.expired:
+                self._api_token = token
+                return self._api_token.access_token
 
-                response = self._handle_response(
-                    requests.post(
-                        self.url + API + VERSION_1 + LOGIN,
-                        data=data,
-                        verify=self.config.verify_ssl,
-                        timeout=self.config.http_timeout,
-                    )
-                )
-                if (
-                    not isinstance(response, dict)
-                    or "access_token" not in response
-                ):
-                    raise ValueError(
-                        f"Bad API Response. Expected access token dict, got "
-                        f"{type(response)}"
-                    )
-                self._api_token = response["access_token"]
-                self.config.api_token = self._api_token
+            # Token is expired or not found in the cache. Time to get a new one.
+
+            if not token:
+                logger.debug(f"Authenticating to {self.url}")
             else:
-                raise ValueError(
-                    "No API token, API key or username/password provided. "
-                    "Please provide either an API token, an API key or a "
-                    "username and password in the ZenML config."
+                logger.debug(
+                    f"Authentication token for {self.url} expired; refreshing..."
                 )
-        return self._api_token
+
+            data: Optional[Dict[str, str]] = None
+
+            # Use a custom user agent to identify the ZenML client in the server
+            # logs.
+            headers: Dict[str, str] = {
+                "User-Agent": "zenml/" + zenml.__version__,
+            }
+
+            # Check if an API key is configured
+            api_key = credentials_store.get_api_key(self.url)
+
+            # Check if username and password are configured
+            username, password = credentials_store.get_password(self.url)
+
+            if api_key is not None:
+                # An API key is configured. Use it as a password to
+                # authenticate.
+                data = {
+                    "grant_type": OAuthGrantTypes.ZENML_API_KEY.value,
+                    "password": api_key,
+                }
+            elif username is not None and password is not None:
+                # Username and password are configured. Use them to authenticate.
+                data = {
+                    "grant_type": OAuthGrantTypes.OAUTH_PASSWORD.value,
+                    "username": username,
+                    "password": password,
+                }
+            elif self.server_info.is_pro_server():
+                # ZenML Pro workspaces use a proprietary authorization grant
+                # where the ZenML Pro API session token is exchanged for a
+                # regular ZenML server access token.
+
+                # Get the ZenML Pro API session token, if cached and valid
+
+                # We need to determine the right ZenML Pro API URL to use
+                pro_api_url = self.server_info.pro_api_url
+                if not pro_api_url and credentials and credentials.pro_api_url:
+                    pro_api_url = credentials.pro_api_url
+                if not pro_api_url:
+                    pro_api_url = ZENML_PRO_API_URL
+
+                pro_credentials = credentials_store.get_pro_credentials(
+                    pro_api_url
+                )
+                if not pro_credentials:
+                    raise CredentialsNotValid(
+                        "You need to be logged in to ZenML Pro in order to "
+                        f"access the ZenML Pro server '{self.url}'. Please run "
+                        "'zenml login' to log in or choose a different server."
+                    )
+
+                elif pro_credentials.has_valid_token:
+                    assert pro_credentials.api_token is not None
+                    pro_token = pro_credentials.api_token
+                elif pro_credentials.can_refresh_token:
+                    pro_token = ZenMLProClient(pro_api_url).authenticate()
+                else:
+                    raise CredentialsNotValid(
+                        "Your ZenML Pro login session has expired. "
+                        "Please log in again using 'zenml login'."
+                    )
+
+                data = {
+                    "grant_type": OAuthGrantTypes.ZENML_EXTERNAL.value,
+                }
+                headers.update(
+                    {"Authorization": "Bearer " + pro_token.access_token}
+                )
+            else:
+                if not token:
+                    raise CredentialsNotValid(
+                        "No valid credentials found. Please run 'zenml login "
+                        f"--url {self.url}' to connect to the current server."
+                    )
+                elif token.expired:
+                    raise CredentialsNotValid(
+                        "Your authentication to the current server has expired. "
+                        "Please log in again using 'zenml login "
+                        f"{self.url}'."
+                    )
+
+            response = self._handle_response(
+                requests.post(
+                    self.url + API + VERSION_1 + LOGIN,
+                    data=data,
+                    verify=self.config.verify_ssl,
+                    timeout=self.config.http_timeout,
+                    headers=headers,
+                )
+            )
+            try:
+                token_response = OAuthTokenResponse.model_validate(response)
+            except ValidationError as e:
+                raise CredentialsNotValid(
+                    "Unexpected response received while authenticating to "
+                    f"the server {e}"
+                ) from e
+
+            # Cache the token
+            self._api_token = credentials_store.set_token(
+                self.url, token_response
+            )
+
+            # Update the server info in the credentials store with the latest
+            # information from the server.
+            # NOTE: this is the best place to do this because we know that
+            # the token is valid and the server is reachable.
+            try:
+                server_info = self.get_store_info()
+            except Exception as e:
+                logger.warning(f"Failed to get server info: {e}.")
+            else:
+                credentials_store.update_server_info(self.url, server_info)
+
+        return self._api_token.access_token
 
     @property
     def session(self) -> requests.Session:
-        """Authenticate to the ZenML server.
+        """Initialize and return a requests session.
 
         Returns:
-            A requests session with the authentication token.
+            A requests session.
         """
-        if self._session is None:
-            if self.config.verify_ssl is False:
-                urllib3.disable_warnings(
-                    urllib3.exceptions.InsecureRequestWarning
+        with self._session_lock:
+            if self._session is None:
+                # We only need to initialize the session once over the lifetime
+                # of the client. We can swap the token out when it expires.
+                if self.config.verify_ssl is False:
+                    urllib3.disable_warnings(
+                        urllib3.exceptions.InsecureRequestWarning
+                    )
+
+                self._session = requests.Session()
+                # Retries are triggered for all HTTP methods (GET, HEAD, POST, PUT,
+                # PATCH, OPTIONS and DELETE) on specific HTTP status codes:
+                #
+                #     408: Request Timeout.
+                #     429: Too Many Requests.
+                #     502: Bad Gateway.
+                #     503: Service Unavailable.
+                #     504: Gateway Timeout
+                #
+                # This also handles connection level errors, if a connection attempt
+                # fails due to transient issues like:
+                #
+                #     DNS resolution errors.
+                #     Connection timeouts.
+                #     Network disruptions.
+                #
+                # Additional errors retried:
+                #
+                #     Read Timeouts: If the server does not send a response within
+                #     the timeout period.
+                #     Connection Refused: If the server refuses the connection.
+                #
+                retries = Retry(
+                    connect=5,
+                    read=8,
+                    redirect=3,
+                    status=10,
+                    allowed_methods=[
+                        "HEAD",
+                        "GET",
+                        "POST",
+                        "PUT",
+                        "PATCH",
+                        "DELETE",
+                        "OPTIONS",
+                    ],
+                    status_forcelist=[
+                        408,  # Request Timeout
+                        429,  # Too Many Requests
+                        502,  # Bad Gateway
+                        503,  # Service Unavailable
+                        504,  # Gateway Timeout
+                    ],
+                    other=3,
+                    backoff_factor=1,
+                )
+                http_adapter = HTTPAdapter(
+                    max_retries=retries,
+                    pool_maxsize=self.config.connection_pool_size,
+                )
+                self._session.mount("https://", http_adapter)
+                self._session.mount("http://", http_adapter)
+                self._session.verify = self.config.verify_ssl
+                # Use a custom user agent to identify the ZenML client in the server
+                # logs.
+                self._session.headers.update(
+                    {"User-Agent": "zenml/" + zenml.__version__}
                 )
 
-            self._session = requests.Session()
-            retries = Retry(backoff_factor=0.1, connect=5)
-            self._session.mount("https://", HTTPAdapter(max_retries=retries))
-            self._session.mount("http://", HTTPAdapter(max_retries=retries))
-            self._session.verify = self.config.verify_ssl
-            token = self._get_auth_token()
-            self._session.headers.update({"Authorization": "Bearer " + token})
-            logger.debug("Authenticated to ZenML server.")
-        return self._session
+            # Note that we return an unauthenticated session here. An API token
+            # is only fetched and set in the authorization header when and if it is
+            # needed.
+            return self._session
 
-    def clear_session(self) -> None:
-        """Clear the authentication session and any cached API tokens.
+    def reinitialize_session(self) -> None:
+        """Reinitialize the session.
 
-        Raises:
-            AuthorizationException: If the API token can't be reset because
-                the store configuration does not contain username and password
-                or an API key to fetch a new token.
+        This is used to reset the session to a new one with a new connection pool.
         """
-        self._session = None
+        with self._session_lock:
+            if self._session is not None:
+                headers = dict(self._session.headers.items())
+                self._session.close()
+                self._session = None
+                self.session.headers.update(headers)
+
+    def authenticate(self, force: bool = False) -> None:
+        """Authenticate or re-authenticate to the ZenML server.
+
+        Args:
+            force: If True, force a re-authentication even if a valid API token
+                is currently cached. This is useful when the current API token
+                is known to be invalid or expired.
+        """
+        # This is called to trigger an authentication flow, either because
+        # the current API token is expired or no longer valid, or because
+        # a configuration change has happened or merely because an
+        # authentication was never attempted before.
+        #
+        # 1. Drop the API token currently being used, if any.
+        # 2. If force=True, clear the current API token from the credentials
+        # store, if any, otherwise it will just be re-used on the next call.
+        # 3. Get a new API token
+
+        # The authentication token could have expired or invalidated through
+        # other means; refresh it and try again. This will clear any cached
+        # token and trigger a new authentication flow.
+        if self._api_token and not force:
+            if self._api_token.expired:
+                logger.info(
+                    "Authentication session expired; attempting to "
+                    "re-authenticate."
+                )
+            else:
+                logger.info(
+                    "Authentication session was invalidated by the server; "
+                    "This can happen for example if the user's permissions "
+                    "have been revoked or if the server has been restarted "
+                    "and lost its session state. Attempting to "
+                    "re-authenticate."
+                )
+        else:
+            if force:
+                # Clear the current API token from the credentials store, if
+                # any, to force a new authentication flow.
+                get_credentials_store().clear_token(self.url)
+            # Never authenticated since the client was created or the API token
+            # was explicitly cleared.
+            logger.debug(f"Authenticating to {self.url}...")
+
         self._api_token = None
-        # Clear the configured API token only if it's possible to fetch a new
-        # one from the server using other credentials (username/password or
-        # service account API key).
-        if (
-            self.config.username is not None
-            and self.config.password is not None
-            or self.config.api_key is not None
-        ):
-            self.config.api_token = None
-        elif self.config.api_token:
-            raise AuthorizationException(
-                "Unable to refresh invalid API token. This is probably "
-                "because you're connected to your ZenML server with device "
-                "authentication. Rerunning `zenml connect --url "
-                f"{self.config.url}` should solve this issue. "
-                "If you're seeing this error from an automated workload, "
-                "you should probably use a service account to start that "
-                "workload to prevent this error."
-            )
+
+        new_api_token = self.get_or_generate_api_token()
+
+        # Set or refresh the authentication token
+        self.session.headers.update(
+            {"Authorization": "Bearer " + new_api_token}
+        )
+        logger.debug(f"Authenticated to {self.url}")
+        self._last_authenticated = utc_now()
 
     @staticmethod
     def _handle_response(response: requests.Response) -> Json:
@@ -4081,6 +4707,7 @@ class RestZenStore(BaseZenStore):
         method: str,
         url: str,
         params: Optional[Dict[str, Any]] = None,
+        timeout: Optional[int] = None,
         **kwargs: Any,
     ) -> Json:
         """Make a request to the REST API.
@@ -4089,92 +4716,191 @@ class RestZenStore(BaseZenStore):
             method: The HTTP method to use.
             url: The URL to request.
             params: The query parameters to pass to the endpoint.
+            timeout: The request timeout in seconds.
             kwargs: Additional keyword arguments to pass to the request.
 
         Returns:
             The parsed response.
 
         Raises:
-            AuthorizationException: if the request fails due to an expired
-                authentication token.
+            CredentialsNotValid: if the request fails due to invalid
+                client credentials.
         """
-        params = {k: str(v) for k, v in params.items()} if params else {}
+        request_headers = {
+            source_context.name: source_context.get().value,
+        }
 
-        self.session.headers.update(
-            {source_context.name: source_context.get().value}
-        )
+        # If the server replies with a credentials validation (401 Unauthorized)
+        # error, we (re-)authenticate and retry the request here in the
+        # following cases:
+        #
+        # 1. initial authentication: the last request was not authenticated
+        # with an API token.
+        # 2. re-authentication: the last request was authenticated with an API
+        # token that was rejected by the server. This is to cover the case
+        # of expired tokens that can be refreshed by the client automatically
+        # without user intervention from other sources (e.g. API keys).
+        #
+        # NOTE: it can happen that the same request is retried here for up to
+        # two times: once after initial authentication and once after
+        # re-authentication.
+        re_authenticated = False
+        path = url.removeprefix(self.url)
+        while True:
+            # Add a request ID to the request headers
+            request_id = str(uuid4())[:8]
+            request_headers["X-Request-ID"] = request_id
+            # Add an idempotency key to the request headers to ensure that
+            # requests are idempotent.
+            request_headers["Idempotency-Key"] = str(uuid4())
 
-        try:
-            return self._handle_response(
-                self.session.request(
+            start_time = time.time()
+            logger.debug(f"[{request_id}] {method} {path} started...")
+            status_code = "failed"
+            last_authenticated = self._last_authenticated
+
+            try:
+                response = self.session.request(
                     method,
                     url,
-                    params=params,
+                    headers=request_headers,
+                    params=params if params else {},
                     verify=self.config.verify_ssl,
-                    timeout=self.config.http_timeout,
+                    timeout=timeout or self.config.http_timeout,
                     **kwargs,
                 )
-            )
-        except AuthorizationException:
-            # The authentication token could have expired; refresh it and try
-            # again. This will clear any cached token and trigger a new
-            # authentication flow.
-            self.clear_session()
-            logger.info("Authentication token expired; refreshing...")
 
-        try:
-            return self._handle_response(
-                self.session.request(
-                    method,
-                    url,
-                    params=params,
-                    verify=self.config.verify_ssl,
-                    timeout=self.config.http_timeout,
-                    **kwargs,
+                status_code = str(response.status_code)
+                return self._handle_response(response)
+            except CredentialsNotValid as e:
+                # NOTE: CredentialsNotValid is raised only when the server
+                # explicitly indicates that the credentials are not valid and
+                # they can be thrown away or when the request is not
+                # authenticated at all.
+                credentials_store = get_credentials_store()
+
+                with self._session_lock:
+                    if self._last_authenticated != last_authenticated:
+                        # Another thread has re-authenticated since the last
+                        # request. We simply retry the request.
+                        continue
+
+                    if self._api_token is None:
+                        # The last request was not authenticated with an API
+                        # token at all. We authenticate here and then try the
+                        # request again, this time with a valid API token in the
+                        # header.
+                        logger.debug(
+                            f"[{request_id}] The last request was not "
+                            f"authenticated: {e}\n"
+                            "Re-authenticating and retrying..."
+                        )
+                        self.authenticate()
+                    elif not credentials_store.can_login(self.url):
+                        # The request failed either because we're not
+                        # authenticated or our current credentials are not valid
+                        # anymore.
+                        logger.error(
+                            "The current token is no longer valid, and "
+                            "it is not possible to generate a new token using the "
+                            "configured credentials. Please run "
+                            f"`zenml login {self.url}` to "
+                            "re-authenticate to the server or authenticate using "
+                            "an API key. See "
+                            "https://docs.zenml.io/deploying-zenml/connecting-to-zenml/connect-with-a-service-account "
+                            "for more information."
+                        )
+                        # Clear the current token from the credentials store to
+                        # force a new authentication flow next time.
+                        get_credentials_store().clear_token(self.url)
+                        raise e
+                    elif not re_authenticated:
+                        # The last request was authenticated with an API token
+                        # that was rejected by the server. We attempt a
+                        # re-authentication here and then retry the request.
+                        logger.debug(
+                            f"[{request_id}] The last request was authenticated "
+                            "with an API token that was rejected by the server: "
+                            f"{e}\n"
+                            "Re-authenticating and retrying..."
+                        )
+                        re_authenticated = True
+                        self.authenticate(
+                            # Ignore the current token and force a re-authentication
+                            force=True
+                        )
+                    else:
+                        # The last request was made after re-authenticating but
+                        # still failed. Bailing out.
+                        logger.debug(
+                            f"[{request_id}] The last request failed after "
+                            "re-authenticating: {e}\n"
+                            "Bailing out..."
+                        )
+                        raise CredentialsNotValid(
+                            "The current credentials are no longer valid. Please "
+                            "log in again using 'zenml login'."
+                        ) from e
+            finally:
+                end_time = time.time()
+                duration = (end_time - start_time) * 1000
+                logger.debug(
+                    f"[{request_id}] {status_code} {method} {path} took "
+                    f"{duration:.2f}ms."
                 )
-            )
-        except AuthorizationException:
-            logger.info(
-                "Your authentication token has expired. Please re-authenticate."
-            )
-            raise
 
     def get(
-        self, path: str, params: Optional[Dict[str, Any]] = None, **kwargs: Any
+        self,
+        path: str,
+        params: Optional[Dict[str, Any]] = None,
+        timeout: Optional[int] = None,
+        **kwargs: Any,
     ) -> Json:
         """Make a GET request to the given endpoint path.
 
         Args:
             path: The path to the endpoint.
             params: The query parameters to pass to the endpoint.
+            timeout: The request timeout in seconds.
             kwargs: Additional keyword arguments to pass to the request.
 
         Returns:
             The response body.
         """
-        logger.debug(f"Sending GET request to {path}...")
         return self._request(
-            "GET", self.url + API + VERSION_1 + path, params=params, **kwargs
+            "GET",
+            self.url + API + VERSION_1 + path,
+            params=params,
+            timeout=timeout,
+            **kwargs,
         )
 
     def delete(
-        self, path: str, params: Optional[Dict[str, Any]] = None, **kwargs: Any
+        self,
+        path: str,
+        body: Optional[BaseModel] = None,
+        params: Optional[Dict[str, Any]] = None,
+        timeout: Optional[int] = None,
+        **kwargs: Any,
     ) -> Json:
         """Make a DELETE request to the given endpoint path.
 
         Args:
             path: The path to the endpoint.
+            body: The body to send.
             params: The query parameters to pass to the endpoint.
+            timeout: The request timeout in seconds.
             kwargs: Additional keyword arguments to pass to the request.
 
         Returns:
             The response body.
         """
-        logger.debug(f"Sending DELETE request to {path}...")
         return self._request(
             "DELETE",
             self.url + API + VERSION_1 + path,
+            json=body.model_dump(mode="json") if body else None,
             params=params,
+            timeout=timeout,
             **kwargs,
         )
 
@@ -4183,6 +4909,7 @@ class RestZenStore(BaseZenStore):
         path: str,
         body: BaseModel,
         params: Optional[Dict[str, Any]] = None,
+        timeout: Optional[int] = None,
         **kwargs: Any,
     ) -> Json:
         """Make a POST request to the given endpoint path.
@@ -4191,17 +4918,18 @@ class RestZenStore(BaseZenStore):
             path: The path to the endpoint.
             body: The body to send.
             params: The query parameters to pass to the endpoint.
+            timeout: The request timeout in seconds.
             kwargs: Additional keyword arguments to pass to the request.
 
         Returns:
             The response body.
         """
-        logger.debug(f"Sending POST request to {path}...")
         return self._request(
             "POST",
             self.url + API + VERSION_1 + path,
-            data=body.model_dump_json(),
+            json=body.model_dump(mode="json"),
             params=params,
+            timeout=timeout,
             **kwargs,
         )
 
@@ -4210,6 +4938,7 @@ class RestZenStore(BaseZenStore):
         path: str,
         body: Optional[BaseModel] = None,
         params: Optional[Dict[str, Any]] = None,
+        timeout: Optional[int] = None,
         **kwargs: Any,
     ) -> Json:
         """Make a PUT request to the given endpoint path.
@@ -4218,18 +4947,21 @@ class RestZenStore(BaseZenStore):
             path: The path to the endpoint.
             body: The body to send.
             params: The query parameters to pass to the endpoint.
+            timeout: The request timeout in seconds.
             kwargs: Additional keyword arguments to pass to the request.
 
         Returns:
             The response body.
         """
-        logger.debug(f"Sending PUT request to {path}...")
-        data = body.model_dump_json(exclude_unset=True) if body else None
+        json = (
+            body.model_dump(mode="json", exclude_unset=True) if body else None
+        )
         return self._request(
             "PUT",
             self.url + API + VERSION_1 + path,
-            data=data,
+            json=json,
             params=params,
+            timeout=timeout,
             **kwargs,
         )
 
@@ -4256,31 +4988,39 @@ class RestZenStore(BaseZenStore):
 
         return response_model.model_validate(response_body)
 
-    def _create_workspace_scoped_resource(
+    def _batch_create_resources(
         self,
-        resource: AnyWorkspaceScopedRequest,
+        resources: List[AnyRequest],
         response_model: Type[AnyResponse],
         route: str,
         params: Optional[Dict[str, Any]] = None,
-    ) -> AnyResponse:
-        """Create a new workspace scoped resource.
+    ) -> List[AnyResponse]:
+        """Create a new batch of resources.
 
         Args:
-            resource: The resource to create.
-            route: The resource REST API route to use.
-            response_model: Optional model to use to deserialize the response
-                body. If not provided, the resource class itself will be used.
+            resources: The resources to create.
+            response_model: The response model of an individual resource.
+            route: The resource REST route to use.
             params: Optional query parameters to pass to the endpoint.
 
         Returns:
-            The created resource.
+            List of response models.
         """
-        return self._create_resource(
-            resource=resource,
-            response_model=response_model,
-            route=f"{WORKSPACES}/{str(resource.workspace)}{route}",
+        json_data = [
+            resource.model_dump(mode="json") for resource in resources
+        ]
+        response = self._request(
+            "POST",
+            self.url + API + VERSION_1 + route + BATCH,
+            json=json_data,
             params=params,
         )
+        assert isinstance(response, list)
+
+        return [
+            response_model.model_validate(model_data)
+            for model_data in response
+        ]
 
     def _get_or_create_resource(
         self,
@@ -4308,56 +5048,29 @@ class RestZenStore(BaseZenStore):
                 a boolean indicating whether the resource was created or not.
         """
         response_body = self.post(
-            f"{route}{GET_OR_CREATE}",
+            route,
             body=resource,
             params=params,
         )
         if not isinstance(response_body, list):
             raise ValueError(
-                f"Expected a list response from the {route}{GET_OR_CREATE} "
+                f"Expected a list response from the {route} "
                 f"endpoint but got {type(response_body)} instead."
             )
         if len(response_body) != 2:
             raise ValueError(
                 f"Expected a list response with 2 elements from the "
-                f"{route}{GET_OR_CREATE} endpoint but got {len(response_body)} "
+                f"{route} endpoint but got {len(response_body)} "
                 f"elements instead."
             )
         model_json, was_created = response_body
         if not isinstance(was_created, bool):
             raise ValueError(
                 f"Expected a boolean as the second element of the list "
-                f"response from the {route}{GET_OR_CREATE} endpoint but got "
+                f"response from the {route} endpoint but got "
                 f"{type(was_created)} instead."
             )
         return response_model.model_validate(model_json), was_created
-
-    def _get_or_create_workspace_scoped_resource(
-        self,
-        resource: AnyWorkspaceScopedRequest,
-        response_model: Type[AnyResponse],
-        route: str,
-        params: Optional[Dict[str, Any]] = None,
-    ) -> Tuple[AnyResponse, bool]:
-        """Get or create a workspace scoped resource.
-
-        Args:
-            resource: The resource to get or create.
-            route: The resource REST API route to use.
-            response_model: Optional model to use to deserialize the response
-                body. If not provided, the resource class itself will be used.
-            params: Optional query parameters to pass to the endpoint.
-
-        Returns:
-            The created resource, and a boolean indicating whether the resource
-            was created or not.
-        """
-        return self._get_or_create_resource(
-            resource=resource,
-            response_model=response_model,
-            route=f"{WORKSPACES}/{str(resource.workspace)}{route}",
-            params=params,
-        )
 
     def _get_resource(
         self,
@@ -4474,12 +5187,39 @@ class RestZenStore(BaseZenStore):
         return response_model.model_validate(response_body)
 
     def _delete_resource(
-        self, resource_id: Union[str, UUID], route: str
+        self,
+        resource_id: Union[str, UUID],
+        route: str,
+        params: Optional[Dict[str, Any]] = None,
     ) -> None:
         """Delete a resource.
 
         Args:
             resource_id: The ID of the resource to delete.
             route: The resource REST API route to use.
+            params: Optional query parameters to pass to the endpoint.
         """
-        self.delete(f"{route}/{str(resource_id)}")
+        self.delete(f"{route}/{str(resource_id)}", params=params)
+
+    def _batch_delete_resources(
+        self,
+        resources: Sequence[BaseModel],
+        route: str,
+        params: Optional[Dict[str, Any]] = None,
+    ) -> None:
+        """Delete a batch of resources.
+
+        Args:
+            resources: The resources to delete.
+            route: The resource REST route to use.
+            params: Optional query parameters to pass to the endpoint.
+        """
+        json_data = [
+            resource.model_dump(mode="json") for resource in resources
+        ]
+        self._request(
+            "DELETE",
+            self.url + API + VERSION_1 + route + BATCH,
+            json=json_data,
+            params=params,
+        )

@@ -14,12 +14,12 @@
 """Implementation of the Skypilot base VM orchestrator."""
 
 import os
-import re
 from abc import abstractmethod
-from typing import TYPE_CHECKING, Any, Dict, Optional, Tuple, cast
+from typing import TYPE_CHECKING, Dict, Optional, Tuple, cast
 from uuid import uuid4
 
 import sky
+from sky import StatusRefreshMode
 
 from zenml.entrypoints import PipelineEntrypointConfiguration
 from zenml.enums import StackComponentType
@@ -31,15 +31,25 @@ from zenml.integrations.skypilot.flavors.skypilot_orchestrator_base_vm_config im
 from zenml.integrations.skypilot.orchestrators.skypilot_orchestrator_entrypoint_configuration import (
     SkypilotOrchestratorEntrypointConfiguration,
 )
+from zenml.integrations.skypilot.utils import (
+    create_docker_run_command,
+    prepare_docker_setup,
+    prepare_launch_kwargs,
+    prepare_resources_kwargs,
+    prepare_task_kwargs,
+    sanitize_cluster_name,
+    sky_job_get,
+)
 from zenml.logger import get_logger
 from zenml.orchestrators import (
     ContainerizedOrchestrator,
+    SubmissionResult,
 )
 from zenml.orchestrators.utils import get_orchestrator_run_name
 from zenml.stack import StackValidator
 
 if TYPE_CHECKING:
-    from zenml.models import PipelineDeploymentResponse
+    from zenml.models import PipelineRunResponse, PipelineSnapshotResponse
     from zenml.stack import Stack
 
 
@@ -144,23 +154,37 @@ class SkypilotBaseOrchestrator(ContainerizedOrchestrator):
             set: Whether to set the environment variables or not.
         """
 
-    def prepare_or_run_pipeline(
+    def submit_pipeline(
         self,
-        deployment: "PipelineDeploymentResponse",
+        snapshot: "PipelineSnapshotResponse",
         stack: "Stack",
-        environment: Dict[str, str],
-    ) -> Any:
-        """Runs each pipeline step in a separate Skypilot container.
+        base_environment: Dict[str, str],
+        step_environments: Dict[str, Dict[str, str]],
+        placeholder_run: Optional["PipelineRunResponse"] = None,
+    ) -> Optional[SubmissionResult]:
+        """Submits a pipeline to the orchestrator.
+
+        This method should only submit the pipeline and not wait for it to
+        complete. If the orchestrator is configured to wait for the pipeline run
+        to complete, a function that waits for the pipeline run to complete can
+        be passed as part of the submission result.
 
         Args:
-            deployment: The pipeline deployment to prepare or run.
+            snapshot: The pipeline snapshot to submit.
             stack: The stack the pipeline will run on.
-            environment: Environment variables to set in the orchestration
-                environment.
+            base_environment: Base environment shared by all steps. This should
+                be set if your orchestrator for example runs one container that
+                is responsible for starting all the steps.
+            step_environments: Environment variables to set when executing
+                specific steps.
+            placeholder_run: An optional placeholder run for the snapshot.
 
         Raises:
             Exception: If the pipeline run fails.
             RuntimeError: If the code is running in a notebook.
+
+        Returns:
+            Optional submission result.
         """
         # First check whether the code is running in a notebook.
         if Environment.in_notebook():
@@ -172,7 +196,7 @@ class SkypilotBaseOrchestrator(ContainerizedOrchestrator):
                 "and run the code outside of a notebook when using this "
                 "orchestrator."
             )
-        if deployment.schedule:
+        if snapshot.schedule:
             logger.warning(
                 "Skypilot Orchestrator currently does not support the "
                 "use of schedules. The `schedule` will be ignored "
@@ -181,36 +205,36 @@ class SkypilotBaseOrchestrator(ContainerizedOrchestrator):
 
         # Set up some variables for configuration
         orchestrator_run_id = str(uuid4())
-        environment[ENV_ZENML_SKYPILOT_ORCHESTRATOR_RUN_ID] = (
+        base_environment[ENV_ZENML_SKYPILOT_ORCHESTRATOR_RUN_ID] = (
             orchestrator_run_id
         )
 
         settings = cast(
             SkypilotBaseOrchestratorSettings,
-            self.get_settings(deployment),
+            self.get_settings(snapshot),
         )
 
-        pipeline_name = deployment.pipeline_configuration.name
+        pipeline_name = snapshot.pipeline_configuration.name
         orchestrator_run_name = get_orchestrator_run_name(pipeline_name)
 
         assert stack.container_registry
 
         # Get Docker image for the orchestrator pod
         try:
-            image = self.get_image(deployment=deployment)
+            image = self.get_image(snapshot=snapshot)
         except KeyError:
             # If no generic pipeline image exists (which means all steps have
             # custom builds) we use a random step image as all of them include
             # dependencies for the active stack
-            pipeline_step_name = next(iter(deployment.step_configurations))
+            pipeline_step_name = next(iter(snapshot.step_configurations))
             image = self.get_image(
-                deployment=deployment, step_name=pipeline_step_name
+                snapshot=snapshot, step_name=pipeline_step_name
             )
 
         different_settings_found = False
 
         if not self.config.disable_step_based_settings:
-            for _, step in deployment.step_configurations.items():
+            for _, step in snapshot.step_configurations.items():
                 step_settings = cast(
                     SkypilotBaseOrchestratorSettings,
                     self.get_settings(step),
@@ -238,46 +262,33 @@ class SkypilotBaseOrchestrator(ContainerizedOrchestrator):
             command = SkypilotOrchestratorEntrypointConfiguration.get_entrypoint_command()
             args = SkypilotOrchestratorEntrypointConfiguration.get_entrypoint_arguments(
                 run_name=orchestrator_run_name,
-                deployment_id=deployment.id,
+                snapshot_id=snapshot.id,
             )
         else:
             # Run the entire pipeline in one VM using PipelineEntrypointConfiguration
             command = PipelineEntrypointConfiguration.get_entrypoint_command()
             args = PipelineEntrypointConfiguration.get_entrypoint_arguments(
-                deployment_id=deployment.id
+                snapshot_id=snapshot.id
             )
 
         entrypoint_str = " ".join(command)
         arguments_str = " ".join(args)
 
-        docker_environment_str = " ".join(
-            f"-e {k}={v}" for k, v in environment.items()
-        )
-        custom_run_args = " ".join(settings.docker_run_args)
-        if custom_run_args:
-            custom_run_args += " "
-
-        instance_type = settings.instance_type or self.DEFAULT_INSTANCE_TYPE
+        task_envs = base_environment.copy()
 
         # Set up credentials
         self.setup_credentials()
 
-        # Guaranteed by stack validation
-        assert stack is not None and stack.container_registry is not None
+        # Prepare Docker setup
+        setup, docker_creds_envs = prepare_docker_setup(
+            container_registry_uri=stack.container_registry.config.uri,
+            credentials=stack.container_registry.credentials,
+            use_sudo=True,  # Base orchestrator uses sudo
+        )
 
-        if docker_creds := stack.container_registry.credentials:
-            docker_username, docker_password = docker_creds
-            setup = (
-                f"sudo docker login --username $DOCKER_USERNAME --password "
-                f"$DOCKER_PASSWORD {stack.container_registry.config.uri}"
-            )
-            task_envs = {
-                "DOCKER_USERNAME": docker_username,
-                "DOCKER_PASSWORD": docker_password,
-            }
-        else:
-            setup = None
-            task_envs = None
+        # Update task_envs with Docker credentials
+        if docker_creds_envs:
+            task_envs.update(docker_creds_envs)
 
         # Run the entire pipeline
 
@@ -285,60 +296,127 @@ class SkypilotBaseOrchestrator(ContainerizedOrchestrator):
         self.prepare_environment_variable(set=True)
 
         try:
-            task = sky.Task(
-                run=f"sudo docker run --rm {custom_run_args}{docker_environment_str} {image} {entrypoint_str} {arguments_str}",
-                setup=setup,
-                envs=task_envs,
-            )
-            logger.debug(
-                f"Running run: sudo docker run --rm {custom_run_args}{docker_environment_str} {image} {entrypoint_str} {arguments_str}"
-            )
-            logger.debug(f"Running run: {setup}")
-            task = task.set_resources(
-                sky.Resources(
-                    cloud=self.cloud,
-                    instance_type=instance_type,
-                    cpus=settings.cpus,
-                    memory=settings.memory,
-                    accelerators=settings.accelerators,
-                    accelerator_args=settings.accelerator_args,
-                    use_spot=settings.use_spot,
-                    job_recovery=settings.job_recovery,
-                    region=settings.region,
-                    zone=settings.zone,
-                    image_id=settings.image_id,
-                    disk_size=settings.disk_size,
-                    disk_tier=settings.disk_tier,
+            if isinstance(self.cloud, sky.clouds.Kubernetes):
+                run_command = f"${{VIRTUAL_ENV:+$VIRTUAL_ENV/bin/}}{entrypoint_str} {arguments_str}"
+                setup = None
+                down = False
+                idle_minutes_to_autostop = None
+            else:
+                run_command = create_docker_run_command(
+                    image=image,
+                    entrypoint_str=entrypoint_str,
+                    arguments_str=arguments_str,
+                    environment=task_envs,
+                    docker_run_args=settings.docker_run_args,
+                    use_sudo=True,  # Base orchestrator uses sudo
                 )
+                down = settings.down
+                idle_minutes_to_autostop = settings.idle_minutes_to_autostop
+
+            # Create the Task with all parameters and task settings
+            task_kwargs = prepare_task_kwargs(
+                settings=settings,
+                run_command=run_command,
+                setup=setup,
+                task_envs=task_envs,
+                task_name=f"{orchestrator_run_name}",
             )
 
-            # Set the cluster name
-            cluster_name = settings.cluster_name
-            if cluster_name is None:
-                # Find existing cluster
-                for i in sky.status(refresh=True):
-                    if isinstance(
-                        i["handle"].launched_resources.cloud, type(self.cloud)
-                    ):
-                        cluster_name = i["handle"].cluster_name
-                        logger.info(
-                            f"Found existing cluster {cluster_name}. Reusing..."
-                        )
-            if cluster_name is None:
-                cluster_name = self.sanitize_cluster_name(
+            task = sky.Task(**task_kwargs)
+            logger.debug(f"Running run: {run_command}")
+
+            # Set resources with all parameters and resource settings
+            resources_kwargs = prepare_resources_kwargs(
+                cloud=self.cloud,
+                settings=settings,
+                default_instance_type=self.DEFAULT_INSTANCE_TYPE,
+                kubernetes_image=image
+                if isinstance(self.cloud, sky.clouds.Kubernetes)
+                else None,
+            )
+
+            task = task.set_resources(sky.Resources(**resources_kwargs))
+
+            launch_new_cluster = True
+            if settings.cluster_name:
+                status_request_id = sky.status(
+                    refresh=StatusRefreshMode.AUTO,
+                    cluster_names=[settings.cluster_name],
+                )
+                cluster_info = sky.stream_and_get(status_request_id)
+
+                if cluster_info:
+                    logger.info(
+                        f"Found existing cluster {settings.cluster_name}. Reusing..."
+                    )
+                    launch_new_cluster = False
+
+                else:
+                    logger.info(
+                        f"Cluster {settings.cluster_name} not found. Launching a new one..."
+                    )
+                    cluster_name = settings.cluster_name
+            else:
+                cluster_name = sanitize_cluster_name(
                     f"{orchestrator_run_name}"
                 )
+                logger.info(
+                    f"No cluster name provided. Launching a new cluster with name {cluster_name}..."
+                )
 
-            # Launch the cluster
-            sky.launch(
-                task,
-                cluster_name,
-                retry_until_up=settings.retry_until_up,
-                idle_minutes_to_autostop=settings.idle_minutes_to_autostop,
-                down=settings.down,
-                stream_logs=settings.stream_logs,
-                detach_setup=True,
-            )
+            if launch_new_cluster:
+                # Prepare launch parameters with additional launch settings
+                launch_kwargs = prepare_launch_kwargs(
+                    settings=settings,
+                    down=down,
+                    idle_minutes_to_autostop=idle_minutes_to_autostop,
+                )
+                logger.info(
+                    f"Launching the task on a new cluster: {cluster_name}"
+                )
+                launch_job_id = sky.launch(
+                    task,
+                    cluster_name,
+                    **launch_kwargs,
+                )
+                return sky_job_get(
+                    launch_job_id, settings.stream_logs, cluster_name
+                )
+
+            else:
+                # Prepare exec parameters with additional launch settings
+                exec_kwargs = {
+                    "down": down,
+                    "backend": None,
+                    **settings.launch_settings,  # Can reuse same settings for exec
+                }
+
+                # Remove None values to avoid overriding SkyPilot defaults
+                exec_kwargs = {
+                    k: v for k, v in exec_kwargs.items() if v is not None
+                }
+
+                # Make sure the cluster is up
+                start_request_id = sky.start(
+                    settings.cluster_name,
+                    down=down,
+                    idle_minutes_to_autostop=idle_minutes_to_autostop,
+                    retry_until_up=settings.retry_until_up,
+                )
+                sky.stream_and_get(start_request_id)
+
+                logger.info(
+                    f"Executing the task on the cluster: {settings.cluster_name}"
+                )
+                exec_job_id = sky.exec(
+                    task,
+                    cluster_name=settings.cluster_name,
+                    **exec_kwargs,
+                )
+                assert settings.cluster_name is not None
+                return sky_job_get(
+                    exec_job_id, settings.stream_logs, settings.cluster_name
+                )
 
         except Exception as e:
             logger.error(f"Pipeline run failed: {e}")
@@ -347,19 +425,3 @@ class SkypilotBaseOrchestrator(ContainerizedOrchestrator):
         finally:
             # Unset the service connector AWS profile ENV variable
             self.prepare_environment_variable(set=False)
-
-    def sanitize_cluster_name(self, name: str) -> str:
-        """Sanitize the value to be used in a cluster name.
-
-        Args:
-            name: Arbitrary input cluster name.
-
-        Returns:
-            Sanitized cluster name.
-        """
-        name = re.sub(
-            r"[^a-z0-9-]", "-", name.lower()
-        )  # replaces any character that is not a lowercase letter, digit, or hyphen with a hyphen
-        name = re.sub(r"^[-]+", "", name)  # trim leading hyphens
-        name = re.sub(r"[-]+$", "", name)  # trim trailing hyphens
-        return name

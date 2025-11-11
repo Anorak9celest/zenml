@@ -21,7 +21,7 @@ pip install "zenml[templates,server]" notebook
 zenml integration install sklearn -y
 ```
 
-We will then use [ZenML templates](../../how-to/setting-up-a-project-repository/using-project-templates.md) to help us get the code we need for the project:
+We will then use [ZenML templates](https://docs.zenml.io/how-to/project-setup-and-management/collaborate-with-team/project-templates) to help us get the code we need for the project:
 
 ```bash
 mkdir zenml_starter
@@ -36,11 +36,11 @@ pip install -r requirements.txt
 
 <summary>Above doesn't work? Here is an alternative</summary>
 
-The starter template is the same as the [ZenML quickstart](https://github.com/zenml-io/zenml/tree/main/examples/quickstart). You can clone it like so:
+The starter template is the same as the [ZenML mlops starter example](https://github.com/zenml-io/zenml/tree/main/examples/mlops_starter). You can clone it like so:
 
 ```bash
 git clone --depth 1 git@github.com:zenml-io/zenml.git
-cd zenml/examples/quickstart
+cd zenml/examples/mlops_starter
 pip install -r requirements.txt
 zenml init
 ```
@@ -49,7 +49,7 @@ zenml init
 
 ## What you'll learn
 
-You can either follow along in the [accompanying Jupyter notebook](https://github.com/zenml-io/zenml/blob/main/examples/quickstart/quickstart.ipynb), or just keep reading the [README file for more instructions](https://github.com/zenml-io/zenml/blob/main/examples/quickstart/README.md).
+You can either follow along in the [accompanying Jupyter notebook](https://github.com/zenml-io/zenml/blob/main/examples/mlops_starter/quickstart.ipynb), or just keep reading the [README file for more instructions](https://github.com/zenml-io/zenml/tree/main/examples/mlops_starter).
 
 Either way, at the end you would run three pipelines that are exemplary:
 

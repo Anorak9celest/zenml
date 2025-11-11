@@ -16,7 +16,7 @@
 import re
 from typing import TYPE_CHECKING, Optional, Tuple, Type, cast
 
-from pydantic import field_validator
+from pydantic import Field, field_validator
 
 from zenml.constants import DOCKER_REGISTRY_RESOURCE_TYPE
 from zenml.enums import StackComponentType
@@ -36,12 +36,24 @@ if TYPE_CHECKING:
 class BaseContainerRegistryConfig(AuthenticationConfigMixin):
     """Base config for a container registry.
 
-    Attributes:
-        uri: The URI of the container registry.
+    Configuration for connecting to container image registries.
+    Field descriptions are defined inline using Field() descriptors.
     """
 
-    uri: str
-    default_repository: Optional[str] = None
+    uri: str = Field(
+        description="Container registry URI (e.g., 'gcr.io' for Google Container "
+        "Registry, 'docker.io' for Docker Hub, 'registry.gitlab.com' for GitLab "
+        "Container Registry, 'ghcr.io' for GitHub Container Registry). This is "
+        "the base URL where container images will be pushed to and pulled from."
+    )
+    default_repository: Optional[str] = Field(
+        default=None,
+        description="Default repository namespace for image storage (e.g., "
+        "'username' for Docker Hub, 'project-id' for GCR, 'organization' for "
+        "GitHub Container Registry). If not specified, images will be stored at "
+        "the registry root. For Docker Hub this would mean only official images "
+        "can be pushed.",
+    )
 
     @field_validator("uri")
     @classmethod
@@ -160,6 +172,25 @@ class BaseContainerRegistry(AuthenticationMixin):
 
         return self._docker_client
 
+    def is_valid_image_name_for_registry(self, image_name: str) -> bool:
+        """Check if the image name is valid for the container registry.
+
+        Args:
+            image_name: The name of the image.
+
+        Returns:
+            `True` if the image name is valid for the container registry,
+            `False` otherwise.
+        """
+        # Remove prefixes to make sure this logic also works for DockerHub
+        image_name = image_name.removeprefix("index.docker.io/")
+        image_name = image_name.removeprefix("docker.io/")
+
+        registry_uri = self.config.uri.removeprefix("index.docker.io/")
+        registry_uri = registry_uri.removeprefix("docker.io/")
+
+        return image_name.startswith(registry_uri)
+
     def prepare_image_push(self, image_name: str) -> None:
         """Preparation before an image gets pushed.
 
@@ -183,7 +214,7 @@ class BaseContainerRegistry(AuthenticationMixin):
             ValueError: If the image name is not associated with this
                 container registry.
         """
-        if not image_name.startswith(self.config.uri):
+        if not self.is_valid_image_name_for_registry(image_name):
             raise ValueError(
                 f"Docker image `{image_name}` does not belong to container "
                 f"registry `{self.config.uri}`."
@@ -193,6 +224,25 @@ class BaseContainerRegistry(AuthenticationMixin):
         return docker_utils.push_image(
             image_name, docker_client=self.docker_client
         )
+
+    def get_image_repo_digest(self, image_name: str) -> Optional[str]:
+        """Get the repository digest of an image.
+
+        Args:
+            image_name: The name of the image.
+
+        Returns:
+            The repository digest of the image.
+        """
+        if not self.is_valid_image_name_for_registry(image_name):
+            return None
+
+        try:
+            metadata = self.docker_client.images.get_registry_data(image_name)
+        except Exception:
+            return None
+
+        return cast(str, metadata.id.split(":")[-1])
 
 
 class BaseContainerRegistryFlavor(Flavor):

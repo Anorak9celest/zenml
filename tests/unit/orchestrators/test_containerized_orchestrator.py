@@ -21,7 +21,7 @@ from zenml.config import DockerSettings
 from zenml.config.step_configurations import Step
 from zenml.constants import ORCHESTRATOR_DOCKER_IMAGE_KEY
 from zenml.enums import StackComponentType
-from zenml.models import BuildItem, PipelineDeploymentBase
+from zenml.models import BuildItem, PipelineSnapshotBase
 from zenml.orchestrators import ContainerizedOrchestrator
 from zenml.orchestrators.base_orchestrator import BaseOrchestratorConfig
 
@@ -29,9 +29,6 @@ from zenml.orchestrators.base_orchestrator import BaseOrchestratorConfig
 class StubContainerizedOrchestrator(ContainerizedOrchestrator):
     def get_orchestrator_run_id(self) -> str:
         return ""
-
-    def prepare_or_run_pipeline(self, deployment, stack):
-        pass
 
 
 def _get_orchestrator() -> StubContainerizedOrchestrator:
@@ -42,7 +39,6 @@ def _get_orchestrator() -> StubContainerizedOrchestrator:
         flavor="stub",
         type=StackComponentType.ORCHESTRATOR,
         user=uuid4(),
-        workspace=uuid4(),
         created=datetime.now(),
         updated=datetime.now(),
     )
@@ -69,7 +65,7 @@ def test_builds_with_no_docker_settings():
     specifies custom Docker settings."""
     orchestrator = _get_orchestrator()
 
-    deployment = PipelineDeploymentBase(
+    snapshot = PipelineSnapshotBase(
         run_name_template="",
         pipeline_configuration={"name": "pipeline"},
         step_configurations={
@@ -80,7 +76,7 @@ def test_builds_with_no_docker_settings():
         server_version="0.12.3",
     )
 
-    builds = orchestrator.get_docker_builds(deployment=deployment)
+    builds = orchestrator.get_docker_builds(snapshot=snapshot)
     assert len(builds) == 1
     build = builds[0]
     assert build.key == "orchestrator"
@@ -97,7 +93,7 @@ def test_builds_with_custom_docker_settings_for_some_steps():
     custom_step_1_settings = DockerSettings(
         requirements=["step_1_requirements"]
     )
-    deployment = PipelineDeploymentBase(
+    snapshot = PipelineSnapshotBase(
         run_name_template="",
         pipeline_configuration={"name": "pipeline"},
         step_configurations={
@@ -110,7 +106,7 @@ def test_builds_with_custom_docker_settings_for_some_steps():
         server_version="0.12.3",
     )
 
-    builds = orchestrator.get_docker_builds(deployment=deployment)
+    builds = orchestrator.get_docker_builds(snapshot=snapshot)
     assert len(builds) == 2
     step_1_build = builds[0]
     assert step_1_build.key == "orchestrator"
@@ -133,7 +129,7 @@ def test_builds_with_custom_docker_settings_for_all_steps():
     custom_step_2_settings = DockerSettings(
         requirements=["step_2_requirements"]
     )
-    deployment = PipelineDeploymentBase(
+    snapshot = PipelineSnapshotBase(
         run_name_template="",
         pipeline_configuration={"name": "pipeline"},
         step_configurations={
@@ -148,7 +144,7 @@ def test_builds_with_custom_docker_settings_for_all_steps():
         server_version="0.12.3",
     )
 
-    builds = orchestrator.get_docker_builds(deployment=deployment)
+    builds = orchestrator.get_docker_builds(snapshot=snapshot)
     assert len(builds) == 2
     step_1_build = builds[0]
     assert step_1_build.key == "orchestrator"
@@ -161,18 +157,18 @@ def test_builds_with_custom_docker_settings_for_all_steps():
     assert step_2_build.settings == custom_step_2_settings
 
 
-def test_getting_image_from_deployment(
-    sample_deployment_response_model, sample_build_response_model
+def test_getting_image_from_snapshot(
+    sample_snapshot_response_model, sample_build_response_model
 ):
-    """Tests getting the image from a deployment."""
-    assert not sample_deployment_response_model.build
+    """Tests getting the image from a snapshot."""
+    assert not sample_snapshot_response_model.build
     with pytest.raises(RuntimeError):
-        # Missing build in deployment
+        # Missing build in snapshot
         ContainerizedOrchestrator.get_image(
-            deployment=sample_deployment_response_model
+            snapshot=sample_snapshot_response_model
         )
 
-    sample_deployment_response_model.metadata.build = (
+    sample_snapshot_response_model.resources.build = (
         sample_build_response_model
     )
     assert not sample_build_response_model.images
@@ -180,7 +176,7 @@ def test_getting_image_from_deployment(
     with pytest.raises(KeyError):
         # Missing the image in build
         ContainerizedOrchestrator.get_image(
-            deployment=sample_deployment_response_model
+            snapshot=sample_snapshot_response_model
         )
 
     sample_build_response_model.metadata.images = {
@@ -188,7 +184,7 @@ def test_getting_image_from_deployment(
     }
     assert (
         ContainerizedOrchestrator.get_image(
-            deployment=sample_deployment_response_model
+            snapshot=sample_snapshot_response_model
         )
         == "image_name"
     )

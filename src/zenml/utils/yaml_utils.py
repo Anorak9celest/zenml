@@ -14,6 +14,7 @@
 """Utility functions to help with YAML files and data."""
 
 import json
+import os
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Type, Union
 from uuid import UUID
@@ -99,9 +100,8 @@ def is_yaml(file_path: str) -> bool:
     Returns:
         True if is yaml, else False.
     """
-    if file_path.endswith("yaml") or file_path.endswith("yml"):
-        return True
-    return False
+    extension = os.path.splitext(file_path)[1].lower()
+    return extension in (".yaml", ".yml")
 
 
 def comment_out_yaml(yaml_string: str) -> str:
@@ -122,6 +122,7 @@ def write_json(
     file_path: str,
     contents: Any,
     encoder: Optional[Type[json.JSONEncoder]] = None,
+    **json_dump_args: Any,
 ) -> None:
     """Write contents as JSON format to file_path.
 
@@ -129,6 +130,7 @@ def write_json(
         file_path: Path to JSON file.
         contents: Contents of JSON file.
         encoder: Custom JSON encoder to use when saving json.
+        **json_dump_args: Extra arguments to pass to json.dumps.
 
     Raises:
         FileNotFoundError: if directory does not exist.
@@ -140,10 +142,7 @@ def write_json(
             raise FileNotFoundError(f"Directory {dir_} does not exist.")
     io_utils.write_file_contents_as_string(
         file_path,
-        json.dumps(
-            contents,
-            cls=encoder,
-        ),
+        json.dumps(contents, cls=encoder, **json_dump_args),
     )
 
 

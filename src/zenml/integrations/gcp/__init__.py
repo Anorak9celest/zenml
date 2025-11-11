@@ -30,8 +30,10 @@ from zenml.stack import Flavor
 
 GCP_ARTIFACT_STORE_FLAVOR = "gcp"
 GCP_IMAGE_BUILDER_FLAVOR = "gcp"
+GCP_VERTEX_EXPERIMENT_TRACKER_FLAVOR = "vertex"
 GCP_VERTEX_ORCHESTRATOR_FLAVOR = "vertex"
 GCP_VERTEX_STEP_OPERATOR_FLAVOR = "vertex"
+GCP_DEPLOYER_FLAVOR = "gcp"
 
 # Service connector constants
 GCP_CONNECTOR_TYPE = "gcp"
@@ -42,21 +44,27 @@ class GcpIntegration(Integration):
     """Definition of Google Cloud Platform integration for ZenML."""
 
     NAME = GCP
+    # Adding the gcsfs<=2024.12.0 for now to solve the issue with the 
+    # increased number of list calls. This is a temporary fix and should be
+    # removed once the issue is resolved.
     REQUIREMENTS = [
         "kfp>=2.6.0",
-        "gcsfs",
+        "gcsfs!=2025.5.0,!=2025.5.0.post1,<=2024.12.0",
         "google-cloud-secret-manager",
         "google-cloud-container>=2.21.0",
         "google-cloud-artifact-registry>=1.11.3",
         "google-cloud-storage>=2.9.0",
         "google-cloud-aiplatform>=1.34.0",  # includes shapely pin fix
         "google-cloud-build>=3.11.0",
+        "google-cloud-pipeline-components>=2.19.0",
+        "google-cloud-run>=0.10.0",
+        "google-cloud-logging>=3.8.0",
         "kubernetes",
     ]
     REQUIREMENTS_IGNORED_ON_UNINSTALL = ["kubernetes","kfp"]
 
-    @staticmethod
-    def activate() -> None:
+    @classmethod
+    def activate(cls) -> None:
         """Activate the GCP integration."""
         from zenml.integrations.gcp import service_connectors  # noqa
 
@@ -69,17 +77,18 @@ class GcpIntegration(Integration):
         """
         from zenml.integrations.gcp.flavors import (
             GCPArtifactStoreFlavor,
+            GCPDeployerFlavor,
             GCPImageBuilderFlavor,
+            VertexExperimentTrackerFlavor,
             VertexOrchestratorFlavor,
             VertexStepOperatorFlavor,
         )
 
         return [
             GCPArtifactStoreFlavor,
+            GCPDeployerFlavor,
             GCPImageBuilderFlavor,
+            VertexExperimentTrackerFlavor,
             VertexOrchestratorFlavor,
             VertexStepOperatorFlavor,
         ]
-
-
-GcpIntegration.check_installation()

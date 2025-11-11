@@ -1,36 +1,56 @@
-# ☁️ ZenML Pro
+---
+description: Learn about the ZenML Pro features and deployment scenarios.
+cover: .gitbook/assets/procover.png
+coverY: 0
+layout:
+  cover:
+    visible: true
+    size: hero
+  title:
+    visible: true
+  description:
+    visible: true
+  tableOfContents:
+    visible: true
+  outline:
+    visible: true
+  pagination:
+    visible: true
+---
 
-The Pro version of ZenML comes with a number of features that expand the
-functionality of the Open Source product
+# Introduction
 
-### Role-based access control and permissions
+The [Pro version of ZenML](https://zenml.io/pro) extends the Open Source product with advanced features for enterprise-grade MLOps.
 
-Utilizing ZenML Pro provides you with access to a robust control plane that
-unifies user management and optimizes your workflows. Efficiently manage access
-and permissions through centralized user administration. Create fine-grained
-permissions for resources such as stacks, pipelines, models, etc.
+![Walkthrough of ZenML Model Control Plane](../../.gitbook/assets/mcp-walkthrough.gif)
 
-See the section on [user management](./user-management.md) to learn more.
+## Key Features
 
-### A brand-new, modern MLOps experience
+### Managed Production Deployment
+Deploy multiple ZenML servers through [workspaces](workspaces.md) with enterprise-grade reliability.
 
-![Walkthrough of ZenML Model Control Plane](../../.gitbook/assets/mcp_walkthrough.gif)
+### User Management
+- Create [organizations](organization.md) and [teams](teams.md) for scalable user management
+- Implement [role-based access control](roles.md) with customizable permissions
 
-We have built the ZenML Pro experience from the ground-up. With ZenML Pro, you get
-access to a new dashboard, with a better experience. The new dashboard features
-more functionality such as
-the [Model Control Plane](../../user-guide/starter-guide/track-ml-models.md)
-and [Artifact Control Plane](../../user-guide/starter-guide/manage-artifacts.md).
+### Advanced MLOps Capabilities
+- Enhanced [Model Control Plane](https://docs.zenml.io/user-guides/starter-guide/track-ml-models) for ML asset tracking
+- [Artifact Control Plane](https://docs.zenml.io/user-guides/starter-guide/manage-artifacts) for improved asset management
+- [Run Snapshots](https://docs.zenml.io/concepts/snapshots) for quick pipeline iteration
+- Early access to pro-specific features like triggers, filters, and usage reports
 
-### Triggers, CI/CD, Reports and more
+{% hint style="info" %}
+Try ZenML Pro with a [free account](https://zenml.io/pro?utm_source=docs&utm_medium=referral_link&utm_campaign=cloud_promotion&utm_content=signup_link).
+{% endhint %}
 
-Additionally, ZenML Pro users get exclusive access to an array of
-cloud-specific features, such as triggering pipelines directly through the
-dashboard, integrating with your code repository CI/CD system, generating usage
-reports and more.
+## Deployment Options
 
-Learn more about ZenML Pro on the [ZenML Website](https://zenml.io/cloud).
-<!-- For scarf -->
-<figure><img alt="ZenML Scarf" referrerpolicy="no-referrer-when-downgrade" src="https://static.scarf.sh/a.png?x-pxid=f0b4f458-0a54-4fcd-aa95-d5ee424815bc" /></figure>
+### SaaS Deployment
+The simplest way to get started is with [the SaaS version of ZenML Pro](https://zenml.io/pro), which handles server management and maintenance for you.
 
+### Self-hosted Deployment
+For organizations requiring full control, ZenML Pro can be [self-hosted](self-hosted.md). [Book a demo](https://www.zenml.io/book-your-demo) to learn more.
 
+## Feature Overview
+
+<table data-view="cards"><thead><tr><th></th><th></th><th data-hidden data-card-cover data-type="files"></th><th data-hidden></th><th data-hidden data-type="content-ref"></th><th data-hidden data-card-target data-type="content-ref"></th></tr></thead><tbody><tr><td><strong>Workspaces</strong></td><td>Workspaces in ZenML Pro</td><td><a href=".gitbook/assets/pro-workspaces.png">pro-workspaces.png</a></td><td></td><td></td><td><a href="workspaces.md">workspaces.md</a></td></tr><tr><td><strong>Organizations</strong></td><td>Organizations in ZenML Pro</td><td><a href=".gitbook/assets/pro-organizations.png">pro-organizations.png</a></td><td></td><td></td><td><a href="organization.md">organization.md</a></td></tr><tr><td><strong>Teams</strong></td><td>Teams in ZenML Pro</td><td><a href=".gitbook/assets/pro-teams.png">pro-teams.png</a></td><td></td><td></td><td><a href="teams.md">teams.md</a></td></tr><tr><td><strong>Roles</strong></td><td>Roles in ZenML Pro</td><td><a href=".gitbook/assets/pro-roles.png">pro-roles.png</a></td><td></td><td></td><td><a href="roles.md">roles.md</a></td></tr><tr><td><strong>Self-Hosted Deployments</strong></td><td>Self-hosted ZenML Pro deployments</td><td><a href=".gitbook/assets/pro-self-host.png">pro-self-host.png</a></td><td></td><td></td><td><a href="self-hosted.md">self-hosted.md</a></td></tr></tbody></table>

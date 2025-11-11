@@ -13,10 +13,7 @@
 #  permissions and limitations under the License.
 """ZenML specific exception definitions."""
 
-from typing import TYPE_CHECKING, Dict, List, Optional, Type
-
-if TYPE_CHECKING:
-    from zenml.steps import BaseParameters
+from typing import Dict, Optional
 
 
 class ZenMLBaseException(Exception):
@@ -50,44 +47,21 @@ class AuthorizationException(ZenMLBaseException):
     """Raised when an authorization error occurred while trying to access a ZenML resource ."""
 
 
+class CredentialsNotValid(AuthorizationException):
+    """Raised when the credentials provided are invalid.
+
+    This is a subclass of AuthorizationException and should only be raised when
+    the authentication credentials are invalid (e.g. expired API token, invalid
+    username/password, invalid signature). If caught by the ZenML client, it
+    will trigger an invalidation of the currently cached API token and a
+    re-authentication flow.
+    """
+
+
 class DoesNotExistException(ZenMLBaseException):
     """Raises exception when the entity does not exist in the system but an action is being done that requires it to be present."""
 
     def __init__(self, message: str):
-        """Initializes the exception.
-
-        Args:
-            message: Message with details of exception.
-        """
-        super().__init__(message)
-
-
-class PipelineNotSucceededException(ZenMLBaseException):
-    """Raises exception when trying to fetch artifacts from a not succeeded pipeline."""
-
-    def __init__(
-        self,
-        name: str = "",
-        message: str = "{} is not yet completed successfully.",
-    ):
-        """Initializes the exception.
-
-        Args:
-            name: Name of the pipeline.
-            message: Message with details of exception.
-        """
-        super().__init__(message.format(name))
-
-
-class GitException(ZenMLBaseException):
-    """Raises exception when a problem occurs in git resolution."""
-
-    def __init__(
-        self,
-        message: str = "There is a problem with git resolution. "
-        "Please make sure that all relevant files "
-        "are committed.",
-    ):
         """Initializes the exception.
 
         Args:
@@ -108,85 +82,16 @@ class StepContextError(ZenMLBaseException):
     """Raises exception when interacting with a StepContext in an unsupported way."""
 
 
-class PipelineInterfaceError(ZenMLBaseException):
-    """Raises exception when interacting with the Pipeline interface in an unsupported way."""
-
-
-class ArtifactInterfaceError(ZenMLBaseException):
-    """Raises exception when interacting with the Artifact interface in an unsupported way."""
-
-
 class StackComponentInterfaceError(ZenMLBaseException):
     """Raises exception when interacting with the stack components in an unsupported way."""
-
-
-class StackComponentDeploymentError(ZenMLBaseException):
-    """Raises exception when deploying a stack component fails."""
 
 
 class ArtifactStoreInterfaceError(ZenMLBaseException):
     """Raises exception when interacting with the Artifact Store interface in an unsupported way."""
 
 
-class PipelineConfigurationError(ZenMLBaseException):
-    """Raises exceptions when a pipeline configuration contains invalid values."""
-
-
-class MissingStepParameterError(ZenMLBaseException):
-    """Raises exceptions when a step parameter is missing when running a pipeline."""
-
-    def __init__(
-        self,
-        step_name: str,
-        missing_parameters: List[str],
-        parameters_class: Type["BaseParameters"],
-    ):
-        """Initializes a MissingStepParameterError object.
-
-        Args:
-            step_name: Name of the step for which one or more parameters
-                are missing.
-            missing_parameters: Names of all parameters which are missing.
-            parameters_class: Class of the parameters object for which
-                the parameters are missing.
-        """
-        import textwrap
-
-        message = textwrap.fill(
-            textwrap.dedent(
-                f"""
-            Missing parameters {missing_parameters} for '{step_name}' step.
-            There are three ways to solve this issue:
-            (1) Specify a default value in the parameters class
-            `{parameters_class.__name__}`
-            (2) Specify the parameters in code when creating the pipeline:
-            `my_pipeline({step_name}(params={parameters_class.__name__}(...))`
-            (3) Specify the parameters in a yaml configuration file and pass
-            it to the pipeline: `my_pipeline(...).run(config_path='path_to_yaml')`
-            """
-            )
-        )
-        super().__init__(message)
-
-
 class IntegrationError(ZenMLBaseException):
     """Raises exceptions when a requested integration can not be activated."""
-
-
-class DuplicateRunNameError(RuntimeError):
-    """Raises exception when a run with the same name already exists."""
-
-    def __init__(
-        self,
-        message: str = "Unable to run a pipeline with a run name that "
-        "already exists.",
-    ):
-        """Initializes the exception.
-
-        Args:
-            message: Message with details of exception.
-        """
-        super().__init__(message)
 
 
 class ValidationError(ZenMLBaseException):
@@ -197,56 +102,32 @@ class EntityExistsError(ZenMLBaseException):
     """Raised when trying to register an entity that already exists."""
 
 
-class ActionExistsError(EntityExistsError):
-    """Raised when registering an action with a name that already exists."""
-
-
-class TriggerExistsError(EntityExistsError):
-    """Raised when registering a trigger with name that already exists."""
+class EntityCreationError(ZenMLBaseException, RuntimeError):
+    """Raised when failing to create an entity."""
 
 
 class WebhookInactiveError(ZenMLBaseException):
     """Raised when source is inactive."""
 
 
-class StackExistsError(EntityExistsError):
-    """Raised when trying to register a stack with name that already exists."""
-
-
-class StackComponentExistsError(EntityExistsError):
-    """Raised when trying to register a stack component with existing name."""
-
-
-class EventSourceExistsError(EntityExistsError):
-    """Raised when trying to register an event source with existing name."""
-
-
-class SecretExistsError(EntityExistsError):
-    """Raised when trying to register a secret with existing name."""
-
-
 class StackValidationError(ZenMLBaseException):
     """Raised when a stack configuration is not valid."""
-
-
-class StackComponentValidationError(ZenMLBaseException):
-    """Raised when a stack component configuration is not valid."""
-
-
-class ProvisioningError(ZenMLBaseException):
-    """Raised when an error occurs when provisioning resources for a StackComponent."""
 
 
 class GitNotFoundError(ImportError):
     """Raised when ZenML CLI is used to interact with examples on a machine with no git installation."""
 
 
-class DuplicatedConfigurationError(ZenMLBaseException):
-    """Raised when a configuration parameter is set twice."""
-
-
 class IllegalOperationError(ZenMLBaseException):
     """Raised when an illegal operation is attempted."""
+
+
+class RunStoppedException(ZenMLBaseException):
+    """Raised when a ZenML pipeline run gets stopped by the user."""
+
+
+class RunInterruptedException(ZenMLBaseException):
+    """Raised when a ZenML step gets interrupted for an unknown reason."""
 
 
 class MethodNotAllowedError(ZenMLBaseException):
@@ -339,3 +220,35 @@ class SecretsStoreNotConfiguredError(NotImplementedError):
 
 class BackupSecretsStoreNotConfiguredError(NotImplementedError):
     """Raised when a backup secrets store is not configured."""
+
+
+class CustomFlavorImportError(ImportError):
+    """Raised when failing to import a custom flavor."""
+
+
+class MaxConcurrentTasksError(ZenMLBaseException):
+    """Raised when the maximum number of concurrent tasks is reached."""
+
+
+class RunMonitoringError(ZenMLBaseException):
+    """Raised when an error occurs while monitoring a pipeline run."""
+
+    def __init__(
+        self,
+        original_exception: BaseException,
+    ) -> None:
+        """Initializes the error.
+
+        Args:
+            original_exception: The original exception that occurred while
+                monitoring the pipeline run.
+        """
+        self.original_exception = original_exception
+
+
+class HookValidationException(ZenMLBaseException):
+    """Exception raised when hook validation fails."""
+
+
+class HookExecutionException(ZenMLBaseException):
+    """Exception raised when hook execution fails."""

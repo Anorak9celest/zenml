@@ -14,38 +14,37 @@
 import os
 import shutil
 import tempfile
-from uuid import uuid4
 
-import numpy as np
 import pytest
+from pydantic import BaseModel
 
 from zenml.artifacts.utils import (
-    _get_new_artifact_version,
     _load_artifact_from_uri,
+    _strip_timestamp_from_multiline_string,
     load_artifact_from_response,
     load_model_from_metadata,
     save_model_metadata,
 )
 from zenml.client import Client
 from zenml.constants import MODEL_METADATA_YAML_FILE_NAME
-from zenml.materializers.numpy_materializer import NUMPY_FILENAME
-from zenml.models import ArtifactVersionResponse, Page
+from zenml.materializers.pydantic_materializer import DEFAULT_FILENAME
+from zenml.models import ArtifactVersionResponse
 
 
 @pytest.fixture
-def model_artifact(mocker):
+def model_artifact(mocker, clean_client: "Client"):
     return mocker.Mock(
         spec=ArtifactVersionResponse,
         id="123",
         created="2023-01-01T00:00:00Z",
         updated="2023-01-01T00:00:00Z",
-        workspace="workspace-name",
+        project="project-name",
         name="model-name",
         type="type",
         uri="gs://my-bucket/model.joblib",
         data_type="path/to/model/class",
         materializer="path/to/materializer/class",
-        artifact_store_id=uuid4(),
+        artifact_store_id=clean_client.active_stack.artifact_store.id,
     )
 
 
@@ -121,17 +120,24 @@ def test_load_artifact_from_response(mocker, model_artifact):
     mocker_load_artifact.assert_called_once()
 
 
+class TempClass(BaseModel):
+    """Temp class for testing purposes."""
+
+    temp_value: int = 1
+
+
 @pytest.fixture
-def numpy_file_uri(clean_client: "Client"):
-    # Create a temporary file to save the numpy array
+def builtin_type_file_uri(clean_client: "Client"):
+    # Create a temporary file to save an integer
     temp_dir = tempfile.mkdtemp(
         dir=clean_client.active_stack.artifact_store.path
     )
-    numpy_file = os.path.join(temp_dir, NUMPY_FILENAME)
+    filepath = os.path.join(temp_dir, DEFAULT_FILENAME)
 
-    # Save a numpy array to the temporary file
-    arr = np.array([1, 2, 3, 4, 5])
-    np.save(numpy_file, arr)
+    # Save the integer to the temporary file
+    from zenml.utils.yaml_utils import write_json
+
+    write_json(filepath, TempClass().model_dump_json())
 
     # Yield the temporary directory
     yield temp_dir
@@ -140,7 +146,7 @@ def numpy_file_uri(clean_client: "Client"):
     shutil.rmtree(temp_dir)
 
 
-def test__load_artifact(numpy_file_uri):
+def test__load_artifact(builtin_type_file_uri):
     """Test the _load_artifact function."""
     materializer = (
         "random_materializer_class_path.random_materializer_class_name"
@@ -150,59 +156,72 @@ def test__load_artifact(numpy_file_uri):
     # Test with invalid materializer and ensure that a ModuleNotFoundError is
     # raised
     try:
-        _load_artifact_from_uri(materializer, data_type, numpy_file_uri)
+        _load_artifact_from_uri(materializer, data_type, builtin_type_file_uri)
         assert False, "Expected a ModuleNotFoundError to be raised."
     except ModuleNotFoundError as e:
-        assert (
-            str(e) == "No module named 'random_materializer_class_path'"
-        ), "Unexpected error message."
+        assert str(e) == "No module named 'random_materializer_class_path'", (
+            "Unexpected error message."
+        )
 
     # Test with invalid data type and ensure that a ModuleNotFoundError is
     # raised
-    materializer = "zenml.materializers.numpy_materializer.NumpyMaterializer"
+    materializer = (
+        "zenml.materializers.pydantic_materializer.PydanticMaterializer"
+    )
     try:
-        _load_artifact_from_uri(materializer, data_type, numpy_file_uri)
+        _load_artifact_from_uri(materializer, data_type, builtin_type_file_uri)
         assert False, "Expected a ModuleNotFoundError to be raised."
     except ModuleNotFoundError as e:
-        assert (
-            str(e) == "No module named 'random_data_type_class_path'"
-        ), "Unexpected error message."
+        assert str(e) == "No module named 'random_data_type_class_path'", (
+            "Unexpected error message."
+        )
 
     # Test with valid materializer and data type and ensure that the artifact
     # is loaded correctly
-    data_type = "numpy.ndarray"
-    artifact = _load_artifact_from_uri(materializer, data_type, numpy_file_uri)
+    from zenml.utils import source_utils
+
+    data_type = source_utils.Source(
+        module=TempClass.__module__,
+        attribute=TempClass.__name__,
+        type=source_utils.SourceType.BUILTIN,
+    )
+    artifact = _load_artifact_from_uri(
+        materializer, data_type, builtin_type_file_uri
+    )
     assert artifact is not None
-    assert isinstance(artifact, np.ndarray)
+    assert isinstance(artifact, TempClass)
 
 
-def test__get_new_artifact_version(mocker, sample_artifact_version_model):
-    """Unit test for the `_get_new_artifact_version` function."""
-    # If no artifact exists, "1" should be returned
-    mocker.patch(
-        "zenml.client.Client.list_artifact_versions",
-        return_value=Page(
-            index=1,
-            max_size=1,
-            total_pages=1,
-            total=0,
-            items=[],
+@pytest.mark.parametrize(
+    "raw, expected",
+    [
+        (
+            "[2025-05-16 16:20:23 UTC] Using cached version of step XYZ.\n",
+            "Using cached version of step XYZ.\n",
         ),
-    )
-    assert _get_new_artifact_version(sample_artifact_version_model.name) == 1
-
-    # If an artifact exists, the next version should be returned
-    mocker.patch(
-        "zenml.client.Client.list_artifact_versions",
-        return_value=Page(
-            index=1,
-            max_size=1,
-            total_pages=1,
-            total=1,
-            items=[sample_artifact_version_model],
+        (
+            "[2025-05-16 16:20:23 UTC] Using cached version of step XYZ.\n[2025-05-16 16:20:59 UTC] Log 2.\n",
+            "Using cached version of step XYZ.\nLog 2.\n",
         ),
-    )
-    assert (
-        _get_new_artifact_version(sample_artifact_version_model.name)
-        == int(sample_artifact_version_model.version) + 1
-    )
+        (
+            "Using cached version of step XYZ.\nLog 2.\n",
+            "Using cached version of step XYZ.\nLog 2.\n",
+        ),
+        ("", ""),
+        (
+            "[2025-05-16 16:20:23 UTC] Using cached version of step XYZ.\nNo timestamp here\n"
+            "[2025-05-16 16:20:59 UTC] Log 2.\n",
+            "Using cached version of step XYZ.\nNo timestamp here\nLog 2.\n",
+        ),
+        (
+            "[2025-05-16 16:20:23 UTC] Using cached version of step XYZ.\n"
+            "Timestamp is in the logs: [2025-05-16 16:20:59 UTC]\n"
+            "[2025-05-16 16:20:59 UTC] Log 2.\n",
+            "Using cached version of step XYZ.\n"
+            "Timestamp is in the logs: [2025-05-16 16:20:59 UTC]\nLog 2.\n",
+        ),
+    ],
+)
+def test__strip_timestamp_from_multiline_string(raw: str, expected: str):
+    """Test the _strip_timestamp_from_multiline_string function to properly strip the logs."""
+    assert _strip_timestamp_from_multiline_string(raw) == expected

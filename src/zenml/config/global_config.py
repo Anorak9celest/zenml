@@ -48,7 +48,7 @@ from zenml.logger import get_logger
 from zenml.utils import io_utils, yaml_utils
 
 if TYPE_CHECKING:
-    from zenml.models import StackResponse, WorkspaceResponse
+    from zenml.models import ProjectResponse, StackResponse
     from zenml.zen_stores.base_zen_store import BaseZenStore
 
 logger = get_logger(__name__)
@@ -113,7 +113,7 @@ class GlobalConfiguration(BaseModel, metaclass=GlobalConfigMetaClass):
             global config.
         store: Store configuration.
         active_stack_id: The ID of the active stack.
-        active_workspace_name: The name of the active workspace.
+        active_project_id: The ID of the active project.
     """
 
     user_id: uuid.UUID = Field(default_factory=uuid.uuid4)
@@ -123,10 +123,10 @@ class GlobalConfiguration(BaseModel, metaclass=GlobalConfigMetaClass):
     version: Optional[str] = None
     store: Optional[SerializeAsAny[StoreConfiguration]] = None
     active_stack_id: Optional[uuid.UUID] = None
-    active_workspace_name: Optional[str] = None
+    active_project_id: Optional[uuid.UUID] = None
 
     _zen_store: Optional["BaseZenStore"] = None
-    _active_workspace: Optional["WorkspaceResponse"] = None
+    _active_project: Optional["ProjectResponse"] = None
     _active_stack: Optional["StackResponse"] = None
 
     def __init__(self, **data: Any) -> None:
@@ -385,20 +385,25 @@ class GlobalConfiguration(BaseModel, metaclass=GlobalConfigMetaClass):
     def _sanitize_config(self) -> None:
         """Sanitize and save the global configuration.
 
-        This method is called to ensure that the active stack and workspace
+        This method is called to ensure that the active stack and project
         are set to their default values, if possible.
         """
         # If running in a ZenML server environment, the active stack and
-        # workspace are not relevant
+        # project are not relevant
         if ENV_ZENML_SERVER in os.environ:
             return
-        active_workspace, active_stack = self.zen_store.validate_active_config(
-            self.active_workspace_name,
+        active_project, active_stack = self.zen_store.validate_active_config(
+            self.active_project_id,
             self.active_stack_id,
             config_name="global",
         )
-        self.active_workspace_name = active_workspace.name
-        self._active_workspace = active_workspace
+        if active_project:
+            self.active_project_id = active_project.id
+            self._active_project = active_project
+        else:
+            self.active_project_id = None
+            self._active_project = None
+
         self.set_active_stack(active_stack)
 
     @property
@@ -442,7 +447,7 @@ class GlobalConfiguration(BaseModel, metaclass=GlobalConfigMetaClass):
         """
         environment_vars = {}
 
-        for key in self.model_fields.keys():
+        for key in type(self).model_fields.keys():
             if key == "store":
                 # The store configuration uses its own environment variable
                 # naming scheme
@@ -505,21 +510,9 @@ class GlobalConfiguration(BaseModel, metaclass=GlobalConfigMetaClass):
         """
         from zenml.zen_stores.base_zen_store import BaseZenStore
 
-        # Step 1: Create a baseline store configuration
+        store: Optional[StoreConfiguration] = baseline or self.store
 
-        if baseline is not None:
-            # Use the provided baseline store configuration
-            store = baseline
-        elif self.store is not None:
-            # Use the current store configuration as a baseline
-            store = self.store
-        else:
-            # Start with the default store configuration as a baseline
-            store = self.get_default_store()
-
-        # Step 2: Replace or update the baseline store configuration with the
-        # environment variables
-
+        # Step 1: Read environment variable overrides
         env_store_config: Dict[str, str] = {}
         env_secrets_store_config: Dict[str, str] = {}
         env_backup_secrets_store_config: Dict[str, str] = {}
@@ -560,9 +553,18 @@ class GlobalConfiguration(BaseModel, metaclass=GlobalConfigMetaClass):
                 )
             else:
                 logger.debug(
-                    "Using environment variables to update the default store"
+                    "Using environment variables to update store config"
                 )
+                if not store:
+                    store = self.get_default_store()
                 store = store.model_copy(update=env_store_config, deep=True)
+
+        # Step 2: Only after we've applied the environment variables, we
+        # fallback to the default store if no store configuration is set. This
+        # is to avoid importing the SQL store config in cases where a rest store
+        # is configured with environment variables.
+        if not store:
+            store = self.get_default_store()
 
         # Step 3: Replace or update the baseline secrets store configuration
         # with the environment variables. This only applies to SQL stores.
@@ -659,13 +661,23 @@ class GlobalConfiguration(BaseModel, metaclass=GlobalConfigMetaClass):
         self._configure_store(default_store_cfg)
         logger.debug("Using the default store for the global config.")
 
-    def uses_default_store(self) -> bool:
-        """Check if the global configuration uses the default store.
+    @property
+    def uses_local_store(self) -> bool:
+        """Check if the global configuration uses a local store.
 
         Returns:
-            `True` if the global configuration uses the default store.
+            `True` if the global configuration uses a local store.
         """
-        return self.store_configuration.url == self.get_default_store().url
+        return self.store_configuration.url.startswith("sqlite://")
+
+    @property
+    def uses_sql_store(self) -> bool:
+        """Check if the global configuration uses a SQL store.
+
+        Returns:
+            If the global configuration uses a SQL store.
+        """
+        return self.store_configuration.type == StoreType.SQL
 
     def set_store(
         self,
@@ -690,6 +702,15 @@ class GlobalConfiguration(BaseModel, metaclass=GlobalConfigMetaClass):
         logger.info("Updated the global store configuration.")
 
     @property
+    def is_initialized(self) -> bool:
+        """Check if the global configuration is initialized.
+
+        Returns:
+            `True` if the global configuration is initialized.
+        """
+        return self._zen_store is not None
+
+    @property
     def zen_store(self) -> "BaseZenStore":
         """Initialize and/or return the global zen store.
 
@@ -705,22 +726,22 @@ class GlobalConfiguration(BaseModel, metaclass=GlobalConfigMetaClass):
 
         return self._zen_store
 
-    def set_active_workspace(
-        self, workspace: "WorkspaceResponse"
-    ) -> "WorkspaceResponse":
-        """Set the workspace for the local client.
+    def set_active_project(
+        self, project: "ProjectResponse"
+    ) -> "ProjectResponse":
+        """Set the project for the local client.
 
         Args:
-            workspace: The workspace to set active.
+            project: The project to set active.
 
         Returns:
-            The workspace that was set active.
+            The project that was set active.
         """
-        self.active_workspace_name = workspace.name
-        self._active_workspace = workspace
-        # Sanitize the global configuration to reflect the new workspace
+        self.active_project_id = project.id
+        self._active_project = project
+        # Sanitize the global configuration to reflect the new project
         self._sanitize_config()
-        return workspace
+        return project
 
     def set_active_stack(self, stack: "StackResponse") -> None:
         """Set the active stack for the local client.
@@ -731,35 +752,43 @@ class GlobalConfiguration(BaseModel, metaclass=GlobalConfigMetaClass):
         self.active_stack_id = stack.id
         self._active_stack = stack
 
-    def get_active_workspace(self) -> "WorkspaceResponse":
-        """Get a model of the active workspace for the local client.
+    def get_active_project(self) -> "ProjectResponse":
+        """Get a model of the active project for the local client.
 
         Returns:
-            The model of the active workspace.
+            The model of the active project.
         """
-        workspace_name = self.get_active_workspace_name()
+        # Initialize the store first. This might create a local database if it
+        # doesn't exist yet, which will then refresh our active project ID.
+        _ = self.zen_store
 
-        if self._active_workspace is not None:
-            return self._active_workspace
+        if self._active_project is not None:
+            return self._active_project
 
-        workspace = self.zen_store.get_workspace(
-            workspace_name_or_id=workspace_name,
+        project = self.zen_store.get_project(
+            project_name_or_id=self.get_active_project_id(),
         )
-        return self.set_active_workspace(workspace)
+        return self.set_active_project(project)
 
-    def get_active_workspace_name(self) -> str:
-        """Get the name of the active workspace.
-
-        If the active workspace doesn't exist yet, the ZenStore is reinitialized.
+    def get_active_project_id(self) -> UUID:
+        """Get the ID of the active project.
 
         Returns:
-            The name of the active workspace.
-        """
-        if self.active_workspace_name is None:
-            _ = self.zen_store
-            assert self.active_workspace_name is not None
+            The ID of the active project.
 
-        return self.active_workspace_name
+        Raises:
+            RuntimeError: If the active project is not set.
+        """
+        if self.active_project_id is None:
+            _ = self.zen_store
+            if self.active_project_id is None:
+                raise RuntimeError(
+                    "No project is currently set as active. Please set the "
+                    "active project using the `zenml project set <NAME>` CLI "
+                    "command."
+                )
+
+        return self.active_project_id
 
     def get_active_stack_id(self) -> UUID:
         """Get the ID of the active stack.

@@ -43,7 +43,7 @@ from zenml.zen_server.rbac.utils import (
     verify_permission_for_model,
 )
 from zenml.zen_server.utils import (
-    handle_exceptions,
+    async_fastapi_endpoint_wrapper,
     make_dependable,
     plugin_flavor_registry,
     zen_store,
@@ -58,10 +58,9 @@ router = APIRouter(
 
 @router.get(
     "",
-    response_model=Page[TriggerResponse],
     responses={401: error_response, 404: error_response, 422: error_response},
 )
-@handle_exceptions
+@async_fastapi_endpoint_wrapper
 def list_triggers(
     trigger_filter_model: TriggerFilter = Depends(
         make_dependable(TriggerFilter)
@@ -90,10 +89,9 @@ def list_triggers(
 
 @router.get(
     "/{trigger_id}",
-    response_model=TriggerResponse,
     responses={401: error_response, 404: error_response, 422: error_response},
 )
-@handle_exceptions
+@async_fastapi_endpoint_wrapper
 def get_trigger(
     trigger_id: UUID,
     hydrate: bool = True,
@@ -116,10 +114,9 @@ def get_trigger(
 
 @router.post(
     "",
-    response_model=TriggerResponse,
     responses={401: error_response, 409: error_response, 422: error_response},
 )
-@handle_exceptions
+@async_fastapi_endpoint_wrapper
 def create_trigger(
     trigger: TriggerRequest,
     _: AuthContext = Security(authorize),
@@ -162,17 +159,15 @@ def create_trigger(
 
     return verify_permissions_and_create_entity(
         request_model=trigger,
-        resource_type=ResourceType.TRIGGER,
         create_method=zen_store().create_trigger,
     )
 
 
 @router.put(
     "/{trigger_id}",
-    response_model=TriggerResponse,
     responses={401: error_response, 404: error_response, 422: error_response},
 )
-@handle_exceptions
+@async_fastapi_endpoint_wrapper
 def update_trigger(
     trigger_id: UUID,
     trigger_update: TriggerUpdate,
@@ -235,7 +230,7 @@ def update_trigger(
     "/{trigger_id}",
     responses={401: error_response, 404: error_response, 422: error_response},
 )
-@handle_exceptions
+@async_fastapi_endpoint_wrapper
 def delete_trigger(
     trigger_id: UUID,
     _: AuthContext = Security(authorize),
@@ -245,9 +240,11 @@ def delete_trigger(
     Args:
         trigger_id: Name of the trigger.
     """
-    trigger = zen_store().get_trigger(trigger_id=trigger_id)
-    verify_permission_for_model(trigger, action=Action.DELETE)
-    zen_store().delete_trigger(trigger_id=trigger_id)
+    verify_permissions_and_delete_entity(
+        id=trigger_id,
+        get_method=zen_store().get_trigger,
+        delete_method=zen_store().delete_trigger,
+    )
 
 
 executions_router = APIRouter(
@@ -261,7 +258,7 @@ executions_router = APIRouter(
     "",
     responses={401: error_response, 404: error_response, 422: error_response},
 )
-@handle_exceptions
+@async_fastapi_endpoint_wrapper
 def list_trigger_executions(
     trigger_execution_filter_model: TriggerExecutionFilter = Depends(
         make_dependable(TriggerExecutionFilter)
@@ -292,7 +289,7 @@ def list_trigger_executions(
     "/{trigger_execution_id}",
     responses={401: error_response, 404: error_response, 422: error_response},
 )
-@handle_exceptions
+@async_fastapi_endpoint_wrapper
 def get_trigger_execution(
     trigger_execution_id: UUID,
     hydrate: bool = True,
@@ -319,7 +316,7 @@ def get_trigger_execution(
     "/{trigger_execution_id}",
     responses={401: error_response, 404: error_response, 422: error_response},
 )
-@handle_exceptions
+@async_fastapi_endpoint_wrapper
 def delete_trigger_execution(
     trigger_execution_id: UUID,
     _: AuthContext = Security(authorize),

@@ -113,8 +113,8 @@ def pydantic_encoder(obj: Any) -> Any:
     from pydantic import BaseModel
 
     if isinstance(obj, BaseModel):
-        return obj.model_dump()
-    elif is_dataclass(obj):
+        return obj.model_dump(mode="json")
+    elif is_dataclass(obj) and not isinstance(obj, type):
         return asdict(obj)
 
     # Check the class type and its superclasses for a matching encoder

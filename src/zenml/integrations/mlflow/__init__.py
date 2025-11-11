@@ -16,15 +16,21 @@
 The MLflow integrations currently enables you to use MLflow tracking as a
 convenient way to visualize your experiment runs within the MLflow UI.
 """
-from typing import List, Type
+from packaging import version
+from typing import List, Type, Optional
 
 from zenml.integrations.constants import MLFLOW
 from zenml.integrations.integration import Integration
 from zenml.stack import Flavor
+import sys
+
+from zenml.logger import get_logger
 
 MLFLOW_MODEL_DEPLOYER_FLAVOR = "mlflow"
 MLFLOW_MODEL_EXPERIMENT_TRACKER_FLAVOR = "mlflow"
 MLFLOW_MODEL_REGISTRY_FLAVOR = "mlflow"
+
+logger = get_logger(__name__)
 
 
 class MlflowIntegration(Integration):
@@ -32,23 +38,38 @@ class MlflowIntegration(Integration):
 
     NAME = MLFLOW
 
-    REQUIREMENTS = [
-        "mlflow>=2.1.1,<=2.14.1",
-        "mlserver>=1.3.3",
-        "mlserver-mlflow>=1.3.3",
-        # TODO: remove this requirement once rapidjson is fixed
-        "python-rapidjson<1.15",
-        # When you do:
-        # pip install zenml
-        # You get all our required dependencies. However, if you follow it with:
-        # zenml integration install mlflow
-        # This downgrades pydantic to v1 even though mlflow does not have
-        # any issues with v2. This is why we have to pin it here so a downgrade
-        # will not happen.
-        "pydantic>=2.7.0,<2.8.0",
+    REQUIREMENTS_IGNORED_ON_UNINSTALL = [
+        "python-rapidjson",
+        "pydantic",
+        "numpy",
+        "pandas",
     ]
 
-    REQUIREMENTS_IGNORED_ON_UNINSTALL = ["python-rapidjson", "pydantic"]
+    @classmethod
+    def get_requirements(
+        cls, target_os: Optional[str] = None, python_version: Optional[str] = None
+    ) -> List[str]:
+        """Method to get the requirements for the integration.
+
+        Args:
+            target_os: The target operating system to get the requirements for.
+            python_version: The Python version to use for the requirements.
+
+        Returns:
+            A list of requirements.
+        """
+        from zenml.integrations.numpy import NumpyIntegration
+        from zenml.integrations.pandas import PandasIntegration
+        
+        reqs = [
+            "mlflow>=2.1.1,<3",
+            # TODO: remove this requirement once rapidjson is fixed
+            "python-rapidjson<1.15",
+        ]
+
+        reqs.extend(NumpyIntegration.get_requirements(target_os=target_os, python_version=python_version))
+        reqs.extend(PandasIntegration.get_requirements(target_os=target_os, python_version=python_version))
+        return reqs
 
     @classmethod
     def activate(cls) -> None:
@@ -74,5 +95,3 @@ class MlflowIntegration(Integration):
             MLFlowModelRegistryFlavor,
         ]
 
-
-MlflowIntegration.check_installation()

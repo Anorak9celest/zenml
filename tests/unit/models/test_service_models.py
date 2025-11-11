@@ -17,14 +17,14 @@ from datetime import datetime
 import pytest
 
 from zenml.constants import STR_FIELD_MAX_LENGTH
+from zenml.enums import ServiceState
 from zenml.models import (
     ServiceRequest,
     ServiceResponse,
     ServiceResponseBody,
     ServiceResponseMetadata,
 )
-from zenml.services.service_status import ServiceState
-from zenml.services.service_type import ServiceType
+from zenml.models.v2.misc.service import ServiceType
 
 # Test data
 service_id = "12345678-1234-5678-1234-567812345678"
@@ -60,9 +60,10 @@ updated_time = datetime(2023, 3, 14, 11, 45)
 
 @pytest.fixture
 def service_response(
-    sample_workspace_model,
+    sample_project_model,
 ):
     body = ServiceResponseBody(
+        project_id=sample_project_model.id,
         service_type=service_type,
         labels=labels,
         created=created_time,
@@ -77,7 +78,6 @@ def service_response(
         endpoint=endpoint,
         prediction_url=prediction_url,
         health_check_url=health_check_url,
-        workspace=sample_workspace_model,
     )
     return ServiceResponse(
         id=service_id,

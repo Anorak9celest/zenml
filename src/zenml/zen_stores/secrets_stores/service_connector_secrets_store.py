@@ -23,13 +23,13 @@ from typing import (
     Optional,
     Type,
 )
-from uuid import uuid4
 
 from pydantic import Field, model_validator
 
 from zenml.config.secrets_store_config import SecretsStoreConfiguration
 from zenml.logger import get_logger
 from zenml.models import (
+    ServiceConnectorConfiguration,
     ServiceConnectorRequest,
 )
 from zenml.service_connectors.service_connector import ServiceConnector
@@ -133,10 +133,10 @@ class ServiceConnectorSecretsStore(BaseSecretsStore):
                 name="secrets-store",
                 connector_type=self.SERVICE_CONNECTOR_TYPE,
                 resource_types=[self.SERVICE_CONNECTOR_RESOURCE_TYPE],
-                user=uuid4(),  # Use a fake user ID
-                workspace=uuid4(),  # Use a fake workspace ID
                 auth_method=self.config.auth_method,
-                configuration=self.config.auth_config,
+                configuration=ServiceConnectorConfiguration(
+                    **self.config.auth_config
+                ),
             )
             base_connector = service_connector_registry.instantiate_connector(
                 model=request

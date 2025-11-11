@@ -19,7 +19,7 @@ import pytest
 from pydantic import ValidationError
 
 from zenml.constants import STR_FIELD_MAX_LENGTH
-from zenml.enums import ArtifactType
+from zenml.enums import ArtifactSaveType, ArtifactType
 from zenml.models import ArtifactRequest, ArtifactVersionRequest
 
 UUID_BASE_STRING = "00000000-0000-0000-0000-000000000000"
@@ -41,12 +41,13 @@ def test_artifact_request_model_works_with_long_materializer():
         ArtifactVersionRequest(
             artifact_id=uuid.uuid4(),
             user=uuid.uuid4(),
-            workspace=uuid.uuid4(),
+            project=uuid.uuid4(),
             version=1,
             type=ArtifactType.DATA,
             uri="abc",
             materializer=long_materializer,
             data_type="abc",
+            save_type=ArtifactSaveType.STEP_OUTPUT,
         )
 
 
@@ -57,10 +58,11 @@ def test_artifact_version_request_model_works_with_long_data_type():
         ArtifactVersionRequest(
             artifact_id=uuid.uuid4(),
             user=uuid.uuid4(),
-            workspace=uuid.uuid4(),
+            project=uuid.uuid4(),
             version=1,
             type=ArtifactType.DATA,
             uri="abc",
             materializer="abc",
             data_type=long_data_type,
+            save_type=ArtifactSaveType.STEP_OUTPUT,
         )

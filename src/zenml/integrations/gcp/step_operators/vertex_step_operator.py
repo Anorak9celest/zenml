@@ -48,7 +48,7 @@ from zenml.step_operators import BaseStepOperator
 if TYPE_CHECKING:
     from zenml.config.base_settings import BaseSettings
     from zenml.config.step_run_info import StepRunInfo
-    from zenml.models import PipelineDeploymentBase
+    from zenml.models import PipelineSnapshotBase
 
 logger = get_logger(__name__)
 
@@ -149,19 +149,19 @@ class VertexStepOperator(BaseStepOperator, GoogleCredentialsMixin):
         )
 
     def get_docker_builds(
-        self, deployment: "PipelineDeploymentBase"
+        self, snapshot: "PipelineSnapshotBase"
     ) -> List["BuildConfiguration"]:
         """Gets the Docker builds required for the component.
 
         Args:
-            deployment: The pipeline deployment for which to get the builds.
+            snapshot: The pipeline snapshot for which to get the builds.
 
         Returns:
             The required Docker builds.
         """
         builds = []
-        for step_name, step in deployment.step_configurations.items():
-            if step.config.step_operator == self.name:
+        for step_name, step in snapshot.step_configurations.items():
+            if step.config.uses_step_operator(self.name):
                 build = BuildConfiguration(
                     key=VERTEX_DOCKER_IMAGE_KEY,
                     settings=step.config.docker_settings,
@@ -258,6 +258,7 @@ class VertexStepOperator(BaseStepOperator, GoogleCredentialsMixin):
                     if self.config.reserved_ip_ranges
                     else []
                 ),
+                "persistent_resource_id": settings.persistent_resource_id,
             },
             "labels": job_labels,
             "encryption_spec": {
@@ -305,6 +306,14 @@ class VertexStepOperator(BaseStepOperator, GoogleCredentialsMixin):
 
         while response.state not in VERTEX_JOB_STATES_COMPLETED:
             time.sleep(POLLING_INTERVAL_IN_SECONDS)
+            if self.connector_has_expired():
+                logger.warning("Connector has expired. Recreating client...")
+                # This call will refresh the credentials if they expired.
+                credentials, project_id = self._get_authentication()
+                # Recreate the Python API client.
+                client = aiplatform.gapic.JobServiceClient(
+                    credentials=credentials, client_options=client_options
+                )
             try:
                 response = client.get_custom_job(name=job_id)
                 retry_count = 0
@@ -317,12 +326,7 @@ class VertexStepOperator(BaseStepOperator, GoogleCredentialsMixin):
                         f"Error encountered when polling job "
                         f"{job_id}: {err}\nRetrying...",
                     )
-                    # This call will refresh the credentials if they expired.
-                    credentials, project_id = self._get_authentication()
-                    # Recreate the Python API client.
-                    client = aiplatform.gapic.JobServiceClient(
-                        credentials=credentials, client_options=client_options
-                    )
+                    continue
                 else:
                     logger.exception(
                         "Request failed after %s retries.",

@@ -13,7 +13,7 @@
 #  permissions and limitations under the License.
 """Endpoint definitions for models."""
 
-from typing import Union
+from typing import Optional, Union
 from uuid import UUID
 
 from fastapi import APIRouter, Depends, Security
@@ -24,21 +24,29 @@ from zenml.constants import (
     MODEL_VERSION_ARTIFACTS,
     MODEL_VERSION_PIPELINE_RUNS,
     MODEL_VERSIONS,
+    MODELS,
     RUNS,
     VERSION_1,
 )
 from zenml.models import (
     ModelVersionArtifactFilter,
+    ModelVersionArtifactRequest,
     ModelVersionArtifactResponse,
     ModelVersionFilter,
     ModelVersionPipelineRunFilter,
+    ModelVersionPipelineRunRequest,
     ModelVersionPipelineRunResponse,
+    ModelVersionRequest,
     ModelVersionResponse,
     ModelVersionUpdate,
 )
 from zenml.models.v2.base.page import Page
 from zenml.zen_server.auth import AuthContext, authorize
 from zenml.zen_server.exceptions import error_response
+from zenml.zen_server.rbac.endpoint_utils import (
+    verify_permissions_and_create_entity,
+    verify_permissions_and_delete_entity,
+)
 from zenml.zen_server.rbac.models import Action, ResourceType
 from zenml.zen_server.rbac.utils import (
     dehydrate_page,
@@ -46,9 +54,14 @@ from zenml.zen_server.rbac.utils import (
     get_allowed_resource_ids,
     verify_permission_for_model,
 )
+from zenml.zen_server.routers.models_endpoints import (
+    router as model_router,
+)
+from zenml.zen_server.routers.projects_endpoints import workspace_router
 from zenml.zen_server.utils import (
-    handle_exceptions,
+    async_fastapi_endpoint_wrapper,
     make_dependable,
+    set_filter_project_scope,
     zen_store,
 )
 
@@ -64,16 +77,62 @@ router = APIRouter(
 )
 
 
-@router.get(
+@router.post(
     "",
-    response_model=Page[ModelVersionResponse],
+    responses={401: error_response, 409: error_response, 422: error_response},
+)
+# TODO: the workspace scoped endpoint is only kept for dashboard compatibility
+# and can be removed after the migration
+@workspace_router.post(
+    "/{project_name_or_id}" + MODELS + "/{model_id}" + MODEL_VERSIONS,
+    responses={401: error_response, 409: error_response, 422: error_response},
+    deprecated=True,
+    tags=["model_versions"],
+)
+@async_fastapi_endpoint_wrapper
+def create_model_version(
+    model_version: ModelVersionRequest,
+    model_id: Optional[UUID] = None,
+    project_name_or_id: Optional[Union[str, UUID]] = None,
+    _: AuthContext = Security(authorize),
+) -> ModelVersionResponse:
+    """Creates a model version.
+
+    Args:
+        model_version: Model version to create.
+        model_id: Optional ID of the model.
+        project_name_or_id: Optional name or ID of the project.
+
+    Returns:
+        The created model version.
+    """
+    if project_name_or_id:
+        project = zen_store().get_project(project_name_or_id)
+        model_version.project = project.id
+
+    if model_id:
+        model_version.model = model_id
+
+    return verify_permissions_and_create_entity(
+        request_model=model_version,
+        create_method=zen_store().create_model_version,
+    )
+
+
+@model_router.get(
+    "/{model_name_or_id}" + MODEL_VERSIONS,
     responses={401: error_response, 404: error_response, 422: error_response},
 )
-@handle_exceptions
+@router.get(
+    "",
+    responses={401: error_response, 404: error_response, 422: error_response},
+)
+@async_fastapi_endpoint_wrapper(deduplicate=True)
 def list_model_versions(
     model_version_filter_model: ModelVersionFilter = Depends(
         make_dependable(ModelVersionFilter)
     ),
+    model_name_or_id: Optional[Union[str, UUID]] = None,
     hydrate: bool = False,
     auth_context: AuthContext = Security(authorize),
 ) -> Page[ModelVersionResponse]:
@@ -82,6 +141,7 @@ def list_model_versions(
     Args:
         model_version_filter_model: Filter model used for pagination, sorting,
             filtering.
+        model_name_or_id: Optional name or ID of the model.
         hydrate: Flag deciding whether to hydrate the output model(s)
             by including metadata fields in the response.
         auth_context: The authentication context.
@@ -89,14 +149,22 @@ def list_model_versions(
     Returns:
         The model versions according to query filters.
     """
+    # A project scoped request must always be scoped to a specific
+    # project. This is required for the RBAC check to work.
+    set_filter_project_scope(model_version_filter_model)
+    assert isinstance(model_version_filter_model.project, UUID)
+
+    if model_name_or_id:
+        model_version_filter_model.model = model_name_or_id
+
     allowed_model_ids = get_allowed_resource_ids(
-        resource_type=ResourceType.MODEL
+        resource_type=ResourceType.MODEL,
+        project_id=model_version_filter_model.project,
     )
     model_version_filter_model.configure_rbac(
         authenticated_user_id=auth_context.user.id,
         model_id=allowed_model_ids,
     )
-
     model_versions = zen_store().list_model_versions(
         model_version_filter_model=model_version_filter_model,
         hydrate=hydrate,
@@ -106,10 +174,9 @@ def list_model_versions(
 
 @router.get(
     "/{model_version_id}",
-    response_model=ModelVersionResponse,
     responses={401: error_response, 404: error_response, 422: error_response},
 )
-@handle_exceptions
+@async_fastapi_endpoint_wrapper(deduplicate=True)
 def get_model_version(
     model_version_id: UUID,
     hydrate: bool = True,
@@ -135,10 +202,9 @@ def get_model_version(
 
 @router.put(
     "/{model_version_id}",
-    response_model=ModelVersionResponse,
     responses={401: error_response, 404: error_response, 422: error_response},
 )
-@handle_exceptions
+@async_fastapi_endpoint_wrapper(deduplicate=True)
 def update_model_version(
     model_version_id: UUID,
     model_version_update_model: ModelVersionUpdate,
@@ -172,7 +238,7 @@ def update_model_version(
     "/{model_version_id}",
     responses={401: error_response, 404: error_response, 422: error_response},
 )
-@handle_exceptions
+@async_fastapi_endpoint_wrapper
 def delete_model_version(
     model_version_id: UUID,
     _: AuthContext = Security(authorize),
@@ -182,9 +248,11 @@ def delete_model_version(
     Args:
         model_version_id: The name or ID of the model version to delete.
     """
-    model_version = zen_store().get_model_version(model_version_id)
-    verify_permission_for_model(model_version, action=Action.DELETE)
-    zen_store().delete_model_version(model_version_id)
+    verify_permissions_and_delete_entity(
+        id=model_version_id,
+        get_method=zen_store().get_model_version,
+        delete_method=zen_store().delete_model_version,
+    )
 
 
 ##########################
@@ -198,12 +266,41 @@ model_version_artifacts_router = APIRouter(
 )
 
 
+@model_version_artifacts_router.post(
+    "",
+    responses={401: error_response, 409: error_response, 422: error_response},
+)
+@async_fastapi_endpoint_wrapper
+def create_model_version_artifact_link(
+    model_version_artifact_link: ModelVersionArtifactRequest,
+    _: AuthContext = Security(authorize),
+) -> ModelVersionArtifactResponse:
+    """Create a new model version to artifact link.
+
+    Args:
+        model_version_artifact_link: The model version to artifact link to create.
+
+    Returns:
+        The created model version to artifact link.
+    """
+    model_version = zen_store().get_model_version(
+        model_version_artifact_link.model_version
+    )
+
+    return verify_permissions_and_create_entity(
+        request_model=model_version_artifact_link,
+        create_method=zen_store().create_model_version_artifact_link,
+        # Check for UPDATE permissions on the model version instead of the
+        # model version artifact link
+        surrogate_models=[model_version],
+    )
+
+
 @model_version_artifacts_router.get(
     "",
-    response_model=Page[ModelVersionArtifactResponse],
     responses={401: error_response, 404: error_response, 422: error_response},
 )
-@handle_exceptions
+@async_fastapi_endpoint_wrapper
 def list_model_version_artifact_links(
     model_version_artifact_link_filter_model: ModelVersionArtifactFilter = Depends(
         make_dependable(ModelVersionArtifactFilter)
@@ -234,7 +331,7 @@ def list_model_version_artifact_links(
     + "/{model_version_artifact_link_name_or_id}",
     responses={401: error_response, 404: error_response, 422: error_response},
 )
-@handle_exceptions
+@async_fastapi_endpoint_wrapper
 def delete_model_version_artifact_link(
     model_version_id: UUID,
     model_version_artifact_link_name_or_id: Union[str, UUID],
@@ -260,7 +357,7 @@ def delete_model_version_artifact_link(
     "/{model_version_id}" + ARTIFACTS,
     responses={401: error_response, 404: error_response, 422: error_response},
 )
-@handle_exceptions
+@async_fastapi_endpoint_wrapper
 def delete_all_model_version_artifact_links(
     model_version_id: UUID,
     only_links: bool = True,
@@ -291,12 +388,42 @@ model_version_pipeline_runs_router = APIRouter(
 )
 
 
+@model_version_pipeline_runs_router.post(
+    "",
+    responses={401: error_response, 409: error_response, 422: error_response},
+)
+@async_fastapi_endpoint_wrapper
+def create_model_version_pipeline_run_link(
+    model_version_pipeline_run_link: ModelVersionPipelineRunRequest,
+    _: AuthContext = Security(authorize),
+) -> ModelVersionPipelineRunResponse:
+    """Create a new model version to pipeline run link.
+
+    Args:
+        model_version_pipeline_run_link: The model version to pipeline run link to create.
+
+    Returns:
+        - If Model Version to Pipeline Run Link already exists - returns the existing link.
+        - Otherwise, returns the newly created model version to pipeline run link.
+    """
+    model_version = zen_store().get_model_version(
+        model_version_pipeline_run_link.model_version, hydrate=False
+    )
+
+    return verify_permissions_and_create_entity(
+        request_model=model_version_pipeline_run_link,
+        create_method=zen_store().create_model_version_pipeline_run_link,
+        # Check for UPDATE permissions on the model version instead of the
+        # model version pipeline run link
+        surrogate_models=[model_version],
+    )
+
+
 @model_version_pipeline_runs_router.get(
     "",
-    response_model=Page[ModelVersionPipelineRunResponse],
     responses={401: error_response, 404: error_response, 422: error_response},
 )
-@handle_exceptions
+@async_fastapi_endpoint_wrapper
 def list_model_version_pipeline_run_links(
     model_version_pipeline_run_link_filter_model: ModelVersionPipelineRunFilter = Depends(
         make_dependable(ModelVersionPipelineRunFilter)
@@ -327,7 +454,7 @@ def list_model_version_pipeline_run_links(
     + "/{model_version_pipeline_run_link_name_or_id}",
     responses={401: error_response, 404: error_response, 422: error_response},
 )
-@handle_exceptions
+@async_fastapi_endpoint_wrapper
 def delete_model_version_pipeline_run_link(
     model_version_id: UUID,
     model_version_pipeline_run_link_name_or_id: Union[str, UUID],

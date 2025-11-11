@@ -13,9 +13,9 @@
 #  permissions and limitations under the License.
 """Utility functions for SQLModel schemas."""
 
-from typing import Any
+from typing import Any, List, Optional
 
-from sqlalchemy import Column, ForeignKey
+from sqlalchemy import Column, ForeignKey, Index
 from sqlmodel import Field
 
 
@@ -45,6 +45,7 @@ def build_foreign_key_field(
     target_column: str,
     ondelete: str,
     nullable: bool,
+    custom_constraint_name: Optional[str] = None,
     **sa_column_kwargs: Any,
 ) -> Any:
     """Build a SQLModel foreign key field.
@@ -56,6 +57,7 @@ def build_foreign_key_field(
         target_column: Target column name.
         ondelete: On delete behavior.
         nullable: Whether the field is nullable.
+        custom_constraint_name: Custom name for the foreign key constraint.
         **sa_column_kwargs: Keyword arguments for the SQLAlchemy column.
 
     Returns:
@@ -63,16 +65,22 @@ def build_foreign_key_field(
 
     Raises:
         ValueError: If the ondelete and nullable arguments are not compatible.
+        ValueError: If the foreign key constraint name is too long.
     """
     if not nullable and ondelete == "SET NULL":
         raise ValueError(
             "Cannot set ondelete to SET NULL if the field is not nullable."
         )
-    constraint_name = foreign_key_constraint_name(
+    constraint_name = custom_constraint_name or foreign_key_constraint_name(
         source=source,
         target=target,
         source_column=source_column,
     )
+    if len(constraint_name) > 64:
+        raise ValueError(
+            f"Foreign key constraint name {constraint_name} is too long. "
+            "The maximum length is 64 characters."
+        )
     return Field(
         sa_column=Column(
             ForeignKey(
@@ -84,3 +92,35 @@ def build_foreign_key_field(
             **sa_column_kwargs,
         ),
     )
+
+
+def get_index_name(table_name: str, column_names: List[str]) -> str:
+    """Get the name for an index.
+
+    Args:
+        table_name: The name of the table for which the index will be created.
+        column_names: Names of the columns on which the index will be created.
+
+    Returns:
+        The index name.
+    """
+    columns = "_".join(column_names)
+    # MySQL allows a maximum of 64 characters in identifiers
+    return f"ix_{table_name}_{columns}"[:64]
+
+
+def build_index(
+    table_name: str, column_names: List[str], **kwargs: Any
+) -> Index:
+    """Build an index object.
+
+    Args:
+        table_name: The name of the table for which the index will be created.
+        column_names: Names of the columns on which the index will be created.
+        **kwargs: Additional keyword arguments to pass to the Index.
+
+    Returns:
+        The index.
+    """
+    name = get_index_name(table_name=table_name, column_names=column_names)
+    return Index(name, *column_names, **kwargs)

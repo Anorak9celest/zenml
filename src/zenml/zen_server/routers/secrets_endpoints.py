@@ -13,7 +13,7 @@
 #  permissions and limitations under the License.
 """Endpoint definitions for pipeline run secrets."""
 
-from typing import Optional
+from typing import Optional, Union
 from uuid import UUID
 
 from fastapi import APIRouter, Depends, Security
@@ -29,12 +29,14 @@ from zenml.constants import (
 from zenml.models import (
     Page,
     SecretFilter,
+    SecretRequest,
     SecretResponse,
     SecretUpdate,
 )
 from zenml.zen_server.auth import AuthContext, authorize
 from zenml.zen_server.exceptions import error_response
 from zenml.zen_server.rbac.endpoint_utils import (
+    verify_permissions_and_create_entity,
     verify_permissions_and_delete_entity,
     verify_permissions_and_get_entity,
     verify_permissions_and_list_entities,
@@ -47,8 +49,9 @@ from zenml.zen_server.rbac.utils import (
     is_owned_by_authenticated_user,
     verify_permission,
 )
+from zenml.zen_server.routers.projects_endpoints import workspace_router
 from zenml.zen_server.utils import (
-    handle_exceptions,
+    async_fastapi_endpoint_wrapper,
     make_dependable,
     zen_store,
 )
@@ -66,12 +69,44 @@ op_router = APIRouter(
 )
 
 
+@router.post(
+    "",
+    responses={401: error_response, 409: error_response, 422: error_response},
+)
+# TODO: the workspace scoped endpoint is only kept for dashboard compatibility
+# and can be removed after the migration
+@workspace_router.post(
+    "/{workspace_name_or_id}" + SECRETS,
+    responses={401: error_response, 409: error_response, 422: error_response},
+    deprecated=True,
+    tags=["secrets"],
+)
+@async_fastapi_endpoint_wrapper
+def create_secret(
+    secret: SecretRequest,
+    workspace_name_or_id: Optional[Union[str, UUID]] = None,
+    _: AuthContext = Security(authorize),
+) -> SecretResponse:
+    """Creates a secret.
+
+    Args:
+        secret: Secret to create.
+        workspace_name_or_id: Optional name or ID of the workspace.
+
+    Returns:
+        The created secret.
+    """
+    return verify_permissions_and_create_entity(
+        request_model=secret,
+        create_method=zen_store().create_secret,
+    )
+
+
 @router.get(
     "",
-    response_model=Page[SecretResponse],
     responses={401: error_response, 404: error_response, 422: error_response},
 )
-@handle_exceptions
+@async_fastapi_endpoint_wrapper
 def list_secrets(
     secret_filter_model: SecretFilter = Depends(make_dependable(SecretFilter)),
     hydrate: bool = False,
@@ -116,10 +151,9 @@ def list_secrets(
 
 @router.get(
     "/{secret_id}",
-    response_model=SecretResponse,
     responses={401: error_response, 404: error_response, 422: error_response},
 )
-@handle_exceptions
+@async_fastapi_endpoint_wrapper
 def get_secret(
     secret_id: UUID,
     hydrate: bool = True,
@@ -140,6 +174,7 @@ def get_secret(
         get_method=zen_store().get_secret,
         hydrate=hydrate,
     )
+
     if not has_permissions_for_model(secret, action=Action.READ_SECRET_VALUE):
         secret.remove_secrets()
 
@@ -148,10 +183,9 @@ def get_secret(
 
 @router.put(
     "/{secret_id}",
-    response_model=SecretResponse,
     responses={401: error_response, 404: error_response, 422: error_response},
 )
-@handle_exceptions
+@async_fastapi_endpoint_wrapper
 def update_secret(
     secret_id: UUID,
     secret_update: SecretUpdate,
@@ -191,7 +225,7 @@ def update_secret(
     "/{secret_id}",
     responses={401: error_response, 404: error_response, 422: error_response},
 )
-@handle_exceptions
+@async_fastapi_endpoint_wrapper
 def delete_secret(
     secret_id: UUID,
     _: AuthContext = Security(authorize),
@@ -212,7 +246,7 @@ def delete_secret(
     SECRETS_BACKUP,
     responses={401: error_response, 404: error_response, 422: error_response},
 )
-@handle_exceptions
+@async_fastapi_endpoint_wrapper
 def backup_secrets(
     ignore_errors: bool = True,
     delete_secrets: bool = False,
@@ -242,7 +276,7 @@ def backup_secrets(
     SECRETS_RESTORE,
     responses={401: error_response, 404: error_response, 422: error_response},
 )
-@handle_exceptions
+@async_fastapi_endpoint_wrapper
 def restore_secrets(
     ignore_errors: bool = False,
     delete_secrets: bool = False,

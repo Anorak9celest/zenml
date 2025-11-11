@@ -1,6 +1,6 @@
 # Apache Software License 2.0
 #
-# Copyright (c) ZenML GmbH 2024. All rights reserved.
+# Copyright (c) ZenML GmbH 2025. All rights reserved.
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
 # you may not use this file except in compliance with the License.
@@ -17,7 +17,7 @@
 
 from typing import Any, Dict
 
-from zenml import get_step_context, log_model_metadata, step
+from zenml import get_step_context, log_metadata, step
 
 
 @step(enable_cache=False)
@@ -34,9 +34,14 @@ def log_metadata_from_step_artifact(
 
     context = get_step_context()
     metadata_dict: Dict[str, Any] = (
-        context.pipeline_run.steps[step_name].outputs[artifact_name].load()
+        context.pipeline_run.steps[step_name].outputs[artifact_name][0].load()
     )
 
     metadata = {artifact_name: metadata_dict}
 
-    log_model_metadata(metadata)
+    if context.model:
+        log_metadata(
+            metadata=metadata,
+            model_name=context.model.name,
+            model_version=context.model.version,
+        )

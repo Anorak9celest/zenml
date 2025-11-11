@@ -32,20 +32,45 @@
 import os
 import re
 import types
-from typing import TYPE_CHECKING, Any, Dict, List, Optional, Tuple, Type, cast
+import urllib
+from typing import (
+    TYPE_CHECKING,
+    Any,
+    Dict,
+    List,
+    Optional,
+    Tuple,
+    Type,
+    cast,
+)
 from uuid import UUID
 
 from google.api_core import exceptions as google_exceptions
 from google.cloud import aiplatform
+from google.cloud.aiplatform.compat.services import (
+    pipeline_service_client_v1beta1,
+)
+from google.cloud.aiplatform.compat.types import pipeline_job_v1beta1
+from google.cloud.aiplatform_v1.types import PipelineState
+from google.cloud.aiplatform_v1beta1.types.service_networking import (
+    PscInterfaceConfig,
+)
+from google.protobuf import json_format
+from google_cloud_pipeline_components.v1.custom_job.utils import (
+    create_custom_training_job_from_component,
+)
 from kfp import dsl
 from kfp.compiler import Compiler
+from kfp.dsl.base_component import BaseComponent
 
 from zenml.config.resource_settings import ResourceSettings
 from zenml.constants import (
+    METADATA_ORCHESTRATOR_LOGS_URL,
+    METADATA_ORCHESTRATOR_RUN_ID,
     METADATA_ORCHESTRATOR_URL,
 )
 from zenml.entrypoints import StepEntrypointConfiguration
-from zenml.enums import StackComponentType
+from zenml.enums import ExecutionStatus, StackComponentType
 from zenml.integrations.gcp import GCP_ARTIFACT_STORE_FLAVOR
 from zenml.integrations.gcp.constants import (
     GKE_ACCELERATOR_NODE_SELECTOR_CONSTRAINT_LABEL,
@@ -57,18 +82,24 @@ from zenml.integrations.gcp.flavors.vertex_orchestrator_flavor import (
 from zenml.integrations.gcp.google_credentials_mixin import (
     GoogleCredentialsMixin,
 )
+from zenml.integrations.gcp.vertex_custom_job_parameters import (
+    VertexCustomJobParameters,
+)
 from zenml.io import fileio
 from zenml.logger import get_logger
 from zenml.metadata.metadata_types import MetadataType, Uri
-from zenml.orchestrators import ContainerizedOrchestrator
+from zenml.orchestrators import ContainerizedOrchestrator, SubmissionResult
 from zenml.orchestrators.utils import get_orchestrator_run_name
 from zenml.stack.stack_validator import StackValidator
-from zenml.utils import yaml_utils
 from zenml.utils.io_utils import get_global_config_directory
 
 if TYPE_CHECKING:
     from zenml.config.base_settings import BaseSettings
-    from zenml.models import PipelineDeploymentResponse, ScheduleResponse
+    from zenml.models import (
+        PipelineRunResponse,
+        PipelineSnapshotResponse,
+        ScheduleResponse,
+    )
     from zenml.stack import Stack
 
 logger = get_logger(__name__)
@@ -215,44 +246,14 @@ class VertexOrchestrator(ContainerizedOrchestrator, GoogleCredentialsMixin):
         """
         return os.path.join(self.root_directory, "pipelines")
 
-    def prepare_pipeline_deployment(
-        self,
-        deployment: "PipelineDeploymentResponse",
-        stack: "Stack",
-    ) -> None:
-        """Build a Docker image and push it to the container registry.
-
-        Args:
-            deployment: The pipeline deployment configuration.
-            stack: The stack on which the pipeline will be deployed.
-
-        Raises:
-            ValueError: If `cron_expression` is not in passed Schedule.
-        """
-        if deployment.schedule:
-            if (
-                deployment.schedule.catchup
-                or deployment.schedule.interval_second
-            ):
-                logger.warning(
-                    "Vertex orchestrator only uses schedules with the "
-                    "`cron_expression` property, with optional `start_time` and/or `end_time`. "
-                    "All other properties are ignored."
-                )
-            if deployment.schedule.cron_expression is None:
-                raise ValueError(
-                    "Property `cron_expression` must be set when passing "
-                    "schedule to a Vertex orchestrator."
-                )
-
-    def _create_dynamic_component(
+    def _create_container_component(
         self,
         image: str,
         command: List[str],
         arguments: List[str],
         component_name: str,
-    ) -> dsl.PipelineTask:
-        """Creates a dynamic container component for a Vertex pipeline.
+    ) -> BaseComponent:
+        """Creates a container component for a Vertex pipeline.
 
         Args:
             image: The image to use for the component.
@@ -261,7 +262,7 @@ class VertexOrchestrator(ContainerizedOrchestrator, GoogleCredentialsMixin):
             component_name: The name of the component.
 
         Returns:
-            The dynamic container component.
+            The container component.
         """
 
         def dynamic_container_component() -> dsl.ContainerSpec:
@@ -276,7 +277,6 @@ class VertexOrchestrator(ContainerizedOrchestrator, GoogleCredentialsMixin):
                 args=arguments,
             )
 
-        # Change the name of the function
         new_container_spec_func = types.FunctionType(
             dynamic_container_component.__code__,
             dynamic_container_component.__globals__,
@@ -285,58 +285,138 @@ class VertexOrchestrator(ContainerizedOrchestrator, GoogleCredentialsMixin):
             closure=dynamic_container_component.__closure__,
         )
         pipeline_task = dsl.container_component(new_container_spec_func)
-
         return pipeline_task
 
-    def prepare_or_run_pipeline(
+    def _convert_to_custom_training_job(
         self,
-        deployment: "PipelineDeploymentResponse",
-        stack: "Stack",
+        component: BaseComponent,
+        settings: VertexOrchestratorSettings,
         environment: Dict[str, str],
-    ) -> Any:
-        """Creates a KFP JSON pipeline.
-
-        # noqa: DAR402
-
-        This is an intermediary representation of the pipeline which is then
-        deployed to Vertex AI Pipelines service.
-
-        How it works:
-        -------------
-        Before this method is called the `prepare_pipeline_deployment()` method
-        builds a Docker image that contains the code for the pipeline, all steps
-        the context around these files.
-
-        Based on this Docker image a callable is created which builds
-        container_ops for each step (`_construct_kfp_pipeline`). The function
-        `kfp.components.load_component_from_text` is used to create the
-        `ContainerOp`, because using the `dsl.ContainerOp` class directly is
-        deprecated when using the Kubeflow SDK v2. The step entrypoint command
-        with the entrypoint arguments is the command that will be executed by
-        the container created using the previously created Docker image.
-
-        This callable is then compiled into a JSON file that is used as the
-        intermediary representation of the Kubeflow pipeline.
-
-        This file then is submitted to the Vertex AI Pipelines service for
-        execution.
+    ) -> BaseComponent:
+        """Convert a component to a custom training job component.
 
         Args:
-            deployment: The pipeline deployment to prepare or run.
+            component: The component to convert.
+            settings: The settings for the custom training job.
+            environment: The environment variables to set in the custom
+                training job.
+
+        Returns:
+            The custom training job component.
+        """
+        custom_job_parameters = (
+            settings.custom_job_parameters or VertexCustomJobParameters()
+        )
+        if (
+            custom_job_parameters.persistent_resource_id
+            and not custom_job_parameters.service_account
+        ):
+            # Persistent resources require an explicit service account, but
+            # none was provided in the custom job parameters. We try to fall
+            # back to the workload service account.
+            custom_job_parameters.service_account = (
+                self.config.workload_service_account
+            )
+
+        # Create a dictionary of explicit parameters
+        params = custom_job_parameters.model_dump(
+            exclude_none=True, exclude={"additional_training_job_args"}
+        )
+
+        # Remove None values to let defaults be set by the function
+        params = {k: v for k, v in params.items() if v is not None}
+
+        # Add environment variables
+        params["env"] = [
+            {"name": key, "value": value} for key, value in environment.items()
+        ]
+
+        # Check if any advanced parameters will override explicit parameters
+        if custom_job_parameters.additional_training_job_args:
+            overridden_params = set(params.keys()) & set(
+                custom_job_parameters.additional_training_job_args.keys()
+            )
+            if overridden_params:
+                logger.warning(
+                    f"The following explicit parameters are being overridden by values in "
+                    f"additional_training_job_args: {', '.join(overridden_params)}. "
+                    f"This may lead to unexpected behavior. Consider using either explicit "
+                    f"parameters or additional_training_job_args, but not both for the same parameters."
+                )
+
+        # Add any advanced parameters - these will override explicit parameters if provided
+        params.update(custom_job_parameters.additional_training_job_args)
+
+        # Add other parameters from orchestrator config if not already in params
+        if self.config.network and "network" not in params:
+            params["network"] = self.config.network
+
+        if (
+            self.config.encryption_spec_key_name
+            and "encryption_spec_key_name" not in params
+        ):
+            params["encryption_spec_key_name"] = (
+                self.config.encryption_spec_key_name
+            )
+        if (
+            self.config.workload_service_account
+            and "service_account" not in params
+        ):
+            params["service_account"] = self.config.workload_service_account
+
+        custom_job_component = create_custom_training_job_from_component(
+            component_spec=component,
+            **params,
+        )
+
+        return custom_job_component
+
+    def submit_pipeline(
+        self,
+        snapshot: "PipelineSnapshotResponse",
+        stack: "Stack",
+        base_environment: Dict[str, str],
+        step_environments: Dict[str, Dict[str, str]],
+        placeholder_run: Optional["PipelineRunResponse"] = None,
+    ) -> Optional[SubmissionResult]:
+        """Submits a pipeline to the orchestrator.
+
+        This method should only submit the pipeline and not wait for it to
+        complete. If the orchestrator is configured to wait for the pipeline run
+        to complete, a function that waits for the pipeline run to complete can
+        be passed as part of the submission result.
+
+        Args:
+            snapshot: The pipeline snapshot to submit.
             stack: The stack the pipeline will run on.
-            environment: Environment variables to set in the orchestration
-                environment.
+            base_environment: Base environment shared by all steps. This should
+                be set if your orchestrator for example runs one container that
+                is responsible for starting all the steps.
+            step_environments: Environment variables to set when executing
+                specific steps.
+            placeholder_run: An optional placeholder run for the snapshot.
 
         Raises:
-            ValueError: If the attribute `pipeline_root` is not set and it
-                can be not generated using the path of the artifact store in the
-                stack because it is not a
-                `zenml.integrations.gcp.artifact_store.GCPArtifactStore`. Also gets
-                raised if attempting to schedule pipeline run without using the
-                `zenml.integrations.gcp.artifact_store.GCPArtifactStore`.
+            ValueError: If a schedule without a cron expression is passed.
+
+        Returns:
+            Optional submission result.
         """
+        if snapshot.schedule:
+            if snapshot.schedule.catchup or snapshot.schedule.interval_second:
+                logger.warning(
+                    "Vertex orchestrator only uses schedules with the "
+                    "`cron_expression` property, with optional `start_time` "
+                    "and/or `end_time`. All other properties are ignored."
+                )
+            if snapshot.schedule.cron_expression is None:
+                raise ValueError(
+                    "Property `cron_expression` must be set when passing "
+                    "schedule to a Vertex orchestrator."
+                )
+
         orchestrator_run_name = get_orchestrator_run_name(
-            pipeline_name=deployment.pipeline_configuration.name
+            pipeline_name=snapshot.pipeline_configuration.name
         )
         # If the `pipeline_root` has not been defined in the orchestrator
         # configuration,
@@ -344,7 +424,7 @@ class VertexOrchestrator(ContainerizedOrchestrator, GoogleCredentialsMixin):
         # `GCPArtifactStore`.
         if not self.config.pipeline_root:
             artifact_store = stack.artifact_store
-            self._pipeline_root = f"{artifact_store.path.rstrip('/')}/vertex_pipeline_root/{deployment.pipeline_configuration.name}/{orchestrator_run_name}"
+            self._pipeline_root = f"{artifact_store.path.rstrip('/')}/vertex_pipeline_root/{snapshot.pipeline_configuration.name}/{orchestrator_run_name}"
             logger.info(
                 "The attribute `pipeline_root` has not been set in the "
                 "orchestrator configuration. One has been generated "
@@ -362,22 +442,21 @@ class VertexOrchestrator(ContainerizedOrchestrator, GoogleCredentialsMixin):
             Returns:
                 pipeline_func
             """
-            step_name_to_dynamic_component: Dict[str, Any] = {}
-            node_selector_constraint: Optional[Tuple[str, str]] = None
+            step_name_to_dynamic_component: Dict[str, BaseComponent] = {}
 
-            for step_name, step in deployment.step_configurations.items():
+            for step_name, step in snapshot.step_configurations.items():
                 image = self.get_image(
-                    deployment=deployment,
+                    snapshot=snapshot,
                     step_name=step_name,
                 )
                 command = StepEntrypointConfiguration.get_entrypoint_command()
                 arguments = (
                     StepEntrypointConfiguration.get_entrypoint_arguments(
                         step_name=step_name,
-                        deployment_id=deployment.id,
+                        snapshot_id=snapshot.id,
                     )
                 )
-                dynamic_component = self._create_dynamic_component(
+                component = self._create_container_component(
                     image, command, arguments, step_name
                 )
                 step_settings = cast(
@@ -385,50 +464,29 @@ class VertexOrchestrator(ContainerizedOrchestrator, GoogleCredentialsMixin):
                 )
                 pod_settings = step_settings.pod_settings
                 if pod_settings:
-                    if pod_settings.host_ipc:
+                    ignored_fields = pod_settings.model_fields_set - {
+                        "node_selectors"
+                    }
+                    if ignored_fields:
                         logger.warning(
-                            "Host IPC is set to `True` but not supported in "
-                            "this orchestrator. Ignoring..."
-                        )
-                    if pod_settings.affinity:
-                        logger.warning(
-                            "Affinity is set but not supported in Vertex with "
-                            "Kubeflow Pipelines 2.x. Ignoring..."
-                        )
-                    if pod_settings.tolerations:
-                        logger.warning(
-                            "Tolerations are set but not supported in "
-                            "Vertex with Kubeflow Pipelines 2.x. Ignoring..."
-                        )
-                    if pod_settings.volumes:
-                        logger.warning(
-                            "Volumes are set but not supported in Vertex with "
-                            "Kubeflow Pipelines 2.x. Ignoring..."
-                        )
-                    if pod_settings.volume_mounts:
-                        logger.warning(
-                            "Volume mounts are set but not supported in "
-                            "Vertex with Kubeflow Pipelines 2.x. Ignoring..."
+                            f"The following pod settings are not supported in "
+                            f"Vertex with Vertex Pipelines 2.x and will be "
+                            f"ignored: {list(ignored_fields)}."
                         )
 
-                    # apply pod settings
-                    if (
-                        GKE_ACCELERATOR_NODE_SELECTOR_CONSTRAINT_LABEL
-                        in pod_settings.node_selectors.keys()
-                    ):
-                        node_selector_constraint = (
-                            GKE_ACCELERATOR_NODE_SELECTOR_CONSTRAINT_LABEL,
-                            pod_settings.node_selectors[
-                                GKE_ACCELERATOR_NODE_SELECTOR_CONSTRAINT_LABEL
-                            ],
-                        )
-                    elif step_settings.node_selector_constraint:
-                        node_selector_constraint = (
-                            GKE_ACCELERATOR_NODE_SELECTOR_CONSTRAINT_LABEL,
-                            step_settings.node_selector_constraint[1],
-                        )
+                    for key in pod_settings.node_selectors:
+                        if (
+                            key
+                            != GKE_ACCELERATOR_NODE_SELECTOR_CONSTRAINT_LABEL
+                        ):
+                            logger.warning(
+                                "Vertex only allows the %s node selector, "
+                                "ignoring the node selector %s.",
+                                GKE_ACCELERATOR_NODE_SELECTOR_CONSTRAINT_LABEL,
+                                key,
+                            )
 
-                step_name_to_dynamic_component[step_name] = dynamic_component
+                step_name_to_dynamic_component[step_name] = component
 
             @dsl.pipeline(  # type: ignore[misc]
                 display_name=orchestrator_run_name,
@@ -443,63 +501,91 @@ class VertexOrchestrator(ContainerizedOrchestrator, GoogleCredentialsMixin):
                 ) in step_name_to_dynamic_component.items():
                     # for each component, check to see what other steps are
                     # upstream of it
-                    step = deployment.step_configurations[component_name]
+                    step = snapshot.step_configurations[component_name]
                     upstream_step_components = [
                         step_name_to_dynamic_component[upstream_step_name]
                         for upstream_step_name in step.spec.upstream_steps
                     ]
-                    task = (
-                        component()
-                        .set_display_name(
-                            name=component_name,
-                        )
-                        .set_caching_options(enable_caching=False)
-                        .set_env_variable(
-                            name=ENV_ZENML_VERTEX_RUN_ID,
-                            value=dsl.PIPELINE_JOB_NAME_PLACEHOLDER,
-                        )
-                        .after(*upstream_step_components)
+
+                    step_settings = cast(
+                        VertexOrchestratorSettings, self.get_settings(step)
                     )
-                    self._configure_container_resources(
-                        task,
-                        step.config.resource_settings,
-                        node_selector_constraint,
+
+                    use_custom_training_job = (
+                        step_settings.custom_job_parameters is not None
                     )
+
+                    step_environment = step_environments[component_name]
+                    step_environment[ENV_ZENML_VERTEX_RUN_ID] = (
+                        dsl.PIPELINE_JOB_NAME_PLACEHOLDER
+                    )
+
+                    if use_custom_training_job:
+                        if not step.config.resource_settings.empty:
+                            logger.warning(
+                                "Ignoring resource settings because "
+                                "the step is running as a custom training job. "
+                                "Use `custom_job_parameters.machine_type` "
+                                "to configure the machine type instead."
+                            )
+                        if step_settings.node_selector_constraint:
+                            logger.warning(
+                                "Ignoring node selector constraint because "
+                                "the step is running as a custom training job. "
+                                "Use `custom_job_parameters.accelerator_type` "
+                                "to configure the accelerator type instead."
+                            )
+                        component = self._convert_to_custom_training_job(
+                            component,
+                            settings=step_settings,
+                            environment=step_environment,
+                        )
+                        task = (
+                            component()
+                            .set_display_name(name=component_name)
+                            .set_caching_options(enable_caching=False)
+                            .after(*upstream_step_components)
+                        )
+                    else:
+                        task = (
+                            component()
+                            .set_display_name(
+                                name=component_name,
+                            )
+                            .set_caching_options(enable_caching=False)
+                            .after(*upstream_step_components)
+                        )
+                        for key, value in step_environment.items():
+                            task = task.set_env_variable(name=key, value=value)
+
+                        pod_settings = step_settings.pod_settings
+
+                        node_selector_constraint: Optional[Tuple[str, str]] = (
+                            None
+                        )
+                        if pod_settings and (
+                            GKE_ACCELERATOR_NODE_SELECTOR_CONSTRAINT_LABEL
+                            in pod_settings.node_selectors.keys()
+                        ):
+                            node_selector_constraint = (
+                                GKE_ACCELERATOR_NODE_SELECTOR_CONSTRAINT_LABEL,
+                                pod_settings.node_selectors[
+                                    GKE_ACCELERATOR_NODE_SELECTOR_CONSTRAINT_LABEL
+                                ],
+                            )
+                        elif step_settings.node_selector_constraint:
+                            node_selector_constraint = (
+                                GKE_ACCELERATOR_NODE_SELECTOR_CONSTRAINT_LABEL,
+                                step_settings.node_selector_constraint[1],
+                            )
+
+                        self._configure_container_resources(
+                            dynamic_component=task,
+                            resource_settings=step.config.resource_settings,
+                            node_selector_constraint=node_selector_constraint,
+                        )
 
             return dynamic_pipeline
-
-        def _update_json_with_environment(
-            yaml_file_path: str, environment: Dict[str, str]
-        ) -> None:
-            """Updates the env section of the steps in the YAML file with the given environment variables.
-
-            Args:
-                yaml_file_path: The path to the YAML file to update.
-                environment: A dictionary of environment variables to add.
-            """
-            pipeline_definition = yaml_utils.read_json(pipeline_file_path)
-
-            # Iterate through each component and add the environment variables
-            for executor in pipeline_definition["deploymentSpec"]["executors"]:
-                if (
-                    "container"
-                    in pipeline_definition["deploymentSpec"]["executors"][
-                        executor
-                    ]
-                ):
-                    container = pipeline_definition["deploymentSpec"][
-                        "executors"
-                    ][executor]["container"]
-                    if "env" not in container:
-                        container["env"] = []
-                    for key, value in environment.items():
-                        container["env"].append({"name": key, "value": value})
-
-            yaml_utils.write_json(pipeline_file_path, pipeline_definition)
-
-            print(
-                f"Updated YAML file with environment variables at {yaml_file_path}"
-            )
 
         # Save the generated pipeline to a file.
         fileio.makedirs(self.pipeline_directory)
@@ -515,30 +601,24 @@ class VertexOrchestrator(ContainerizedOrchestrator, GoogleCredentialsMixin):
             pipeline_func=_create_dynamic_pipeline(),
             package_path=pipeline_file_path,
             pipeline_name=_clean_pipeline_name(
-                deployment.pipeline_configuration.name
+                snapshot.pipeline_configuration.name
             ),
         )
-
-        # Let's update the YAML file with the environment variables
-        _update_json_with_environment(pipeline_file_path, environment)
 
         logger.info(
             "Writing Vertex workflow definition to `%s`.", pipeline_file_path
         )
 
         settings = cast(
-            VertexOrchestratorSettings, self.get_settings(deployment)
+            VertexOrchestratorSettings, self.get_settings(snapshot)
         )
 
-        # Using the Google Cloud AIPlatform client, upload and execute the
-        # pipeline
-        # on the Vertex AI Pipelines service.
-        self._upload_and_run_pipeline(
-            pipeline_name=deployment.pipeline_configuration.name,
+        return self._upload_and_run_pipeline(
+            pipeline_name=snapshot.pipeline_configuration.name,
             pipeline_file_path=pipeline_file_path,
             run_name=orchestrator_run_name,
             settings=settings,
-            schedule=deployment.schedule,
+            schedule=snapshot.schedule,
         )
 
     def _upload_and_run_pipeline(
@@ -548,7 +628,7 @@ class VertexOrchestrator(ContainerizedOrchestrator, GoogleCredentialsMixin):
         run_name: str,
         settings: VertexOrchestratorSettings,
         schedule: Optional["ScheduleResponse"] = None,
-    ) -> None:
+    ) -> Optional[SubmissionResult]:
         """Uploads and run the pipeline on the Vertex AI Pipelines service.
 
         Args:
@@ -558,6 +638,13 @@ class VertexOrchestrator(ContainerizedOrchestrator, GoogleCredentialsMixin):
             run_name: Orchestrator run name.
             settings: Pipeline level settings for this orchestrator.
             schedule: The schedule the pipeline will run on.
+
+        Raises:
+            RuntimeError: If the Vertex Orchestrator fails to provision or any
+                other Runtime errors.
+
+        Returns:
+            Optional submission result.
         """
         # We have to replace the hyphens in the run name with underscores
         # and lower case the string, because the Vertex AI Pipelines service
@@ -565,8 +652,7 @@ class VertexOrchestrator(ContainerizedOrchestrator, GoogleCredentialsMixin):
         job_id = _clean_pipeline_name(run_name)
 
         # Get the credentials that would be used to create the Vertex AI
-        # Pipelines
-        # job.
+        # Pipelines job.
         credentials, project_id = self._get_authentication()
 
         # Instantiate the Vertex AI Pipelines job
@@ -598,10 +684,44 @@ class VertexOrchestrator(ContainerizedOrchestrator, GoogleCredentialsMixin):
                 self.config.network,
             )
 
+        if self.config.private_service_connect:
+            # The PSC setting isn't yet part of the stable v1 API. We need to
+            # temporarily hack the aiplatform.PipelineJob object in two places:
+            # * to use the v1beta1 PipelineJob primitive which supports the
+            #   psc_interface_config field instead of the v1 PipelineJob
+            #   primitive.
+            # * to use the v1beta1 PipelineServiceClient instead of the v1
+            #   PipelineServiceClient.
+            #
+            # We achieve the first by converting the v1 PipelineJob to a
+            # v1beta1 PipelineJob and the second by replacing the v1
+            # PipelineServiceClient with a v1beta1 PipelineServiceClient.
+            #
+            # TODO: Remove this once the v1 stable API is updated to support
+            # the PSC setting.
+            pipeline_job_dict = json_format.MessageToDict(
+                run._gca_resource._pb, preserving_proto_field_name=True
+            )
+            run._gca_resource = pipeline_job_v1beta1.PipelineJob(
+                **pipeline_job_dict,
+                psc_interface_config=PscInterfaceConfig(
+                    network_attachment=self.config.private_service_connect,
+                ),
+            )
+            run.api_client = (
+                pipeline_service_client_v1beta1.PipelineServiceClient(
+                    credentials=run.credentials,
+                    client_options={
+                        "api_endpoint": run.api_client.api_endpoint,
+                    },
+                )
+            )
+
         try:
             if schedule:
                 logger.info(
-                    "Scheduling job using native Vertex AI Pipelines scheduling..."
+                    "Scheduling job using native Vertex AI Pipelines "
+                    "scheduling..."
                 )
                 run.create_schedule(
                     display_name=schedule.name,
@@ -611,19 +731,19 @@ class VertexOrchestrator(ContainerizedOrchestrator, GoogleCredentialsMixin):
                     service_account=self.config.workload_service_account,
                     network=self.config.network,
                 )
+                return None
 
             else:
                 logger.info(
                     "No schedule detected. Creating one-off Vertex job..."
                 )
                 logger.info(
-                    "Submitting pipeline job with job_id `%s` to Vertex AI Pipelines "
-                    "service.",
+                    "Submitting pipeline job with job_id `%s` to Vertex AI "
+                    "Pipelines service.",
                     job_id,
                 )
 
                 # Submit the job to Vertex AI Pipelines service.
-
                 run.submit(
                     service_account=self.config.workload_service_account,
                     network=self.config.network,
@@ -633,20 +753,34 @@ class VertexOrchestrator(ContainerizedOrchestrator, GoogleCredentialsMixin):
                     run._dashboard_uri(),
                 )
 
+                _wait_for_completion = None
+
                 if settings.synchronous:
-                    logger.info(
-                        "Waiting for the Vertex AI Pipelines job to finish..."
-                    )
-                    run.wait()
+
+                    def _wait_for_completion() -> None:
+                        logger.info(
+                            "Waiting for the Vertex AI Pipelines job to finish..."
+                        )
+                        run.wait()
+                        logger.info(
+                            "Vertex AI Pipelines job completed successfully."
+                        )
+
+                return SubmissionResult(
+                    metadata=self.compute_metadata(run),
+                    wait_for_completion=_wait_for_completion,
+                )
 
         except google_exceptions.ClientError as e:
-            logger.warning(
-                "Failed to create the Vertex AI Pipelines job: %s", e
+            logger.error("Failed to create the Vertex AI Pipelines job: %s", e)
+            raise RuntimeError(
+                f"Failed to create the Vertex AI Pipelines job: {e}"
             )
         except RuntimeError as e:
             logger.error(
                 "The Vertex AI Pipelines job execution has failed: %s", e
             )
+            raise
 
     def get_orchestrator_run_id(self) -> str:
         """Returns the active orchestrator run id.
@@ -708,6 +842,7 @@ class VertexOrchestrator(ContainerizedOrchestrator, GoogleCredentialsMixin):
             The dynamic component with the resource settings applied.
         """
         # Set optional CPU, RAM and GPU constraints for the pipeline
+        cpu_limit = None
         if resource_settings:
             cpu_limit = resource_settings.cpu_count or self.config.cpu_limit
 
@@ -731,20 +866,198 @@ class VertexOrchestrator(ContainerizedOrchestrator, GoogleCredentialsMixin):
         )
 
         if node_selector_constraint:
-            (constraint_label, value) = node_selector_constraint
+            _, value = node_selector_constraint
             if gpu_limit is not None and gpu_limit > 0:
                 dynamic_component = (
                     dynamic_component.set_accelerator_type(value)
                     .set_accelerator_limit(gpu_limit)
                     .set_gpu_limit(gpu_limit)
                 )
-            elif (
-                constraint_label
-                == GKE_ACCELERATOR_NODE_SELECTOR_CONSTRAINT_LABEL
-                and gpu_limit == 0
-            ):
+            else:
                 logger.warning(
-                    "GPU limit is set to 0 but a GPU type is specified. Ignoring GPU settings."
+                    "Accelerator type %s specified, but the GPU limit is not "
+                    "set or set to 0. The accelerator type will be ignored. "
+                    "To fix this warning, either remove the specified "
+                    "accelerator type or set the `gpu_count` using the "
+                    "ResourceSettings (https://docs.zenml.io/user-guides/tutorial/distributed-training)."
                 )
 
         return dynamic_component
+
+    def fetch_status(
+        self, run: "PipelineRunResponse", include_steps: bool = False
+    ) -> Tuple[
+        Optional[ExecutionStatus], Optional[Dict[str, ExecutionStatus]]
+    ]:
+        """Refreshes the status of a specific pipeline run.
+
+        Args:
+            run: The run that was executed by this orchestrator.
+            include_steps: Whether to fetch steps.
+
+        Returns:
+            A tuple of (pipeline_status, step_statuses_dict).
+            Step statuses are not supported for Vertex, so step_statuses_dict will always be None.
+
+        Raises:
+            AssertionError: If the run was not executed by to this orchestrator.
+            ValueError: If it fetches an unknown state or if we can not fetch
+                the orchestrator run ID.
+        """
+        # Make sure that the stack exists and is accessible
+        if run.stack is None:
+            raise ValueError(
+                "The stack that the run was executed on is not available "
+                "anymore."
+            )
+
+        # Make sure that the run belongs to this orchestrator
+        assert (
+            self.id
+            == run.stack.components[StackComponentType.ORCHESTRATOR][0].id
+        )
+
+        # Initialize the Vertex client
+        credentials, project_id = self._get_authentication()
+        aiplatform.init(
+            project=project_id,
+            location=self.config.location,
+            credentials=credentials,
+        )
+
+        # Fetch the status of the PipelineJob
+        if METADATA_ORCHESTRATOR_RUN_ID in run.run_metadata:
+            run_id = run.run_metadata[METADATA_ORCHESTRATOR_RUN_ID]
+        elif run.orchestrator_run_id is not None:
+            run_id = run.orchestrator_run_id
+        else:
+            raise ValueError(
+                "Can not find the orchestrator run ID, thus can not fetch "
+                "the status."
+            )
+        status = aiplatform.PipelineJob.get(run_id).state
+
+        # Map the potential outputs to ZenML ExecutionStatus. Potential values:
+        # https://boto3.amazonaws.com/v1/documentation/api/latest/reference/services/sagemaker/client/describe_pipeline_execution.html#
+        if status == PipelineState.PIPELINE_STATE_UNSPECIFIED:
+            pipeline_status = run.status
+        elif status in [
+            PipelineState.PIPELINE_STATE_QUEUED,
+            PipelineState.PIPELINE_STATE_PENDING,
+        ]:
+            pipeline_status = ExecutionStatus.INITIALIZING
+        elif status in [
+            PipelineState.PIPELINE_STATE_RUNNING,
+            PipelineState.PIPELINE_STATE_PAUSED,
+        ]:
+            pipeline_status = ExecutionStatus.RUNNING
+        elif status == PipelineState.PIPELINE_STATE_SUCCEEDED:
+            pipeline_status = ExecutionStatus.COMPLETED
+        elif status == PipelineState.PIPELINE_STATE_CANCELLING:
+            pipeline_status = ExecutionStatus.STOPPING
+        elif status == PipelineState.PIPELINE_STATE_CANCELLED:
+            pipeline_status = ExecutionStatus.STOPPED
+        elif status == PipelineState.PIPELINE_STATE_FAILED:
+            pipeline_status = ExecutionStatus.FAILED
+        else:
+            raise ValueError("Unknown status for the pipeline job.")
+
+        # Vertex doesn't support step-level status fetching yet
+        return pipeline_status, None
+
+    def compute_metadata(
+        self, job: aiplatform.PipelineJob
+    ) -> Dict[str, MetadataType]:
+        """Generate run metadata based on the corresponding Vertex PipelineJob.
+
+        Args:
+            job: The corresponding PipelineJob object.
+
+        Returns:
+            A dictionary of metadata related to the pipeline run.
+        """
+        metadata: Dict[str, MetadataType] = {}
+
+        # Orchestrator Run ID
+        if run_id := self._compute_orchestrator_run_id(job):
+            metadata[METADATA_ORCHESTRATOR_RUN_ID] = run_id
+
+        # URL to the Vertex's pipeline view
+        if orchestrator_url := self._compute_orchestrator_url(job):
+            metadata[METADATA_ORCHESTRATOR_URL] = Uri(orchestrator_url)
+
+        # URL to the corresponding Logs Explorer page
+        if logs_url := self._compute_orchestrator_logs_url(job):
+            metadata[METADATA_ORCHESTRATOR_LOGS_URL] = Uri(logs_url)
+
+        return metadata
+
+    @staticmethod
+    def _compute_orchestrator_url(
+        job: aiplatform.PipelineJob,
+    ) -> Optional[str]:
+        """Generate the Orchestrator Dashboard URL upon pipeline execution.
+
+        Args:
+            job: The corresponding PipelineJob object.
+
+        Returns:
+             the URL to the dashboard view in Vertex.
+        """
+        try:
+            return str(job._dashboard_uri())
+        except Exception as e:
+            logger.warning(
+                f"There was an issue while extracting the pipeline url: {e}"
+            )
+            return None
+
+    @staticmethod
+    def _compute_orchestrator_logs_url(
+        job: aiplatform.PipelineJob,
+    ) -> Optional[str]:
+        """Generate the Logs Explorer URL upon pipeline execution.
+
+        Args:
+            job: The corresponding PipelineJob object.
+
+        Returns:
+            the URL querying the pipeline logs in Logs Explorer on GCP.
+        """
+        try:
+            base_url = "https://console.cloud.google.com/logs/query"
+            query = f"""
+             resource.type="aiplatform.googleapis.com/PipelineJob"
+             resource.labels.pipeline_job_id="{job.job_id}"
+             """
+            encoded_query = urllib.parse.quote(query)
+            return f"{base_url}?project={job.project}&query={encoded_query}"
+
+        except Exception as e:
+            logger.warning(
+                f"There was an issue while extracting the logs url: {e}"
+            )
+            return None
+
+    @staticmethod
+    def _compute_orchestrator_run_id(
+        job: aiplatform.PipelineJob,
+    ) -> Optional[str]:
+        """Fetch the Orchestrator Run ID upon pipeline execution.
+
+        Args:
+            job: The corresponding PipelineJob object.
+
+        Returns:
+            the Execution ID of the run in Vertex.
+        """
+        try:
+            if job.job_id:
+                return str(job.job_id)
+
+            return None
+        except Exception as e:
+            logger.warning(
+                f"There was an issue while extracting the pipeline run ID: {e}"
+            )
+            return None

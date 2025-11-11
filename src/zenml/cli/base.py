@@ -49,8 +49,9 @@ from zenml.integrations.registry import integration_registry
 from zenml.io import fileio
 from zenml.logger import get_logger
 from zenml.utils.io_utils import copy_dir, get_global_config_directory
+from zenml.utils.package_utils import get_package_information
+from zenml.utils.server_utils import get_local_server
 from zenml.utils.yaml_utils import write_yaml
-from zenml.zen_server.utils import get_active_deployment
 
 logger = get_logger(__name__)
 # WT_SESSION is a Windows Terminal specific environment variable. If it
@@ -79,19 +80,19 @@ class ZenMLProjectTemplateLocation(BaseModel):
 ZENML_PROJECT_TEMPLATES = dict(
     e2e_batch=ZenMLProjectTemplateLocation(
         github_url="zenml-io/template-e2e-batch",
-        github_tag="2024.06.06",  # Make sure it is aligned with .github/workflows/update-templates-to-examples.yml
+        github_tag="2025.09.22",  # Make sure it is aligned with .github/workflows/update-templates-to-examples.yml
     ),
     starter=ZenMLProjectTemplateLocation(
         github_url="zenml-io/template-starter",
-        github_tag="2024.06.06",  # Make sure it is aligned with .github/workflows/update-templates-to-examples.yml
+        github_tag="2024.11.28",  # Make sure it is aligned with .github/workflows/update-templates-to-examples.yml
     ),
     nlp=ZenMLProjectTemplateLocation(
         github_url="zenml-io/template-nlp",
-        github_tag="2024.06.14",  # Make sure it is aligned with .github/workflows/update-templates-to-examples.yml
+        github_tag="2025.04.07",  # Make sure it is aligned with .github/workflows/update-templates-to-examples.yml
     ),
     llm_finetuning=ZenMLProjectTemplateLocation(
         github_url="zenml-io/template-llm-finetuning",
-        github_tag="2024.06.20",  # Make sure it is aligned with .github/workflows/update-templates-to-examples.yml
+        github_tag="2025.09.19",  # Make sure it is aligned with .github/workflows/update-templates-to-examples.yml
     ),
 )
 
@@ -166,7 +167,7 @@ def init(
         except ImportError:
             error(
                 "You need to install the ZenML project template requirements "
-                "to use templates. Please run `pip install zenml[templates]` "
+                "to use templates. Please run `pip install 'zenml[templates]'` "
                 "and try again."
             )
             return
@@ -264,7 +265,7 @@ def init(
         f"will only take effect when you're running ZenML from the initialized "
         f"repository root, or from a subdirectory. For more information on "
         f"repositories and configurations, please visit "
-        f"https://docs.zenml.io/user-guide/starter-guide/understand-stacks."
+        f"https://docs.zenml.io/user-guides/production-guide/understand-stacks"
     )
 
 
@@ -358,13 +359,13 @@ def clean(yes: bool = False, local: bool = False) -> None:
         )
 
     if yes or confirm:
-        server = get_active_deployment(local=True)
+        server = get_local_server()
 
         if server:
-            from zenml.zen_server.deploy.deployer import ServerDeployer
+            from zenml.zen_server.deploy.deployer import LocalServerDeployer
 
-            deployer = ServerDeployer()
-            deployer.remove_server(server.config.name)
+            deployer = LocalServerDeployer()
+            deployer.remove_server()
             cli_utils.declare("The local ZenML dashboard has been shut down.")
 
         # delete the .zen folder
@@ -610,6 +611,11 @@ def info(
 
     store_cfg = gc.store_configuration
 
+    try:
+        active_project = client.active_project
+    except RuntimeError:
+        active_project = None
+
     user_info = {
         "zenml_local_version": zenml_version,
         "zenml_server_version": store_info.version,
@@ -622,7 +628,7 @@ def info(
         "python_version": environment.python_version(),
         "environment": get_environment(),
         "system_info": environment.get_system_info(),
-        "active_workspace": client.active_workspace.name,
+        "active_project": active_project.name if active_project else None,
         "active_stack": client.active_stack_model.name,
         "active_user": client.active_user.name,
         "telemetry_status": "enabled" if gc.analytics_opt_in else "disabled",
@@ -635,7 +641,7 @@ def info(
     }
 
     if all:
-        user_info["packages"] = cli_utils.get_package_information()
+        user_info["packages"] = get_package_information()
     if packages:
         if user_info.get("packages"):
             if isinstance(user_info["packages"], dict):
@@ -645,7 +651,7 @@ def info(
                     if p in packages
                 }
         else:
-            user_info["query_packages"] = cli_utils.get_package_information(
+            user_info["query_packages"] = get_package_information(
                 list(packages)
             )
     if file:
@@ -674,7 +680,7 @@ def info(
     "--skip_default_registrations",
     is_flag=True,
     default=False,
-    help="Skip registering default workspace, user and stack.",
+    help="Skip registering default project, user and stack.",
     type=bool,
 )
 def migrate_database(skip_default_registrations: bool = False) -> None:

@@ -13,7 +13,6 @@
 #  permissions and limitations under the License.
 
 from typing import Optional, Tuple
-from unittest import mock
 from uuid import uuid4
 
 import pytest
@@ -22,9 +21,8 @@ from typing_extensions import Annotated
 
 from zenml import get_pipeline_context, get_step_context, pipeline, step
 from zenml.artifacts.artifact_config import ArtifactConfig
-from zenml.artifacts.external_artifact import ExternalArtifact
 from zenml.client import Client
-from zenml.enums import ModelStages
+from zenml.enums import ExecutionMode, ExecutionStatus, ModelStages
 from zenml.model.model import Model
 
 
@@ -207,9 +205,9 @@ def _this_step_produces_output(
 @step
 def _this_step_tries_to_recover(run_number: int):
     mv = get_step_context().model._get_or_create_model_version()
-    assert (
-        len(mv.data_artifact_ids["data"]) == run_number
-    ), "expected AssertionError"
+    assert len(mv.data_artifact_ids["data"]) == run_number, (
+        "expected AssertionError"
+    )
 
     raise Exception("make pipeline fail")
 
@@ -241,13 +239,19 @@ def test_recovery_of_steps(clean_client: "Client", model: Model):
         )
 
     with pytest.raises(Exception, match="make pipeline fail"):
-        _this_pipeline_will_recover.with_options(model=model)(1)
+        _this_pipeline_will_recover.with_options(
+            model=model, execution_mode=ExecutionMode.FAIL_FAST
+        )(1)
     if model.version is None:
         model.version = "1"
     with pytest.raises(Exception, match="make pipeline fail"):
-        _this_pipeline_will_recover.with_options(model=model)(2)
+        _this_pipeline_will_recover.with_options(
+            model=model, execution_mode=ExecutionMode.FAIL_FAST
+        )(2)
     with pytest.raises(Exception, match="make pipeline fail"):
-        _this_pipeline_will_recover.with_options(model=model)(3)
+        _this_pipeline_will_recover.with_options(
+            model=model, execution_mode=ExecutionMode.FAIL_FAST
+        )(3)
 
     mv = clean_client.get_model_version(
         model_name_or_id="foo",
@@ -302,45 +306,6 @@ def _no_new_version_pipeline_warns_on_steps():
 def _new_version_pipeline_warns_on_steps():
     _new_version_step()
     _no_model_step()
-
-
-@pytest.mark.parametrize(
-    "pipeline, expected_warning",
-    [
-        (
-            _new_version_pipeline_overridden_warns,
-            "is overridden in all steps",
-        ),
-        (_new_version_pipeline_not_warns, ""),
-        (_no_new_version_pipeline_not_warns, ""),
-        (
-            _no_new_version_pipeline_warns_on_steps,
-            "is configured only in one place of the pipeline",
-        ),
-        (
-            _new_version_pipeline_warns_on_steps,
-            "is configured only in one place of the pipeline",
-        ),
-    ],
-    ids=[
-        "Pipeline with one step, which overrides model - warns that pipeline conf is useless.",
-        "Configuration in pipeline only - not warns.",
-        "Configuration in step only - not warns.",
-        "Two steps ask to create new versions - warning to keep it in one place.",
-        "Pipeline and one of the steps ask to create new versions - warning to keep it in one place.",
-    ],
-)
-def test_multiple_definitions_create_new_version_warns(
-    clean_client: "Client", pipeline, expected_warning
-):
-    """Test that setting conflicting model versions are raise warnings to user."""
-    with mock.patch("zenml.new.pipelines.run_utils.logger.warning") as logger:
-        pipeline()
-        if expected_warning:
-            logger.assert_called_once()
-            assert expected_warning in logger.call_args[0][0]
-        else:
-            logger.assert_not_called()
 
 
 @pipeline(name="bar", enable_cache=False)
@@ -443,45 +408,11 @@ def test_pipeline_run_link_attached_from_step_context(
     }
 
 
-@step
-def _this_step_has_model_on_artifact_level() -> (
-    Tuple[
-        Annotated[
-            int,
-            "declarative_link",
-            ArtifactConfig(
-                model_name="declarative", model_version=ModelStages.LATEST
-            ),
-        ],
-        Annotated[
-            int,
-            "functional_link",
-            ArtifactConfig(
-                model_name="functional", model_version=ModelStages.LATEST
-            ),
-        ],
-    ]
-):
-    return 1, 2
-
-
-@pipeline(enable_cache=False)
-def _pipeline_run_link_attached_from_artifact_context_single_step():
-    _this_step_has_model_on_artifact_level()
-
-
-@pipeline(enable_cache=False)
-def _pipeline_run_link_attached_from_artifact_context_multiple_step():
-    _this_step_has_model_on_artifact_level()
-    _this_step_has_model_on_artifact_level()
-
-
 @pipeline(
     enable_cache=False,
     model=Model(name="pipeline", version=ModelStages.LATEST),
 )
 def _pipeline_run_link_attached_from_mixed_context_single_step():
-    _this_step_has_model_on_artifact_level()
     _this_step_produces_output()
     _this_step_produces_output.with_options(
         model=Model(name="step", version=ModelStages.LATEST),
@@ -493,12 +424,10 @@ def _pipeline_run_link_attached_from_mixed_context_single_step():
     model=Model(name="pipeline", version=ModelStages.LATEST),
 )
 def _pipeline_run_link_attached_from_mixed_context_multiple_step():
-    _this_step_has_model_on_artifact_level()
     _this_step_produces_output()
     _this_step_produces_output.with_options(
         model=Model(name="step", version=ModelStages.LATEST),
     )()
-    _this_step_has_model_on_artifact_level()
     _this_step_produces_output()
     _this_step_produces_output.with_options(
         model=Model(name="step", version=ModelStages.LATEST),
@@ -509,27 +438,17 @@ def _pipeline_run_link_attached_from_mixed_context_multiple_step():
     "pipeline,model_names",
     (
         (
-            _pipeline_run_link_attached_from_artifact_context_single_step,
-            ["declarative", "functional"],
-        ),
-        (
-            _pipeline_run_link_attached_from_artifact_context_multiple_step,
-            ["declarative", "functional"],
-        ),
-        (
             _pipeline_run_link_attached_from_mixed_context_single_step,
-            ["declarative", "functional", "step", "pipeline"],
+            ["step", "pipeline"],
         ),
         (
             _pipeline_run_link_attached_from_mixed_context_multiple_step,
-            ["declarative", "functional", "step", "pipeline"],
+            ["step", "pipeline"],
         ),
     ),
     ids=[
-        "Single step pipeline (declarative+functional)",
-        "Multiple steps pipeline (declarative+functional)",
-        "Single step pipeline (declarative+functional+step+pipeline)",
-        "Multiple steps pipeline (declarative+functional+step+pipeline)",
+        "Single step pipeline (step+pipeline)",
+        "Multiple steps pipeline (step+pipeline)",
     ],
 )
 def test_pipeline_run_link_attached_from_mixed_context(
@@ -579,13 +498,11 @@ def _consumer_step(a: int, b: int):
 
 
 @step(model=Model(name="step"))
-def _producer_step() -> (
-    Tuple[
-        Annotated[int, "output_0"],
-        Annotated[int, "output_1"],
-        Annotated[int, "output_2"],
-    ]
-):
+def _producer_step() -> Tuple[
+    Annotated[int, "output_0"],
+    Annotated[int, "output_1"],
+    Annotated[int, "output_2"],
+]:
     return 1, 2, 3
 
 
@@ -593,13 +510,13 @@ def _producer_step() -> (
 def _consumer_pipeline_with_step_context():
     _consumer_step.with_options(
         model=Model(name="step", version=ModelStages.LATEST)
-    )(ExternalArtifact(name="output_0"), 1)
+    )(Client().get_artifact_version("output_0"), 1)
 
 
 @pipeline(model=Model(name="step", version=ModelStages.LATEST))
 def _consumer_pipeline_with_pipeline_context():
     _consumer_step(
-        ExternalArtifact(name="output_2"),
+        Client().get_artifact_version("output_2"),
         3,
     )
 
@@ -648,7 +565,7 @@ def test_that_if_some_steps_request_new_version_but_cached_new_version_is_still_
     def _inner_pipeline():
         # this step requests a new version, but can be cached
         _this_step_produces_output.with_options(model=Model(name="step"))(
-            dummy=42, id="cacheable_step"
+            dummy=42, id="cacheable_step", after=["non_cacheable_step"]
         )
         # this is an always run step
         _this_step_produces_output.with_options(enable_cache=False)(
@@ -660,21 +577,21 @@ def test_that_if_some_steps_request_new_version_but_cached_new_version_is_still_
     # model is configured with latest stage, so a warm-up needed
     with pytest.raises(KeyError):
         _inner_pipeline.with_options(run_name=run_1)()
+    run_2 = f"run_{uuid4()}"
     Model(name="step")._get_or_create_model_version()
-    _inner_pipeline.with_options(run_name=run_1)()
+    _inner_pipeline.with_options(run_name=run_2)()
 
     # here the step requesting new version is cached
-    run_2 = f"run_{uuid4()}"
-    _inner_pipeline.with_options(run_name=run_2)()
+    run_3 = f"run_{uuid4()}"
+    _inner_pipeline.with_options(run_name=run_3)()
 
     model = clean_client.get_model(model_name_or_id="step")
     mvs = model.versions
     assert len(mvs) == 3
-    # here we check which pipelines were attached to the model versions:
-    # - MV #1 was created before the first run and was used as LATEST in first run -> run 1
-    # - MV #2 was created during first run in a step and was used as LATEST in second run -> runs 1&2
-    # - MV #3 was created during the second run and was not used in other pipelines -> run 2
-    for mv, run_names in zip(mvs, ({run_1}, {run_1, run_2}, {run_2})):
+    # - MV #1 was created before the second run and was used as LATEST in second run -> run 2
+    # - MV #2 was created during second run in a step and was used as LATEST in third run -> runs 2&3
+    # - MV #3 was created during the third run and was not used in other pipelines -> run 3
+    for mv, run_names in zip(mvs, ({run_2}, {run_2, run_3}, {run_3})):
         pr_ids = clean_client.zen_store.get_model_version(
             mv.id
         ).pipeline_run_ids
@@ -687,10 +604,7 @@ def test_that_pipeline_run_is_removed_on_deletion_of_pipeline_run(
 ):
     """Test that if pipeline run gets deleted - it is removed from model version."""
 
-    @pipeline(
-        model=Model(name="step", version=ModelStages.LATEST),
-        enable_cache=False,
-    )
+    @pipeline(enable_cache=False)
     def _inner_pipeline():
         _this_step_produces_output.with_options(model=Model(name="step"))()
 
@@ -717,7 +631,6 @@ def test_that_pipeline_run_is_removed_on_deletion_of_pipeline(
     """Test that if pipeline gets deleted - runs are removed from model version."""
 
     @pipeline(
-        model=Model(name="step", version=ModelStages.LATEST),
         enable_cache=False,
         name="test_that_pipeline_run_is_removed_on_deletion_of_pipeline",
     )
@@ -750,10 +663,7 @@ def test_that_artifact_is_removed_on_deletion(
 ):
     """Test that if artifact gets deleted - it is removed from model version."""
 
-    @pipeline(
-        model=Model(name="step", version=ModelStages.LATEST),
-        enable_cache=False,
-    )
+    @pipeline(enable_cache=False)
     def _inner_pipeline():
         _this_step_produces_output.with_options(model=Model(name="step"))()
 
@@ -763,10 +673,9 @@ def test_that_artifact_is_removed_on_deletion(
     run = clean_client.get_pipeline_run(run_1)
     pipeline_id = run.pipeline.id
     artifact_version_id = (
-        run.steps["_this_step_produces_output"].outputs["data"].id
+        run.steps["_this_step_produces_output"].outputs["data"][0].id
     )
     clean_client.delete_pipeline(pipeline_id)
-    clean_client.delete_pipeline_run(run.id)
     clean_client.delete_artifact_version(artifact_version_id)
     model = clean_client.get_model(model_name_or_id="step")
     mvs = model.versions
@@ -788,9 +697,9 @@ def _this_step_asserts_context_with_artifact(artifact: str):
 
 
 @step
-def _this_step_produces_output_model() -> (
-    Annotated[str, ArtifactConfig(name="artifact")]
-):
+def _this_step_produces_output_model() -> Annotated[
+    str, ArtifactConfig(name="artifact")
+]:
     """This step produces artifact with model number."""
     return str(get_step_context().model.id)
 
@@ -870,3 +779,183 @@ def test_pipeline_use_same_model_version_even_if_it_was_promoted_during_run(
         model_version_asserter(mv_id=mv1.id, after=["model_version_promoter"])
 
     _inner_pipeline()
+
+
+def test_templated_names_for_model_version(clean_client: "Client"):
+    """Test few cases with templated version names:
+
+    - Use same template in pipeline and step and ensure that only one and same model version was created.
+    """
+    model_name = random_resource_name()
+    model_version = random_resource_name() + "{date}_{time}"
+
+    @pipeline(
+        model=Model(name=model_name, version=model_version), enable_cache=False
+    )
+    def _inner_pipeline():
+        _this_step_produces_output.with_options(
+            model=Model(name=model_name, version=model_version)
+        )(id="step_1")
+        _this_step_produces_output(after=["step_1"], id="step_2")
+
+    _inner_pipeline()
+
+    versions = clean_client.get_model(model_name).versions
+    first_version_name = versions[0].version
+    assert len(versions) == 1
+    assert "{date}" not in first_version_name
+    assert "{time}" not in first_version_name
+    assert len(versions[0]._get_model_version().data_artifact_ids["data"]) == 2
+
+    _inner_pipeline()
+
+    versions = clean_client.get_model(model_name).versions
+    assert len(versions) == 2
+    assert "{date}" not in versions[1].version
+    assert "{time}" not in versions[1].version
+    assert len(versions[1]._get_model_version().data_artifact_ids["data"]) == 2
+    assert versions[1].version != first_version_name
+
+
+@step
+def noop() -> None:
+    pass
+
+
+def test_model_version_creation(clean_client: "Client"):
+    """Tests that model versions get created correctly for a pipeline run."""
+    shared_model_name = random_resource_name()
+    custom_model_name = random_resource_name()
+
+    @pipeline(model=Model(name=shared_model_name), enable_cache=False)
+    def _inner_pipeline():
+        noop.with_options(model=Model(name=shared_model_name))(id="shared")
+        noop.with_options(
+            model=Model(name=shared_model_name, version="custom")
+        )(id="custom_version")
+        noop.with_options(model=Model(name=custom_model_name))(
+            id="custom_model"
+        )
+
+    run_1 = _inner_pipeline()
+    shared_versions = clean_client.list_model_versions(shared_model_name)
+    assert len(shared_versions) == 2
+    implicit_version = shared_versions[-2]
+    explicit_version = shared_versions[-1]
+
+    custom_versions = clean_client.list_model_versions(custom_model_name)
+    assert len(custom_versions) == 1
+    custom_version = custom_versions[-1]
+
+    assert run_1.model_version.id == implicit_version.id
+    for name, step_ in run_1.steps.items():
+        if name == "shared":
+            assert step_.model_version.id == implicit_version.id
+        elif name == "custom_version":
+            assert step_.model_version.id == explicit_version.id
+        else:
+            assert step_.model_version.id == custom_version.id
+    links = clean_client.list_model_version_pipeline_run_links(
+        pipeline_run_id=run_1.id
+    )
+    assert len(links) == 3
+
+    run_2 = _inner_pipeline()
+    shared_versions = clean_client.list_model_versions(shared_model_name)
+    assert len(shared_versions) == 3
+    implicit_version = shared_versions[-1]
+    explicit_version = shared_versions[-2]
+
+    custom_versions = clean_client.list_model_versions(custom_model_name)
+    assert len(custom_versions) == 2
+    custom_version = custom_versions[-1]
+
+    assert run_2.model_version.id == implicit_version.id
+    for name, step_ in run_2.steps.items():
+        if name == "shared":
+            assert step_.model_version.id == implicit_version.id
+        elif name == "custom_version":
+            assert step_.model_version.id == explicit_version.id
+        else:
+            assert step_.model_version.id == custom_version.id
+    links = clean_client.list_model_version_pipeline_run_links(
+        pipeline_run_id=run_2.id
+    )
+    assert len(links) == 3
+
+    # Run with caching enabled to see if everything still works
+    run_3 = _inner_pipeline.with_options(enable_cache=True)()
+    shared_versions = clean_client.list_model_versions(shared_model_name)
+    assert len(shared_versions) == 4
+    implicit_version = shared_versions[-1]
+    explicit_version = shared_versions[-3]
+
+    custom_versions = clean_client.list_model_versions(custom_model_name)
+    assert len(custom_versions) == 3
+    custom_version = custom_versions[-1]
+
+    assert run_3.model_version.id == implicit_version.id
+    for name, step_ in run_3.steps.items():
+        assert step_.status == ExecutionStatus.CACHED
+
+        if name == "shared":
+            assert step_.model_version.id == implicit_version.id
+        elif name == "custom_version":
+            assert step_.model_version.id == explicit_version.id
+        else:
+            assert step_.model_version.id == custom_version.id
+    links = clean_client.list_model_version_pipeline_run_links(
+        pipeline_run_id=run_3.id
+    )
+    assert len(links) == 3
+
+
+def test_model_version_fetching_by_stage(clean_client: "Client"):
+    """Tests that model versions can be fetched by number or stage."""
+    model_name = random_resource_name()
+
+    @pipeline(model=Model(name=model_name), enable_cache=False)
+    def _creator_pipeline():
+        noop()
+
+    @pipeline(model=Model(name=model_name, version=1), enable_cache=False)
+    def _fetch_by_version_number_pipeline():
+        noop()
+
+    @pipeline(
+        model=Model(name=model_name, version="latest"), enable_cache=False
+    )
+    def _fetch_latest_version_pipeline():
+        noop()
+
+    @pipeline(
+        model=Model(name=model_name, version="production"), enable_cache=False
+    )
+    def _fetch_prod_version_pipeline():
+        noop()
+
+    with pytest.raises(KeyError):
+        _fetch_by_version_number_pipeline()
+
+    with pytest.raises(KeyError):
+        _fetch_latest_version_pipeline()
+
+    with pytest.raises(KeyError):
+        _fetch_prod_version_pipeline()
+
+    _creator_pipeline()
+    _creator_pipeline()
+
+    versions = clean_client.list_model_versions(model_name)
+    assert len(versions) == 2
+    mv_1, mv_2 = versions
+    mv_1.set_stage("production")
+
+    run = _fetch_by_version_number_pipeline()
+    assert run.model_version.id == mv_1.id
+
+    run = _fetch_latest_version_pipeline()
+    assert run.model_version.id == mv_2.id
+
+    run = _fetch_prod_version_pipeline()
+    assert run.model_version.id == mv_1.id

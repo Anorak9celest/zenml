@@ -6,7 +6,7 @@ description: >-
 
 # Evidently
 
-The Evidently [Data Validator](./data-validators.md) flavor provided with the ZenML integration uses [Evidently](https://evidentlyai.com/) to perform data quality, data drift, model drift and model performance analyses, to generate reports and run checks. The reports and check results can be used to implement automated corrective actions in your pipelines or to render interactive representations for further visual interpretation, evaluation and documentation.
+The Evidently [Data Validator](./) flavor provided with the ZenML integration uses [Evidently](https://evidentlyai.com/) to perform data quality, data drift, model drift and model performance analyzes, to generate reports and run checks. The reports and check results can be used to implement automated corrective actions in your pipelines or to render interactive representations for further visual interpretation, evaluation and documentation.
 
 ### When would you want to use it?
 
@@ -21,7 +21,7 @@ You should use the Evidently Data Validator when you need the following data and
 * [Target Drift](https://docs.evidentlyai.com/presets/target-drift) reports and tests: helps detect and explore changes in the target function and/or model predictions by comparing two datasets where the target and/or prediction columns are available.
 * [Regression Performance](https://docs.evidentlyai.com/presets/reg-performance) or [Classification Performance](https://docs.evidentlyai.com/presets/class-performance) reports and tests: evaluate the performance of a model by analyzing a single dataset where both the target and prediction columns are available. It can also compare it to the past performance of the same model, or the performance of an alternative model by providing a second dataset.
 
-You should consider one of the other [Data Validator flavors](./data-validators.md#data-validator-flavors) if you need a different set of data validation features.
+You should consider one of the other [Data Validator flavors](./#data-validator-flavors) if you need a different set of data validation features.
 
 ### How do you deploy it?
 
@@ -47,7 +47,7 @@ zenml stack register custom_stack -dv evidently_data_validator ... --set
 
 Evidently's profiling functions take in a `pandas.DataFrame` dataset or a pair of datasets and generate results in the form of a `Report` object.
 
-One of Evidently's notable characteristics is that it only requires datasets as input. Even when running model performance comparison analyses, no model needs to be present. However, that does mean that the input data needs to include additional `target` and `prediction` columns for some profiling reports and, you have to include additional information about the dataset columns in the form of [column mappings](https://docs.evidentlyai.com/user-guide/tests-and-reports/column-mapping). Depending on how your data is structured, you may also need to include additional steps in your pipeline before the data validation step to insert the additional `target` and `prediction` columns into your data. This may also require interacting with one or more models.
+One of Evidently's notable characteristics is that it only requires datasets as input. Even when running model performance comparison analyzes, no model needs to be present. However, that does mean that the input data needs to include additional `target` and `prediction` columns for some profiling reports and, you have to include additional information about the dataset columns in the form of [column mappings](https://docs.evidentlyai.com/user-guide/tests-and-reports/column-mapping). Depending on how your data is structured, you may also need to include additional steps in your pipeline before the data validation step to insert the additional `target` and `prediction` columns into your data. This may also require interacting with one or more models.
 
 There are three ways you can use Evidently to generate data reports in your ZenML pipelines that allow different levels of flexibility:
 
@@ -177,6 +177,12 @@ As can be seen in the example, there are two basic ways of adding metrics to you
 The ZenML Evidently report step can then be inserted into your pipeline where it can take in two datasets and outputs the Evidently report generated in both JSON and HTML formats, e.g.:
 
 ```python
+from zenml import pipeline
+from zenml.config import DockerSettings
+
+# Note: docker_settings would be defined elsewhere
+# Note: data_loader, data_splitter, text_data_report, text_data_test, text_analyzer would be custom step functions
+
 @pipeline(enable_cache=False, settings={"docker": docker_settings})
 def text_data_report_test_pipeline():
     """Links all the steps together in a pipeline."""
@@ -228,7 +234,7 @@ text_data_report = evidently_report_step.with_options(
 )
 ```
 
-You can view [the complete list of configuration parameters](https://sdkdocs.zenml.io/latest/integration\_code\_docs/integrations-evidently/#zenml.integrations.evidently.steps.evidently\_report.evidently\_report\_step) in the SDK docs.
+You can view [the complete list of configuration parameters](https://sdkdocs.zenml.io/latest/integration_code_docs/integrations-evidently.html#zenml.integrations.evidently) in the SDK docs.
 
 #### Data Validation
 
@@ -405,7 +411,7 @@ text_data_test = evidently_test_step.with_options(
 )
 ```
 
-You can view [the complete list of configuration parameters](https://sdkdocs.zenml.io/latest/integration\_code\_docs/integrations-evidently/#zenml.integrations.evidently.steps.evidently\_test.evidently\_test\_step) in the SDK docs.
+You can view [the complete list of configuration parameters](https://sdkdocs.zenml.io/latest/integration_code_docs/integrations-evidently.html#zenml.integrations.evidently) in the SDK docs.
 
 #### The Evidently Data Validator
 
@@ -414,7 +420,7 @@ The Evidently Data Validator implements the same interface as do all Data Valida
 All you have to do is call the Evidently Data Validator methods when you need to interact with Evidently to generate data reports or to run test suites, e.g.:
 
 ```python
-from typing_extensions import Annotated  # or `from typing import Annotated on Python 3.9+
+from typing import Annotated
 from typing import Tuple
 import pandas as pd
 from evidently.pipeline.column_mapping import ColumnMapping
@@ -528,14 +534,14 @@ def data_validation(
     return test_suite.json(), HTMLString(test_suite.show(mode="inline").data)
 ```
 
-Have a look at [the complete list of methods and parameters available in the `EvidentlyDataValidator` API](https://sdkdocs.zenml.io/latest/integration\_code\_docs/integrations-evidently/#zenml.integrations.evidently.data\_validators.evidently\_data\_validator.EvidentlyDataValidator) in the SDK docs.
+Have a look at [the complete list of methods and parameters available in the `EvidentlyDataValidator` API](https://sdkdocs.zenml.io/latest/integration_code_docs/integrations-evidently.html#zenml.integrations.evidently) in the SDK docs.
 
 #### Call Evidently directly
 
 You can use the Evidently library directly in your custom pipeline steps, e.g.:
 
 ```python
-from typing_extensions import Annotated  # or `from typing import Annotated` on Python 3.9+
+from typing import Annotated
 from typing import Tuple
 import pandas as pd
 from evidently.report import Report
@@ -609,7 +615,7 @@ def data_tester(
 
 You can view visualizations of the Evidently reports generated by your pipeline steps directly in the ZenML dashboard by clicking on the respective artifact in the pipeline run DAG.
 
-Alternatively, if you are running inside a Jupyter notebook, you can load and render the reports using the [artifact.visualize() method](../../how-to/visualize-artifacts/README.md), e.g.:
+Alternatively, if you are running inside a Jupyter notebook, you can load and render the reports using the [artifact.visualize() method](https://docs.zenml.io/how-to/data-artifact-management/visualize-artifacts/), e.g.:
 
 ```python
 from zenml.client import Client

@@ -24,13 +24,14 @@ from typing import (
     Type,
 )
 
-from pydantic import field_validator
+from pydantic import Field, field_validator
 
 from zenml.artifact_stores import (
     BaseArtifactStoreConfig,
     BaseArtifactStoreFlavor,
 )
 from zenml.integrations.s3 import S3_ARTIFACT_STORE_FLAVOR
+from zenml.integrations.s3.utils import split_s3_path
 from zenml.models import ServiceConnectorRequirements
 from zenml.stack.authentication_mixin import AuthenticationConfigMixin
 from zenml.utils.networking_utils import (
@@ -63,12 +64,39 @@ class S3ArtifactStoreConfig(
 
     SUPPORTED_SCHEMES: ClassVar[Set[str]] = {"s3://"}
 
-    key: Optional[str] = SecretField(default=None)
-    secret: Optional[str] = SecretField(default=None)
-    token: Optional[str] = SecretField(default=None)
-    client_kwargs: Optional[Dict[str, Any]] = None
-    config_kwargs: Optional[Dict[str, Any]] = None
-    s3_additional_kwargs: Optional[Dict[str, Any]] = None
+    key: Optional[str] = SecretField(
+        default=None,
+        description="AWS access key ID for authentication. "
+        "If not provided, credentials will be inferred from the environment.",
+    )
+    secret: Optional[str] = SecretField(
+        default=None,
+        description="AWS secret access key for authentication. "
+        "If not provided, credentials will be inferred from the environment.",
+    )
+    token: Optional[str] = SecretField(
+        default=None,
+        description="AWS session token for temporary credentials. "
+        "If not provided, credentials will be inferred from the environment.",
+    )
+    client_kwargs: Optional[Dict[str, Any]] = Field(
+        None,
+        description="Additional keyword arguments to pass to the S3 client. "
+        "For example, to connect to a custom S3-compatible endpoint: "
+        "{'endpoint_url': 'http://minio:9000'}",
+    )
+    config_kwargs: Optional[Dict[str, Any]] = Field(
+        None,
+        description="Additional keyword arguments to pass to the S3 client configuration. "
+        "For example: {'region_name': 'us-west-2', 'signature_version': 's3v4'}",
+    )
+    s3_additional_kwargs: Optional[Dict[str, Any]] = Field(
+        None,
+        description="Additional keyword arguments for S3 operations. "
+        "For example: {'ACL': 'bucket-owner-full-control'}",
+    )
+
+    _bucket: Optional[str] = None
 
     @field_validator("client_kwargs")
     @classmethod
@@ -105,6 +133,17 @@ class S3ArtifactStoreConfig(
                 url
             )
         return value
+
+    @property
+    def bucket(self) -> str:
+        """The bucket name of the artifact store.
+
+        Returns:
+            The bucket name of the artifact store.
+        """
+        if self._bucket is None:
+            self._bucket, _ = split_s3_path(self.path)
+        return self._bucket
 
 
 class S3ArtifactStoreFlavor(BaseArtifactStoreFlavor):

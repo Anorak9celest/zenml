@@ -13,6 +13,8 @@
 #  permissions and limitations under the License.
 """Functionality to install or uninstall ZenML integrations via the CLI."""
 
+import os
+import subprocess
 import sys
 from typing import Optional, Tuple
 
@@ -24,6 +26,7 @@ from zenml.cli.utils import (
     confirmation,
     declare,
     error,
+    exception,
     format_integration_list,
     install_packages,
     print_table,
@@ -34,6 +37,14 @@ from zenml.cli.utils import (
 from zenml.console import console
 from zenml.enums import CliCategories
 from zenml.logger import get_logger
+
+_WHYLOGS_INTEGRATION_WARNING = (
+    "WhyLabs was acquired by Apple and the hosted WhyLabs platform is being "
+    "discontinued. The whylogs library remains open source and the WhyLabs "
+    "platform is now available as OSS at "
+    "https://github.com/whylabs/whylabs-oss, but hosted functionality may stop "
+    "working. Plan accordingly before continuing with the whylogs integration."
+)
 
 logger = get_logger(__name__)
 
@@ -79,11 +90,11 @@ def get_requirements(integration_name: Optional[str] = None) -> None:
             integration_name
         )
     except KeyError as e:
-        error(str(e))
+        exception(e)
     else:
         if requirements:
             title(
-                f'Requirements for {integration_name or "all integrations"}:\n'
+                f"Requirements for {integration_name or 'all integrations'}:\n"
             )
             declare(f"{requirements}")
             warning(
@@ -131,12 +142,20 @@ def get_requirements(integration_name: Optional[str] = None) -> None:
     "environment. This can not be specified when also providing explicit "
     "integrations.",
 )
+@click.option(
+    "--poetry",
+    "poetry",
+    is_flag=True,
+    default=False,
+    help="Add the exported requirements to your current Poetry project.",
+)
 def export_requirements(
     integrations: Tuple[str],
     ignore_integration: Tuple[str],
     output_file: Optional[str] = None,
     overwrite: bool = False,
     installed_only: bool = False,
+    poetry: bool = False,
 ) -> None:
     """Exports integration requirements so they can be installed using pip.
 
@@ -150,6 +169,7 @@ def export_requirements(
         installed_only: Only export requirements for integrations installed in
             your current environment. This can not be specified when also
             providing explicit integrations.
+        poetry: Add the exported requirements to your current Poetry project.
     """
     from zenml.integrations.registry import integration_registry
 
@@ -158,6 +178,12 @@ def export_requirements(
             "You can either provide specific integrations or export only "
             "requirements for integrations installed in your local "
             "environment, not both."
+        )
+
+    if poetry and output_file:
+        error(
+            "You can either specify an output file or add the requirements to "
+            "the Poetry project, not both."
         )
 
     all_integrations = set(integration_registry.integrations.keys())
@@ -180,6 +206,9 @@ def export_requirements(
                     f"Integration {i} does not exist. Available integrations: "
                     f"{all_integrations}"
                 )
+
+    if "whylogs" in integrations_to_export:
+        warning(_WHYLOGS_INTEGRATION_WARNING)
 
     requirements = []
     for integration_name in integrations_to_export:
@@ -204,6 +233,25 @@ def export_requirements(
                 with open(output_file, "w") as f:
                     f.write("\n".join(requirements))
         declare(f"Requirements exported to {output_file}.")
+    if poetry:
+        res = os.popen("poetry env list").read()
+        envs = [
+            env
+            for env in res.split("\n")
+            if env.lower().find("(activated)") > 0
+        ]
+        if len(envs) == 0:
+            error(
+                "No activated Poetry environment found. Please activate one "
+                "and try again."
+            )
+        else:
+            # Use subprocess.run with shell=False to avoid command injection
+            args = ["poetry", "add"] + requirements
+            subprocess.run(args, check=True)
+            declare(
+                f"Requirements added to `{envs[0]}` environment in Poetry."
+            )
     else:
         click.echo(" ".join(requirements), nl=False)
 
@@ -247,42 +295,63 @@ def install(
     Args:
         integrations: The name of the integration to install the requirements
             for.
-        ignore_integration: Integrations to ignore explicitly (passed in separately).
+        ignore_integration: Integrations to ignore explicitly (passed in
+            separately).
         force: Force the installation of the required packages.
         uv: Use uv for package installation (experimental).
     """
-    from zenml.cli.utils import is_uv_installed
+    from zenml.cli.utils import is_pip_installed, is_uv_installed
     from zenml.integrations.registry import integration_registry
 
     if uv and not is_uv_installed():
         error(
-            "UV is not installed but the uv flag was passed in. Please install uv or remove the uv flag."
+            "UV is not installed but the uv flag was passed in. Please install "
+            "uv or remove the uv flag."
+        )
+
+    if not uv and not is_pip_installed():
+        error(
+            "Pip is not installed. Please install pip or use the uv flag "
+            "(--uv) for package installation."
         )
 
     if not integrations:
         # no integrations specified, use all registered integrations
-        integrations = set(integration_registry.integrations.keys())
+        integration_set = set(integration_registry.integrations.keys())
 
         for i in ignore_integration:
             try:
-                integrations.remove(i)
+                integration_set.remove(i)
             except KeyError:
                 error(
                     f"Integration {i} does not exist. Available integrations: "
                     f"{list(integration_registry.integrations.keys())}"
                 )
-    # TODO: remove once python 3.8 is deprecated
-    if sys.version_info.minor == 8 and "tensorflow" in integrations:
+    else:
+        integration_set = set(integrations)
+
+    if "whylogs" in integration_set:
+        warning(_WHYLOGS_INTEGRATION_WARNING)
+
+    if sys.version_info.minor == 12 and "tensorflow" in integration_set:
         warning(
-            "Python 3.8 with TensorFlow is not fully compatible with "
-            "Pydantic 2 requirements. Consider upgrading to a "
-            "higher Python version if you would like to use the "
-            "Tensorflow integration."
+            "The TensorFlow integration is not yet compatible with Python "
+            "3.12, thus its installation is skipped. Consider using a "
+            "different version of Python and stay in touch for further updates."
         )
+        integration_set.remove("tensorflow")
+
+    if sys.version_info.minor == 12 and "deepchecks" in integration_set:
+        warning(
+            "The Deepchecks integration is not yet compatible with Python "
+            "3.12, thus its installation is skipped. Consider using a "
+            "different version of Python and stay in touch for further updates."
+        )
+        integration_set.remove("deepchecks")
 
     requirements = []
     integrations_to_install = []
-    for integration_name in integrations:
+    for integration_name in integration_set:
         try:
             if force or not integration_registry.is_installed(
                 integration_name
@@ -346,11 +415,17 @@ def uninstall(
         force: Force the uninstallation of the required packages.
         uv: Use uv for package uninstallation (experimental).
     """
-    from zenml.cli.utils import is_uv_installed
+    from zenml.cli.utils import is_pip_installed, is_uv_installed
     from zenml.integrations.registry import integration_registry
 
     if uv and not is_uv_installed():
         error("Package `uv` is not installed. Please install it and retry.")
+
+    if not uv and not is_pip_installed():
+        error(
+            "Pip is not installed. Please install pip or use the uv flag "
+            "(--uv) for package installation."
+        )
 
     if not integrations:
         # no integrations specified, use all registered integrations
@@ -423,11 +498,17 @@ def upgrade(
         force: Force the installation of the required packages.
         uv: Use uv for package installation (experimental).
     """
-    from zenml.cli.utils import is_uv_installed
+    from zenml.cli.utils import is_pip_installed, is_uv_installed
     from zenml.integrations.registry import integration_registry
 
     if uv and not is_uv_installed():
         error("Package `uv` is not installed. Please install it and retry.")
+
+    if not uv and not is_pip_installed():
+        error(
+            "Pip is not installed. Please install pip or use the uv flag "
+            "(--uv) for package installation."
+        )
 
     if not integrations:
         # no integrations specified, use all registered integrations

@@ -14,13 +14,15 @@
 """Source classes."""
 
 from enum import Enum
-from typing import TYPE_CHECKING, Any, Dict, Optional
+from types import BuiltinFunctionType, FunctionType, ModuleType
+from typing import TYPE_CHECKING, Any, Callable, Dict, Optional, Type, Union
 from uuid import UUID
 
 from pydantic import (
     BaseModel,
     BeforeValidator,
     ConfigDict,
+    PlainSerializer,
     SerializeAsAny,
     field_validator,
 )
@@ -42,6 +44,7 @@ class SourceType(Enum):
     INTERNAL = "internal"
     DISTRIBUTION_PACKAGE = "distribution_package"
     CODE_REPOSITORY = "code_repository"
+    NOTEBOOK = "notebook"
     UNKNOWN = "unknown"
 
 
@@ -161,6 +164,201 @@ class Source(BaseModel):
         """
         return super().model_dump_json(serialize_as_any=True, **kwargs)
 
+    @classmethod
+    def convert_source(cls, source: Any) -> Any:
+        """Converts an old source string to a source object.
+
+        Args:
+            source: Source string or object.
+
+        Returns:
+            The converted source.
+        """
+        if isinstance(source, str):
+            source = cls.from_import_path(source)
+
+        return source
+
+
+ObjectType = Union[
+    Type[Any],
+    Callable[..., Any],
+    ModuleType,
+    FunctionType,
+    BuiltinFunctionType,
+]
+
+
+class SourceOrObject(Source):
+    """Hybrid type that can hold either a Source path or a loaded object (type, function, variable, etc.).
+
+    This enables:
+    - Internal use: Pass actual objects directly
+    - External use: Pass source strings from config
+    - Lazy serialization: Converts objects to source path strings only at
+    serialization time
+    - Lazy loading: Only loads sources when explicitly requested
+
+    Examples:
+    * the source `SourceOrObject(module="zenml.config.source", attribute="SourceOrObject")`
+    references the class that this docstring is describing.
+    * the object `SourceOrObject.from_object(object=my_object)` creates a source
+    or object from the object `my_object`.
+
+    Attributes:
+        _object: Loaded object object (if initialized from object or loaded).
+        _is_loaded: Whether the callable has been loaded.
+    """
+
+    _object: Optional[ObjectType] = None
+    _is_loaded: bool = False
+
+    @classmethod
+    def from_source(cls, source: Source) -> "SourceOrObject":
+        """Creates a source or object from a source instance.
+
+        Args:
+            source: The source instance.
+
+        Returns:
+            The source or object instance.
+        """
+        return cls(**source.model_dump())
+
+    @classmethod
+    def from_object(cls, object: ObjectType) -> "SourceOrObject":
+        """Creates a source or object from an object instance.
+
+        Args:
+            object: The object instance.
+
+        Returns:
+            The source or object instance.
+        """
+        # We don't resolve the object right away, we only do it at serialization
+        # time. This allows us to store temporary objects in this class too.
+        result = cls(
+            module="",
+            type=SourceType.UNKNOWN,
+        )
+        result._object = object
+        result._is_loaded = True
+        return result
+
+    def load(self) -> ObjectType:
+        """Load and return the object.
+
+        Returns:
+            The loaded object.
+
+        Raises:
+            RuntimeError: If loading fails.
+        """
+        from zenml.utils import source_utils
+
+        if not self._is_loaded:
+            try:
+                self._object = source_utils.load(self)
+                self._is_loaded = True
+            except Exception as e:
+                raise RuntimeError(
+                    f"Failed to load object from {self.import_path}: {e}"
+                ) from e
+
+        assert self._object is not None
+        return self._object
+
+    def resolve(self) -> None:
+        """Resolve the stored object to a source."""
+        from zenml.utils import source_utils
+
+        if not self._is_loaded:
+            return
+
+        if self.module:
+            # Already resolved
+            return
+
+        source = source_utils.resolve(self._object)
+        for k, v in source.model_dump().items():
+            setattr(self, k, v)
+
+    @property
+    def is_loaded(self) -> bool:
+        """Whether the object has been loaded.
+
+        Returns:
+            True if the object has been loaded, False otherwise.
+        """
+        return self._is_loaded
+
+    @classmethod
+    def convert_source_or_object(
+        cls,
+        source: Union[
+            str, "SourceOrObject", Source, Dict[str, Any], ObjectType
+        ],
+    ) -> Union["SourceOrObject", Dict[str, Any]]:
+        """Converts a source string or object to a SourceOrObject object.
+
+        Args:
+            source: Source string or object.
+
+        Returns:
+            The converted source or object.
+        """
+        if isinstance(source, str):
+            source = cls.from_import_path(source)
+
+        if isinstance(source, cls):
+            return source
+
+        if isinstance(source, Source):
+            return cls.from_source(source)
+
+        if isinstance(source, dict):
+            return source
+
+        return cls.from_object(source)
+
+    def model_dump(self, **kwargs: Any) -> Dict[str, Any]:
+        """Dump the source as a dictionary.
+
+        Args:
+            **kwargs: Additional keyword arguments.
+
+        Returns:
+            The source as a dictionary.
+        """
+        self.resolve()
+        return super().model_dump(**kwargs)
+
+    def model_dump_json(self, **kwargs: Any) -> str:
+        """Dump the source as a JSON string.
+
+        Args:
+            **kwargs: Additional keyword arguments.
+
+        Returns:
+            The source as a JSON string.
+        """
+        self.resolve()
+        return super().model_dump_json(**kwargs)
+
+    @classmethod
+    def serialize_source_or_object(
+        cls, value: "SourceOrObject"
+    ) -> Dict[str, Any]:
+        """Serialize the source or object as a dictionary.
+
+        Args:
+            value: The source or object to serialize.
+
+        Returns:
+            The source or object as a string.
+        """
+        return value.model_dump()
+
 
 class DistributionPackageSource(Source):
     """Source representing an object from a distribution package.
@@ -229,21 +427,71 @@ class CodeRepositorySource(Source):
         return value
 
 
-def convert_source(source: Any) -> Any:
-    """Converts an old source string to a source object.
+class NotebookSource(Source):
+    """Source representing an object defined in a notebook.
 
-    Args:
-        source: Source string or object.
-
-    Returns:
-        The converted source.
+    Attributes:
+        replacement_module: Name of the module from which this source should
+            be loaded in case the code is not running in a notebook.
+        artifact_store_id: ID of the artifact store in which the replacement
+            module code is stored.
     """
-    if isinstance(source, str):
-        source = Source.from_import_path(source)
 
-    return source
+    replacement_module: Optional[str] = None
+    artifact_store_id: Optional[UUID] = None
+    type: SourceType = SourceType.NOTEBOOK
+
+    @field_validator("type")
+    @classmethod
+    def _validate_type(cls, value: SourceType) -> SourceType:
+        """Validate the source type.
+
+        Args:
+            value: The source type.
+
+        Raises:
+            ValueError: If the source type is not `NOTEBOOK`.
+
+        Returns:
+            The source type.
+        """
+        if value != SourceType.NOTEBOOK:
+            raise ValueError("Invalid source type.")
+
+        return value
+
+    @field_validator("module")
+    @classmethod
+    def _validate_module(cls, value: str) -> str:
+        """Validate the module.
+
+        Args:
+            value: The module.
+
+        Raises:
+            ValueError: If the module is not `__main__`.
+
+        Returns:
+            The module.
+        """
+        if value != "__main__":
+            raise ValueError("Invalid module for notebook source.")
+
+        return value
 
 
 SourceWithValidator = Annotated[
-    SerializeAsAny[Source], BeforeValidator(convert_source)
+    SerializeAsAny[Source],
+    BeforeValidator(Source.convert_source),
 ]
+
+if TYPE_CHECKING:
+    SourceOrObjectField = Union[ObjectType, SourceOrObject, Source, str]
+else:
+    SourceOrObjectField = Annotated[
+        SourceOrObject,
+        BeforeValidator(SourceOrObject.convert_source_or_object),
+        PlainSerializer(
+            SourceOrObject.serialize_source_or_object, return_type=dict
+        ),
+    ]

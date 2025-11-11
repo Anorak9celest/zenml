@@ -13,45 +13,73 @@
 #  permissions and limitations under the License.
 """Util functions for the ZenML Server."""
 
+import asyncio
 import inspect
+import logging
 import os
+import sys
+import threading
+import time
 from functools import wraps
 from typing import (
+    TYPE_CHECKING,
     Any,
+    Awaitable,
     Callable,
+    Dict,
+    List,
     Optional,
     Tuple,
     Type,
     TypeVar,
-    cast,
+    Union,
+    overload,
 )
-from urllib.parse import urlparse
+from uuid import UUID
 
-import secure
+import psutil
 from pydantic import BaseModel, ValidationError
+from typing_extensions import ParamSpec
 
+from zenml import __version__ as zenml_version
 from zenml.config.global_config import GlobalConfiguration
 from zenml.config.server_config import ServerConfiguration
 from zenml.constants import (
+    API,
     ENV_ZENML_SERVER,
+    HEALTH,
+    INFO,
+    READY,
+    VERSION_1,
 )
-from zenml.enums import ServerProviderType
 from zenml.exceptions import IllegalOperationError, OAuthError
 from zenml.logger import get_logger
+from zenml.models.v2.base.scoped import ProjectScopedFilter
 from zenml.plugins.plugin_flavor_registry import PluginFlavorRegistry
-from zenml.zen_server.deploy.deployment import ServerDeployment
-from zenml.zen_server.deploy.local.local_zen_server import (
-    LocalServerDeploymentConfig,
-)
+from zenml.zen_server.cache import MemoryCache
 from zenml.zen_server.exceptions import http_exception_from_error
 from zenml.zen_server.feature_gate.feature_gate_interface import (
     FeatureGateInterface,
 )
-from zenml.zen_server.pipeline_deployment.workload_manager_interface import (
+from zenml.zen_server.pipeline_execution.workload_manager_interface import (
     WorkloadManagerInterface,
 )
 from zenml.zen_server.rbac.rbac_interface import RBACInterface
+from zenml.zen_server.request_management import RequestContext, RequestManager
 from zenml.zen_stores.sql_zen_store import SqlZenStore
+
+if TYPE_CHECKING:
+    from fastapi import Request
+
+    from zenml.zen_server.auth import AuthContext
+    from zenml.zen_server.pipeline_execution.utils import (
+        BoundedThreadPoolExecutor,
+    )
+
+
+P = ParamSpec("P")
+R = TypeVar("R")
+
 
 logger = get_logger(__name__)
 
@@ -59,8 +87,10 @@ _zen_store: Optional["SqlZenStore"] = None
 _rbac: Optional[RBACInterface] = None
 _feature_gate: Optional[FeatureGateInterface] = None
 _workload_manager: Optional[WorkloadManagerInterface] = None
+_snapshot_executor: Optional["BoundedThreadPoolExecutor"] = None
 _plugin_flavor_registry: Optional[PluginFlavorRegistry] = None
-_secure_headers: Optional[secure.Secure] = None
+_memcache: Optional[MemoryCache] = None
+_request_manager: Optional[RequestManager] = None
 
 
 def zen_store() -> "SqlZenStore":
@@ -85,6 +115,7 @@ def plugin_flavor_registry() -> PluginFlavorRegistry:
         The plugin flavor registry.
     """
     global _plugin_flavor_registry
+
     if _plugin_flavor_registry is None:
         _plugin_flavor_registry = PluginFlavorRegistry()
         _plugin_flavor_registry.initialize_plugins()
@@ -187,6 +218,35 @@ def initialize_workload_manager() -> None:
             _workload_manager = workload_manager_class()
 
 
+def snapshot_executor() -> "BoundedThreadPoolExecutor":
+    """Return the initialized snapshot executor.
+
+    Raises:
+        RuntimeError: If the snapshot executor is not initialized.
+
+    Returns:
+        The snapshot executor.
+    """
+    global _snapshot_executor
+    if _snapshot_executor is None:
+        raise RuntimeError("Snapshot executor not initialized")
+
+    return _snapshot_executor
+
+
+def initialize_snapshot_executor() -> None:
+    """Initialize the snapshot executor."""
+    global _snapshot_executor
+    from zenml.zen_server.pipeline_execution.utils import (
+        BoundedThreadPoolExecutor,
+    )
+
+    _snapshot_executor = BoundedThreadPoolExecutor(
+        max_workers=server_config().max_concurrent_snapshot_runs,
+        thread_name_prefix="zenml-snapshot-executor",
+    )
+
+
 def initialize_plugins() -> None:
     """Initialize the event plugins registry."""
     plugin_flavor_registry().initialize_plugins()
@@ -216,102 +276,29 @@ def initialize_zen_store() -> None:
     _zen_store = zen_store_
 
 
-def secure_headers() -> secure.Secure:
-    """Return the secure headers component.
+def initialize_memcache(max_capacity: int, default_expiry: int) -> None:
+    """Initialize the memory cache.
+
+    Args:
+        max_capacity: The maximum capacity of the cache.
+        default_expiry: The default expiry time in seconds.
+    """
+    global _memcache
+    _memcache = MemoryCache(max_capacity, default_expiry)
+
+
+def memcache() -> MemoryCache:
+    """Return the memory cache.
 
     Returns:
-        The secure headers component.
+        The memory cache.
 
     Raises:
-        RuntimeError: If the secure headers component is not initialized.
+        RuntimeError: If the memory cache is not initialized.
     """
-    global _secure_headers
-    if _secure_headers is None:
-        raise RuntimeError("Secure headers component not initialized")
-    return _secure_headers
-
-
-def initialize_secure_headers() -> None:
-    """Initialize the secure headers component."""
-    global _secure_headers
-
-    config = server_config()
-
-    # For each of the secure headers supported by the `secure` library, we
-    # check if the corresponding configuration is set in the server
-    # configuration:
-    #
-    # - if set to `True`, we use the default value for the header
-    # - if set to a string, we use the string as the value for the header
-    # - if set to `False`, we don't set the header
-
-    server: Optional[secure.Server] = None
-    if config.secure_headers_server:
-        server = secure.Server()
-        if isinstance(config.secure_headers_server, str):
-            server.set(config.secure_headers_server)
-        else:
-            server.set(str(config.deployment_id))
-
-    hsts: Optional[secure.StrictTransportSecurity] = None
-    if config.secure_headers_hsts:
-        hsts = secure.StrictTransportSecurity()
-        if isinstance(config.secure_headers_hsts, str):
-            hsts.set(config.secure_headers_hsts)
-
-    xfo: Optional[secure.XFrameOptions] = None
-    if config.secure_headers_xfo:
-        xfo = secure.XFrameOptions()
-        if isinstance(config.secure_headers_xfo, str):
-            xfo.set(config.secure_headers_xfo)
-
-    xxp: Optional[secure.XXSSProtection] = None
-    if config.secure_headers_xxp:
-        xxp = secure.XXSSProtection()
-        if isinstance(config.secure_headers_xxp, str):
-            xxp.set(config.secure_headers_xxp)
-
-    csp: Optional[secure.ContentSecurityPolicy] = None
-    if config.secure_headers_csp:
-        csp = secure.ContentSecurityPolicy()
-        if isinstance(config.secure_headers_csp, str):
-            csp.set(config.secure_headers_csp)
-
-    content: Optional[secure.XContentTypeOptions] = None
-    if config.secure_headers_content:
-        content = secure.XContentTypeOptions()
-        if isinstance(config.secure_headers_content, str):
-            content.set(config.secure_headers_content)
-
-    referrer: Optional[secure.ReferrerPolicy] = None
-    if config.secure_headers_referrer:
-        referrer = secure.ReferrerPolicy()
-        if isinstance(config.secure_headers_referrer, str):
-            referrer.set(config.secure_headers_referrer)
-
-    cache: Optional[secure.CacheControl] = None
-    if config.secure_headers_cache:
-        cache = secure.CacheControl()
-        if isinstance(config.secure_headers_cache, str):
-            cache.set(config.secure_headers_cache)
-
-    permissions: Optional[secure.PermissionsPolicy] = None
-    if config.secure_headers_permissions:
-        permissions = secure.PermissionsPolicy()
-        if isinstance(config.secure_headers_permissions, str):
-            permissions.value = config.secure_headers_permissions
-
-    _secure_headers = secure.Secure(
-        server=server,
-        hsts=hsts,
-        xfo=xfo,
-        xxp=xxp,
-        csp=csp,
-        content=content,
-        referrer=referrer,
-        cache=cache,
-        permissions=permissions,
-    )
+    if _memcache is None:
+        raise RuntimeError("Memory cache not initialized")
+    return _memcache
 
 
 _server_config: Optional[ServerConfiguration] = None
@@ -329,136 +316,115 @@ def server_config() -> ServerConfiguration:
     return _server_config
 
 
-def get_active_deployment(local: bool = False) -> Optional["ServerDeployment"]:
-    """Get the active local or remote server deployment.
-
-    Call this function to retrieve the local or remote server deployment that
-    was last provisioned on this machine.
-
-    Args:
-        local: Whether to return the local active deployment or the remote one.
+def request_manager() -> RequestManager:
+    """Return the request manager.
 
     Returns:
-        The local or remote active server deployment or None, if no deployment
-        was found.
-    """
-    from zenml.zen_server.deploy.deployer import ServerDeployer
-
-    deployer = ServerDeployer()
-    if local:
-        servers = deployer.list_servers(provider_type=ServerProviderType.LOCAL)
-        if not servers:
-            servers = deployer.list_servers(
-                provider_type=ServerProviderType.DOCKER
-            )
-    else:
-        servers = deployer.list_servers()
-
-    if not servers:
-        return None
-
-    for server in servers:
-        if server.config.provider in [
-            ServerProviderType.LOCAL,
-            ServerProviderType.DOCKER,
-        ]:
-            if local:
-                return server
-        elif not local:
-            return server
-
-    return None
-
-
-def get_active_server_details() -> Tuple[str, Optional[int]]:
-    """Get the URL of the current ZenML Server.
-
-    When multiple servers are present, the following precedence is used to
-    determine which server to use:
-    - If the client is connected to a server, that server has precedence.
-    - If no server is connected, a server that was deployed remotely has
-        precedence over a server that was deployed locally.
-
-    Returns:
-        The URL and port of the currently active server.
+        The request manager.
 
     Raises:
-        RuntimeError: If no server is active.
+        RuntimeError: If the request manager is not initialized.
     """
-    # Check for connected servers first
-    gc = GlobalConfiguration()
-    if not gc.uses_default_store():
-        logger.debug("Getting URL of connected server.")
-        parsed_url = urlparse(gc.store_configuration.url)
-        return f"{parsed_url.scheme}://{parsed_url.hostname}", parsed_url.port
-    # Else, check for deployed servers
-    server = get_active_deployment(local=False)
-    if server:
-        logger.debug("Getting URL of remote server.")
-    else:
-        server = get_active_deployment(local=True)
-        logger.debug("Getting URL of local server.")
+    global _request_manager
+    if _request_manager is None:
+        raise RuntimeError("Request manager not initialized")
+    return _request_manager
 
-    if server and server.status and server.status.url:
-        if isinstance(server.config, LocalServerDeploymentConfig):
-            return server.status.url, server.config.port
-        return server.status.url, None
 
-    raise RuntimeError(
-        "ZenML is not connected to any server right now. Please use "
-        "`zenml connect` to connect to a server or spin up a new local server "
-        "via `zenml up`."
+async def initialize_request_manager() -> None:
+    """Initialize the request manager."""
+    global _request_manager
+    _request_manager = RequestManager(
+        deduplicate=server_config().request_deduplication,
+        transaction_ttl=server_config().request_cache_timeout,
+        request_timeout=server_config().request_timeout,
     )
+    await _request_manager.startup()
 
 
-F = TypeVar("F", bound=Callable[..., Any])
+async def cleanup_request_manager() -> None:
+    """Cleanup the request manager."""
+    global _request_manager
+    if _request_manager is not None:
+        await _request_manager.shutdown()
+        _request_manager = None
 
 
-def handle_exceptions(func: F) -> F:
-    """Decorator to handle exceptions in the API.
+@overload
+def async_fastapi_endpoint_wrapper(
+    func: Callable[P, R],
+) -> Callable[P, Awaitable[Any]]: ...
+
+
+@overload
+def async_fastapi_endpoint_wrapper(
+    *, deduplicate: Optional[bool] = None
+) -> Callable[[Callable[P, R]], Callable[P, Awaitable[Any]]]: ...
+
+
+def async_fastapi_endpoint_wrapper(
+    func: Optional[Callable[P, R]] = None,
+    *,
+    deduplicate: Optional[bool] = None,
+) -> Union[
+    Callable[P, Awaitable[Any]],
+    Callable[[Callable[P, R]], Callable[P, Awaitable[Any]]],
+]:
+    """Decorator for FastAPI endpoints.
+
+    This decorator for FastAPI endpoints does the following:
+    - Converts exceptions to HTTPExceptions with the correct status code.
+    - Uses the request manager to deduplicate requests and to convert the sync
+    endpoint function to a coroutine.
+    - Optionally enables idempotency for the endpoint.
 
     Args:
         func: Function to decorate.
+        deduplicate: Whether to enable or disable request deduplication for
+            this endpoint. If not specified, by default, the deduplication is
+            enabled for POST requests and disabled for other requests.
 
     Returns:
         Decorated function.
     """
 
-    @wraps(func)
-    def decorated(*args: Any, **kwargs: Any) -> Any:
-        # These imports can't happen at module level as this module is also
-        # used by the CLI when installed without the `server` extra
-        from fastapi import HTTPException
-        from fastapi.responses import JSONResponse
+    def decorator(func: Callable[P, R]) -> Callable[P, Awaitable[Any]]:
+        @wraps(func)
+        async def async_decorated(*args: P.args, **kwargs: P.kwargs) -> Any:
+            @wraps(func)
+            def decorated(*args: P.args, **kwargs: P.kwargs) -> Any:
+                # These imports can't happen at module level as this module is also
+                # used by the CLI when installed without the `server` extra
+                from fastapi import HTTPException
+                from fastapi.responses import JSONResponse
 
-        from zenml.zen_server.auth import AuthContext, set_auth_context
+                try:
+                    return func(*args, **kwargs)
+                except OAuthError as error:
+                    # The OAuthError is special because it needs to have a JSON response
+                    return JSONResponse(
+                        status_code=error.status_code,
+                        content=error.to_dict(),
+                    )
+                except HTTPException:
+                    raise
+                except Exception as error:
+                    logger.exception("API error")
+                    http_exception = http_exception_from_error(error)
+                    raise http_exception
 
-        for arg in args:
-            if isinstance(arg, AuthContext):
-                set_auth_context(arg)
-                break
-        else:
-            for _, arg in kwargs.items():
-                if isinstance(arg, AuthContext):
-                    set_auth_context(arg)
-                    break
-
-        try:
-            return func(*args, **kwargs)
-        except OAuthError as error:
-            # The OAuthError is special because it needs to have a JSON response
-            return JSONResponse(
-                status_code=error.status_code,
-                content=error.to_dict(),
+            return await request_manager().execute(
+                decorated,
+                deduplicate,
+                *args,
+                **kwargs,
             )
-        except HTTPException:
-            raise
-        except Exception as error:
-            logger.exception("API error")
-            http_exception = http_exception_from_error(error)
-            raise http_exception
 
-    return cast(F, decorated)
+        return async_decorated
+
+    if func is None:
+        return decorator
+    return decorator(func)
 
 
 # Code from https://github.com/tiangolo/fastapi/issues/1474#issuecomment-1160633178
@@ -488,6 +454,8 @@ def make_dependable(cls: Type[BaseModel]) -> Callable[..., Any]:
     """
     from fastapi import Query
 
+    from zenml.zen_server.exceptions import error_detail
+
     def init_cls_and_handle_errors(*args: Any, **kwargs: Any) -> BaseModel:
         from fastapi import HTTPException
 
@@ -495,9 +463,8 @@ def make_dependable(cls: Type[BaseModel]) -> Callable[..., Any]:
             inspect.signature(init_cls_and_handle_errors).bind(*args, **kwargs)
             return cls(*args, **kwargs)
         except ValidationError as e:
-            for error in e.errors():
-                error["loc"] = tuple(["query"] + list(error["loc"]))
-            raise HTTPException(422, detail=e.errors())
+            detail = error_detail(e, exception_type=ValueError)
+            raise HTTPException(422, detail=detail)
 
     params = {v.name: v for v in inspect.signature(cls).parameters.values()}
     query_params = getattr(cls, "API_MULTI_INPUT_PARAMS", [])
@@ -570,3 +537,277 @@ def verify_admin_status_if_no_rbac(
                 "without RBAC enabled.",
             )
     return
+
+
+def is_user_request(request: "Request") -> bool:
+    """Determine if the incoming request is a user request.
+
+    This function checks various aspects of the request to determine
+    if it's a user-initiated request or a system request.
+
+    Args:
+        request: The incoming FastAPI request object.
+
+    Returns:
+        True if it's a user request, False otherwise.
+    """
+    # Define system paths that should be excluded
+    system_paths: List[str] = [
+        "/health",
+        "/ready",
+        "/metrics",
+        "/system",
+        "/docs",
+        "/redoc",
+        "/openapi.json",
+    ]
+
+    user_prefix = f"{API}{VERSION_1}"
+    excluded_user_apis = [INFO]
+    # Check if this is not an excluded endpoint
+    if request.url.path in [
+        user_prefix + suffix for suffix in excluded_user_apis
+    ]:
+        return False
+
+    # Check if this is other user request
+    if request.url.path.startswith(user_prefix):
+        return True
+
+    # Exclude system paths
+    if any(request.url.path.startswith(path) for path in system_paths):
+        return False
+
+    # Exclude requests with specific headers
+    if request.headers.get("X-System-Request") == "true":
+        return False
+
+    # Exclude requests from certain user agents (e.g., monitoring tools)
+    user_agent = request.headers.get("User-Agent", "").lower()
+    system_agents = ["prometheus", "datadog", "newrelic", "pingdom"]
+    if any(agent in user_agent for agent in system_agents):
+        return False
+
+    # Check for internal IP addresses
+    client_host = request.client.host if request.client else None
+    if client_host and (
+        client_host.startswith("10.") or client_host.startswith("192.168.")
+    ):
+        return False
+
+    # Exclude OPTIONS requests (often used for CORS preflight)
+    if request.method == "OPTIONS":
+        return False
+
+    # Exclude specific query parameters that might indicate system requests
+    if request.query_params.get("system_check"):
+        return False
+
+    # If none of the above conditions are met, consider it a user request
+    return True
+
+
+def is_same_or_subdomain(source_domain: str, target_domain: str) -> bool:
+    """Check if the source domain is the same or a subdomain of the target domain.
+
+    Examples:
+        is_same_or_subdomain("example.com", "example.com") -> True
+        is_same_or_subdomain("alpha.example.com", "example.com") -> True
+        is_same_or_subdomain("alpha.example.com", ".example.com") -> True
+        is_same_or_subdomain("example.com", "alpha.example.com") -> False
+        is_same_or_subdomain("alpha.beta.example.com", "beta.example.com") -> True
+        is_same_or_subdomain("alpha.beta.example.com", "alpha.example.com") -> False
+        is_same_or_subdomain("alphabeta.gamma.example", "beta.gamma.example") -> False
+
+    Args:
+        source_domain: The source domain to check.
+        target_domain: The target domain to compare against.
+
+    Returns:
+        True if the source domain is the same or a subdomain of the target
+        domain, False otherwise.
+    """
+    import tldextract
+
+    # Extract the registered domain and suffix for both
+    src_parts = tldextract.extract(source_domain)
+    tgt_parts = tldextract.extract(target_domain)
+
+    if src_parts == tgt_parts:
+        return True  # Same domain
+
+    # Reconstruct the base domains (e.g., example.com)
+    src_base_domain = f"{src_parts.domain}.{src_parts.suffix}"
+    tgt_base_domain = f"{tgt_parts.domain}.{tgt_parts.suffix}"
+
+    if src_base_domain != tgt_base_domain:
+        return False  # Different base domains
+
+    if tgt_parts.subdomain == "":
+        return True  # Subdomain
+
+    if src_parts.subdomain.endswith(f".{tgt_parts.subdomain.lstrip('.')}"):
+        return True  # Subdomain of subdomain
+
+    return False
+
+
+def get_zenml_headers() -> Dict[str, str]:
+    """Get the ZenML specific headers to be included in requests made by the server.
+
+    Returns:
+        The ZenML specific headers.
+    """
+    config = server_config()
+    headers = {
+        "zenml-server-id": str(config.get_external_server_id()),
+        "zenml-server-version": zenml_version,
+    }
+    if config.server_url:
+        headers["zenml-server-url"] = config.server_url
+
+    return headers
+
+
+def set_filter_project_scope(
+    filter_model: ProjectScopedFilter,
+    project_name_or_id: Optional[Union[UUID, str]] = None,
+) -> None:
+    """Set the project scope of the filter model.
+
+    Args:
+        filter_model: The filter model to set the scope for.
+        project_name_or_id: The project to set the scope for. If not
+            provided, the project scope is determined from the request
+            project filter or the default project, in that order.
+    """
+    zen_store().set_filter_project_id(
+        filter_model=filter_model,
+        project_name_or_id=project_name_or_id,
+    )
+
+
+process = psutil.Process()
+fd_limit: Union[int, str] = "N/A"
+if sys.platform != "win32":
+    import resource
+
+    try:
+        fd_limit, _ = resource.getrlimit(resource.RLIMIT_NOFILE)
+    except Exception:
+        pass
+
+
+def get_system_metrics() -> Dict[str, Any]:
+    """Get comprehensive system metrics.
+
+    Returns:
+        Dict containing system metrics
+    """
+    # Get active requests count
+    from zenml.zen_server.middleware import active_requests_count
+
+    # Memory limits
+    memory = process.memory_info()
+
+    # File descriptors
+    open_fds: Union[int, str] = "N/A"
+    try:
+        open_fds = process.num_fds() if hasattr(process, "num_fds") else "N/A"
+    except Exception:
+        pass
+
+    # Current thread name/ID
+    current_thread = threading.current_thread()
+    current_thread_name = current_thread.name
+    current_thread_id = current_thread.ident
+
+    return {
+        "memory_used_mb": memory.rss / (1024 * 1024),
+        "open_fds": open_fds,
+        "fd_limit": fd_limit,
+        "active_requests": active_requests_count,
+        "thread_count": threading.active_count(),
+        "max_worker_threads": server_config().thread_pool_size,
+        "current_thread_name": current_thread_name,
+        "current_thread_id": current_thread_id,
+    }
+
+
+def get_system_metrics_log_str(request: Optional["Request"] = None) -> str:
+    """Get the system metrics as a string for logging.
+
+    Args:
+        request: The request object.
+
+    Returns:
+        The system metrics as a string for debugging logging.
+    """
+    if not logger.isEnabledFor(logging.DEBUG):
+        return ""
+    if request and request.url.path in [HEALTH, READY]:
+        # Don't log system metrics for health and ready endpoints to keep them
+        # fast
+        return ""
+    metrics = get_system_metrics()
+    return (
+        " [ "
+        + " ".join([f"{key}: {value}" for key, value in metrics.items()])
+        + " ]"
+    )
+
+
+event_loop_lag_monitor_task: Optional[asyncio.Task[None]] = None
+
+
+def start_event_loop_lag_monitor(threshold_ms: int = 50) -> None:
+    """Start the event loop lag monitor.
+
+    Args:
+        threshold_ms: The threshold in milliseconds for the event loop lag.
+    """
+    global event_loop_lag_monitor_task
+
+    async def monitor() -> None:
+        while True:
+            start = time.perf_counter()
+            await asyncio.sleep(0)
+            delay = (time.perf_counter() - start) * 1000
+            if delay > threshold_ms:
+                logger.warning(
+                    f"⚠️  Event loop lag detected: {delay:.2f}ms"
+                    "If you see this message, it means that the ZenML server is "
+                    "under heavy load and the clients might start experiencing "
+                    "connection reset errors. Please consider scaling up the "
+                    "server."
+                )
+            await asyncio.sleep(0.5)
+
+    event_loop_lag_monitor_task = asyncio.create_task(monitor())
+
+
+def stop_event_loop_lag_monitor() -> None:
+    """Stop the event loop lag monitor."""
+    global event_loop_lag_monitor_task
+    if event_loop_lag_monitor_task:
+        event_loop_lag_monitor_task.cancel()
+        event_loop_lag_monitor_task = None
+
+
+def get_auth_context() -> Optional["AuthContext"]:
+    """Get the authentication context for the current request.
+
+    Returns:
+        The authentication context.
+    """
+    request_context = request_manager().current_request
+    return request_context.auth_context
+
+
+def get_current_request_context() -> RequestContext:
+    """Get the current request context.
+
+    Returns:
+        The current request context.
+    """
+    return request_manager().current_request

@@ -13,7 +13,6 @@
 #  permissions and limitations under the License.
 """Endpoint definitions for tags."""
 
-from typing import Union
 from uuid import UUID
 
 from fastapi import APIRouter, Depends, Security
@@ -33,15 +32,12 @@ from zenml.models import (
 from zenml.zen_server.auth import AuthContext, authorize
 from zenml.zen_server.exceptions import error_response
 from zenml.zen_server.rbac.endpoint_utils import (
-    verify_permissions_and_create_entity,
     verify_permissions_and_delete_entity,
     verify_permissions_and_get_entity,
-    verify_permissions_and_list_entities,
     verify_permissions_and_update_entity,
 )
-from zenml.zen_server.rbac.models import ResourceType
 from zenml.zen_server.utils import (
-    handle_exceptions,
+    async_fastapi_endpoint_wrapper,
     make_dependable,
     zen_store,
 )
@@ -59,10 +55,9 @@ router = APIRouter(
 
 @router.post(
     "",
-    response_model=TagResponse,
     responses={401: error_response, 409: error_response, 422: error_response},
 )
-@handle_exceptions
+@async_fastapi_endpoint_wrapper
 def create_tag(
     tag: TagRequest,
     _: AuthContext = Security(authorize),
@@ -75,19 +70,14 @@ def create_tag(
     Returns:
         The created tag.
     """
-    return verify_permissions_and_create_entity(
-        request_model=tag,
-        resource_type=ResourceType.TAG,
-        create_method=zen_store().create_tag,
-    )
+    return zen_store().create_tag(tag=tag)
 
 
 @router.get(
     "",
-    response_model=Page[TagResponse],
     responses={401: error_response, 404: error_response, 422: error_response},
 )
-@handle_exceptions
+@async_fastapi_endpoint_wrapper
 def list_tags(
     tag_filter_model: TagFilter = Depends(make_dependable(TagFilter)),
     hydrate: bool = False,
@@ -104,46 +94,44 @@ def list_tags(
     Returns:
         The tags according to query filters.
     """
-    return verify_permissions_and_list_entities(
-        filter_model=tag_filter_model,
-        resource_type=ResourceType.TAG,
-        list_method=zen_store().list_tags,
+    return zen_store().list_tags(
+        tag_filter_model=tag_filter_model,
         hydrate=hydrate,
     )
 
 
 @router.get(
-    "/{tag_name_or_id}",
-    response_model=TagResponse,
+    "/{tag_id}",
     responses={401: error_response, 404: error_response, 422: error_response},
 )
-@handle_exceptions
+@async_fastapi_endpoint_wrapper
 def get_tag(
-    tag_name_or_id: Union[str, UUID],
+    tag_id: UUID,
     hydrate: bool = True,
     _: AuthContext = Security(authorize),
 ) -> TagResponse:
-    """Get a tag by name or ID.
+    """Get a tag by ID.
 
     Args:
-        tag_name_or_id: The name or ID of the tag to get.
+        tag_id: The ID of the tag to get.
         hydrate: Flag deciding whether to hydrate the output model(s)
             by including metadata fields in the response.
 
     Returns:
-        The tag with the given name or ID.
+        The tag with the given ID.
     """
     return verify_permissions_and_get_entity(
-        id=tag_name_or_id, get_method=zen_store().get_tag, hydrate=hydrate
+        id=tag_id,
+        get_method=zen_store().get_tag,
+        hydrate=hydrate,
     )
 
 
 @router.put(
     "/{tag_id}",
-    response_model=TagResponse,
     responses={401: error_response, 404: error_response, 422: error_response},
 )
-@handle_exceptions
+@async_fastapi_endpoint_wrapper
 def update_tag(
     tag_id: UUID,
     tag_update_model: TagUpdate,
@@ -152,7 +140,7 @@ def update_tag(
     """Updates a tag.
 
     Args:
-        tag_id: Id or name of the tag.
+        tag_id: ID of the tag to update.
         tag_update_model: Tag to use for the update.
 
     Returns:
@@ -167,21 +155,21 @@ def update_tag(
 
 
 @router.delete(
-    "/{tag_name_or_id}",
+    "/{tag_id}",
     responses={401: error_response, 404: error_response, 422: error_response},
 )
-@handle_exceptions
+@async_fastapi_endpoint_wrapper
 def delete_tag(
-    tag_name_or_id: Union[str, UUID],
+    tag_id: UUID,
     _: AuthContext = Security(authorize),
 ) -> None:
-    """Delete a tag by name or ID.
+    """Delete a tag by ID.
 
     Args:
-        tag_name_or_id: The name or ID of the tag to delete.
+        tag_id: The ID of the tag to delete.
     """
     verify_permissions_and_delete_entity(
-        id=tag_name_or_id,
+        id=tag_id,
         get_method=zen_store().get_tag,
         delete_method=zen_store().delete_tag,
     )

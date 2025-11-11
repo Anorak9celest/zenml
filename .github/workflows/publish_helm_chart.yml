@@ -17,13 +17,13 @@ jobs:
       PYTHONIOENCODING: utf-8
     steps:
       - name: Checkout repo
-        uses: actions/checkout@v4.1.1
+        uses: actions/checkout@v4.2.2
 
       # The following sed command replaces the version number in Chart.yaml with the tag version.
       # It replaces the line that starts with "version: " with "version: <tag version>"
       - name: Add tag version to Chart.yaml
         run: |
-          sed -i "s/version: .*/version: \"${{ github.ref_name }}\"/" src/zenml/zen_server/deploy/helm/Chart.yaml
+          sed -i "s/version: .*/version: \"${{ github.ref_name }}\"/" helm/Chart.yaml
       - name: Configure AWS credentials
         uses: aws-actions/configure-aws-credentials@v2
         with:
@@ -48,5 +48,5 @@ jobs:
           REGISTRY_ALIAS: zenml
           REPOSITORY: zenml
         run: |-
-          helm package src/zenml/zen_server/deploy/helm
+          helm package ./helm
           helm push $REPOSITORY-${{ github.ref_name }}.tgz oci://$REGISTRY/$REGISTRY_ALIAS

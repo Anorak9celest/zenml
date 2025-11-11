@@ -13,52 +13,69 @@
 #  permissions and limitations under the License.
 """Models representing pipelines."""
 
-from typing import TYPE_CHECKING, Any, List, Optional, Union
+from typing import (
+    TYPE_CHECKING,
+    Any,
+    ClassVar,
+    List,
+    Optional,
+    Type,
+    TypeVar,
+    Union,
+)
 from uuid import UUID
 
 from pydantic import Field
 
-from zenml.config.pipeline_spec import PipelineSpec
-from zenml.constants import STR_FIELD_MAX_LENGTH, TEXT_FIELD_MAX_LENGTH
+from zenml.constants import (
+    SORT_PIPELINES_BY_LATEST_RUN_KEY,
+    STR_FIELD_MAX_LENGTH,
+    TEXT_FIELD_MAX_LENGTH,
+)
 from zenml.enums import ExecutionStatus
 from zenml.models.v2.base.base import BaseUpdate
 from zenml.models.v2.base.scoped import (
-    WorkspaceScopedFilter,
-    WorkspaceScopedRequest,
-    WorkspaceScopedResponse,
-    WorkspaceScopedResponseBody,
-    WorkspaceScopedResponseMetadata,
-    WorkspaceScopedResponseResources,
+    ProjectScopedFilter,
+    ProjectScopedRequest,
+    ProjectScopedResponse,
+    ProjectScopedResponseBody,
+    ProjectScopedResponseMetadata,
+    ProjectScopedResponseResources,
+    TaggableFilter,
 )
+from zenml.models.v2.core.tag import TagResponse
 
 if TYPE_CHECKING:
-    from zenml.models.v2.core.pipeline_run import PipelineRunResponse
+    from zenml.models import (
+        CuratedVisualizationResponse,
+        PipelineRunResponse,
+        UserResponse,
+    )
+    from zenml.zen_stores.schemas import BaseSchema
 
+    AnySchema = TypeVar("AnySchema", bound=BaseSchema)
+
+AnyQuery = TypeVar("AnyQuery", bound=Any)
 
 # ------------------ Request Model ------------------
 
 
-class PipelineRequest(WorkspaceScopedRequest):
+class PipelineRequest(ProjectScopedRequest):
     """Request model for pipelines."""
 
     name: str = Field(
         title="The name of the pipeline.",
         max_length=STR_FIELD_MAX_LENGTH,
     )
-    version: str = Field(
-        title="The version of the pipeline.",
-        max_length=STR_FIELD_MAX_LENGTH,
-    )
-    version_hash: str = Field(
-        title="The version hash of the pipeline.",
-        max_length=STR_FIELD_MAX_LENGTH,
-    )
-    docstring: Optional[str] = Field(
-        title="The docstring of the pipeline.",
-        max_length=TEXT_FIELD_MAX_LENGTH,
+    description: Optional[str] = Field(
         default=None,
+        title="The description of the pipeline.",
+        max_length=TEXT_FIELD_MAX_LENGTH,
     )
-    spec: PipelineSpec = Field(title="The spec of the pipeline.")
+    tags: Optional[List[str]] = Field(
+        default=None,
+        title="Tags of the pipeline.",
+    )
 
 
 # ------------------ Update Model ------------------
@@ -67,68 +84,61 @@ class PipelineRequest(WorkspaceScopedRequest):
 class PipelineUpdate(BaseUpdate):
     """Update model for pipelines."""
 
-    name: Optional[str] = Field(
-        title="The name of the pipeline.",
-        max_length=STR_FIELD_MAX_LENGTH,
+    description: Optional[str] = Field(
         default=None,
-    )
-    version: Optional[str] = Field(
-        title="The version of the pipeline.",
-        max_length=STR_FIELD_MAX_LENGTH,
-        default=None,
-    )
-    version_hash: Optional[str] = Field(
-        title="The version hash of the pipeline.",
-        max_length=STR_FIELD_MAX_LENGTH,
-        default=None,
-    )
-    docstring: Optional[str] = Field(
-        title="The docstring of the pipeline.",
+        title="The description of the pipeline.",
         max_length=TEXT_FIELD_MAX_LENGTH,
-        default=None,
     )
-    spec: Optional[PipelineSpec] = Field(
-        title="The spec of the pipeline.",
-        default=None,
+    add_tags: Optional[List[str]] = Field(
+        default=None, title="New tags to add to the pipeline."
+    )
+    remove_tags: Optional[List[str]] = Field(
+        default=None, title="Tags to remove from the pipeline."
     )
 
 
 # ------------------ Response Model ------------------
 
 
-class PipelineResponseBody(WorkspaceScopedResponseBody):
+class PipelineResponseBody(ProjectScopedResponseBody):
     """Response body for pipelines."""
 
-    status: Optional[List[ExecutionStatus]] = Field(
-        default=None, title="The status of the last 3 Pipeline Runs."
-    )
-    version: str = Field(
-        title="The version of the pipeline.",
-        max_length=STR_FIELD_MAX_LENGTH,
-    )
 
-
-class PipelineResponseMetadata(WorkspaceScopedResponseMetadata):
+class PipelineResponseMetadata(ProjectScopedResponseMetadata):
     """Response metadata for pipelines."""
 
-    version_hash: str = Field(
-        title="The version hash of the pipeline.",
-        max_length=STR_FIELD_MAX_LENGTH,
-    )
-    spec: PipelineSpec = Field(title="The spec of the pipeline.")
-    docstring: Optional[str] = Field(
-        title="The docstring of the pipeline.",
-        max_length=TEXT_FIELD_MAX_LENGTH,
+    description: Optional[str] = Field(
         default=None,
+        title="The description of the pipeline.",
     )
 
 
-class PipelineResponseResources(WorkspaceScopedResponseResources):
+class PipelineResponseResources(ProjectScopedResponseResources):
     """Class for all resource models associated with the pipeline entity."""
+
+    latest_run_user: Optional["UserResponse"] = Field(
+        default=None,
+        title="The user that created the latest run of this pipeline.",
+    )
+    latest_run_id: Optional[UUID] = Field(
+        default=None,
+        title="The ID of the latest run of the pipeline.",
+    )
+    latest_run_status: Optional[ExecutionStatus] = Field(
+        default=None,
+        title="The status of the latest run of the pipeline.",
+    )
+    tags: List[TagResponse] = Field(
+        title="Tags associated with the pipeline.",
+    )
+    visualizations: List["CuratedVisualizationResponse"] = Field(
+        default=[],
+        title="Curated visualizations associated with the pipeline.",
+    )
 
 
 class PipelineResponse(
-    WorkspaceScopedResponse[
+    ProjectScopedResponse[
         PipelineResponseBody,
         PipelineResponseMetadata,
         PipelineResponseResources,
@@ -224,82 +234,205 @@ class PipelineResponse(
             )
         return runs[0]
 
-    # Body and metadata properties
     @property
-    def status(self) -> Optional[List[ExecutionStatus]]:
-        """The `status` property.
+    def latest_run_id(self) -> Optional[UUID]:
+        """The `latest_run_id` property.
 
         Returns:
             the value of the property.
         """
-        return self.get_body().status
+        return self.get_resources().latest_run_id
 
     @property
-    def version(self) -> str:
-        """The `version` property.
+    def latest_run_status(self) -> Optional[ExecutionStatus]:
+        """The `latest_run_status` property.
 
         Returns:
             the value of the property.
         """
-        return self.get_body().version
+        return self.get_resources().latest_run_status
 
     @property
-    def spec(self) -> PipelineSpec:
-        """The `spec` property.
+    def tags(self) -> List[TagResponse]:
+        """The `tags` property.
 
         Returns:
             the value of the property.
         """
-        return self.get_metadata().spec
-
-    @property
-    def version_hash(self) -> str:
-        """The `version_hash` property.
-
-        Returns:
-            the value of the property.
-        """
-        return self.get_metadata().version_hash
-
-    @property
-    def docstring(self) -> Optional[str]:
-        """The `docstring` property.
-
-        Returns:
-            the value of the property.
-        """
-        return self.get_metadata().docstring
+        return self.get_resources().tags
 
 
 # ------------------ Filter Model ------------------
 
 
-class PipelineFilter(WorkspaceScopedFilter):
+class PipelineFilter(ProjectScopedFilter, TaggableFilter):
     """Pipeline filter model."""
+
+    CUSTOM_SORTING_OPTIONS: ClassVar[List[str]] = [
+        *ProjectScopedFilter.CUSTOM_SORTING_OPTIONS,
+        *TaggableFilter.CUSTOM_SORTING_OPTIONS,
+        SORT_PIPELINES_BY_LATEST_RUN_KEY,
+    ]
+    FILTER_EXCLUDE_FIELDS: ClassVar[List[str]] = [
+        *ProjectScopedFilter.FILTER_EXCLUDE_FIELDS,
+        *TaggableFilter.FILTER_EXCLUDE_FIELDS,
+        "latest_run_status",
+        "latest_run_user",
+    ]
+    CLI_EXCLUDE_FIELDS: ClassVar[List[str]] = [
+        *ProjectScopedFilter.CLI_EXCLUDE_FIELDS,
+        *TaggableFilter.CLI_EXCLUDE_FIELDS,
+    ]
 
     name: Optional[str] = Field(
         default=None,
         description="Name of the Pipeline",
     )
-    version: Optional[str] = Field(
+    latest_run_status: Optional[str] = Field(
         default=None,
-        description="Version of the Pipeline",
+        description="Filter by the status of the latest run of a pipeline. "
+        "This will always be applied as an `AND` filter for now.",
     )
-    version_hash: Optional[str] = Field(
+
+    latest_run_user: Optional[Union[UUID, str]] = Field(
         default=None,
-        description="Version hash of the Pipeline",
+        description="Filter by the name or id of the last user that executed the pipeline. ",
     )
-    docstring: Optional[str] = Field(
-        default=None,
-        description="Docstring of the Pipeline",
-    )
-    workspace_id: Optional[Union[UUID, str]] = Field(
-        default=None,
-        description="Workspace of the Pipeline",
-        union_mode="left_to_right",
-    )
-    user_id: Optional[Union[UUID, str]] = Field(
-        default=None,
-        description="User of the Pipeline",
-        union_mode="left_to_right",
-    )
+
+    @property
+    def filter_by_latest_execution(self) -> bool:
+        """Property returning whether filtering considers latest pipeline execution.
+
+        Returns:
+            True if latest pipeline execution filters are used (e.g. latest_run_status).
+        """
+        return bool(self.latest_run_user) or bool(self.latest_run_status)
+
+    def apply_filter(
+        self, query: AnyQuery, table: Type["AnySchema"]
+    ) -> AnyQuery:
+        """Applies the filter to a query.
+
+        Args:
+            query: The query to which to apply the filter.
+            table: The query table.
+
+        Returns:
+            The query with filter applied.
+        """
+        query = super().apply_filter(query, table)
+
+        from sqlmodel import and_, col, func, select
+
+        from zenml.zen_stores.schemas import (
+            PipelineRunSchema,
+            PipelineSchema,
+            UserSchema,
+        )
+
+        if self.filter_by_latest_execution:
+            latest_pipeline_run_subquery = (
+                select(
+                    PipelineRunSchema.pipeline_id,
+                    func.max(PipelineRunSchema.created).label("created"),
+                )
+                .where(col(PipelineRunSchema.pipeline_id).is_not(None))
+                .group_by(col(PipelineRunSchema.pipeline_id))
+                .subquery()
+            )
+
+            query = query.join(
+                PipelineRunSchema,
+                PipelineSchema.id == PipelineRunSchema.pipeline_id,
+            ).join(
+                latest_pipeline_run_subquery,
+                and_(
+                    PipelineRunSchema.pipeline_id
+                    == latest_pipeline_run_subquery.c.pipeline_id,
+                    PipelineRunSchema.created
+                    == latest_pipeline_run_subquery.c.created,
+                ),
+            )
+
+            if self.latest_run_user:
+                query = query.join(
+                    UserSchema, UserSchema.id == PipelineRunSchema.user_id
+                )
+
+                query = query.where(
+                    self.generate_name_or_id_query_conditions(
+                        value=self.latest_run_user,
+                        table=UserSchema,
+                    )
+                )
+
+            if self.latest_run_status:
+                query = query.where(
+                    self.generate_custom_query_conditions_for_column(
+                        value=self.latest_run_status,
+                        table=PipelineRunSchema,
+                        column="status",
+                    )
+                )
+
+        return query
+
+    def apply_sorting(
+        self,
+        query: AnyQuery,
+        table: Type["AnySchema"],
+    ) -> AnyQuery:
+        """Apply sorting to the query.
+
+        Args:
+            query: The query to which to apply the sorting.
+            table: The query table.
+
+        Returns:
+            The query with sorting applied.
+        """
+        from sqlmodel import asc, case, col, desc, func, select
+
+        from zenml.enums import SorterOps
+        from zenml.zen_stores.schemas import PipelineRunSchema, PipelineSchema
+
+        sort_by, operand = self.sorting_params
+
+        if sort_by == SORT_PIPELINES_BY_LATEST_RUN_KEY:
+            # Subquery to find the latest run per pipeline
+            latest_run_subquery = (
+                select(
+                    PipelineSchema.id,
+                    case(
+                        (
+                            func.max(PipelineRunSchema.created).is_(None),
+                            PipelineSchema.created,
+                        ),
+                        else_=func.max(PipelineRunSchema.created),
+                    ).label("latest_run"),
+                )
+                .outerjoin(
+                    PipelineRunSchema,
+                    PipelineSchema.id == PipelineRunSchema.pipeline_id,  # type: ignore[arg-type]
+                )
+                .group_by(col(PipelineSchema.id))
+                .subquery()
+            )
+
+            query = query.add_columns(
+                latest_run_subquery.c.latest_run,
+            ).where(PipelineSchema.id == latest_run_subquery.c.id)
+
+            if operand == SorterOps.ASCENDING:
+                query = query.order_by(
+                    asc(latest_run_subquery.c.latest_run),
+                    asc(PipelineSchema.id),
+                )
+            else:
+                query = query.order_by(
+                    desc(latest_run_subquery.c.latest_run),
+                    desc(PipelineSchema.id),
+                )
+            return query
+        else:
+            return super().apply_sorting(query=query, table=table)

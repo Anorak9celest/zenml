@@ -25,7 +25,7 @@ file.
 import logging
 import os
 import warnings
-from typing import List, Type
+from typing import List, Type, Optional
 
 from zenml.integrations.constants import EVIDENTLY
 from zenml.integrations.integration import Integration
@@ -33,7 +33,7 @@ from zenml.stack import Flavor
 
 # Fix numba errors in Docker and suppress logs and deprecation warning spam
 try:
-    from numba.core.errors import (  # type: ignore[import-not-found]
+    from numba.core.errors import (
         NumbaDeprecationWarning,
         NumbaPendingDeprecationWarning,
     )
@@ -56,8 +56,27 @@ class EvidentlyIntegration(Integration):
     REQUIREMENTS = [
         "evidently>=0.4.16,<=0.4.22",
         "tenacity!=8.4.0",  # https://github.com/jd/tenacity/issues/471
+        "numpy<2.0.0",  # evidently is not compatible with NumPy 2.0
     ]
-    REQUIREMENTS_IGNORED_ON_UNINSTALL = ["tenacity"]
+    REQUIREMENTS_IGNORED_ON_UNINSTALL = ["tenacity", "pandas"]
+
+    @classmethod
+    def get_requirements(
+        cls, target_os: Optional[str] = None, python_version: Optional[str] = None
+    ) -> List[str]:
+        """Method to get the requirements for the integration.
+
+        Args:
+            target_os: The target operating system to get the requirements for.
+            python_version: The Python version to use for the requirements.
+
+        Returns:
+            A list of requirements.
+        """
+        from zenml.integrations.pandas import PandasIntegration
+
+        return cls.REQUIREMENTS + \
+            PandasIntegration.get_requirements(target_os=target_os, python_version=python_version)
 
     @classmethod
     def flavors(cls) -> List[Type[Flavor]]:
@@ -72,5 +91,3 @@ class EvidentlyIntegration(Integration):
 
         return [EvidentlyDataValidatorFlavor]
 
-
-EvidentlyIntegration.check_installation()

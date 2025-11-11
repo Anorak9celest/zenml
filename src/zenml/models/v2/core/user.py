@@ -36,7 +36,7 @@ from zenml.models.v2.base.base import (
     BaseRequest,
     BaseResponseMetadata,
     BaseResponseResources,
-    BaseZenModel,
+    BaseUpdate,
 )
 from zenml.models.v2.base.filter import AnyQuery, BaseFilter
 
@@ -65,12 +65,6 @@ class UserBase(BaseModel):
         description="`null` if not answered, `true` if agreed, "
         "`false` if skipped.",
     )
-    hub_token: Optional[str] = Field(
-        default=None,
-        title="JWT Token for the connected Hub account. Only relevant for user "
-        "accounts.",
-        max_length=STR_FIELD_MAX_LENGTH,
-    )
     password: Optional[str] = Field(
         default=None,
         title="A password for the user.",
@@ -86,6 +80,10 @@ class UserBase(BaseModel):
     user_metadata: Optional[Dict[str, Any]] = Field(
         default=None,
         title="The metadata associated with the user.",
+    )
+    avatar_url: Optional[str] = Field(
+        default=None,
+        title="The avatar URL for the account.",
     )
 
     @classmethod
@@ -162,8 +160,7 @@ class UserRequest(UserBase, BaseRequest):
     )
     full_name: str = Field(
         default="",
-        title="The full name for the account owner. Only relevant for user "
-        "accounts.",
+        title="The display name for the account.",
         max_length=STR_FIELD_MAX_LENGTH,
     )
     is_admin: bool = Field(
@@ -175,14 +172,14 @@ class UserRequest(UserBase, BaseRequest):
         # Validate attributes when assigning them
         validate_assignment=True,
         # Forbid extra attributes to prevent unexpected behavior
-        extra="forbid",
+        extra="ignore",
     )
 
 
 # ------------------ Update Model ------------------
 
 
-class UserUpdate(UserBase, BaseZenModel):
+class UserUpdate(UserBase, BaseUpdate):
     """Update model for users."""
 
     name: Optional[str] = Field(
@@ -192,8 +189,7 @@ class UserUpdate(UserBase, BaseZenModel):
     )
     full_name: Optional[str] = Field(
         default=None,
-        title="The full name for the account owner. Only relevant for user "
-        "accounts.",
+        title="The display name for the account.",
         max_length=STR_FIELD_MAX_LENGTH,
     )
     is_admin: Optional[bool] = Field(
@@ -208,6 +204,10 @@ class UserUpdate(UserBase, BaseZenModel):
         title="The previous password for the user. Only relevant for user "
         "accounts. Required when updating the password.",
         max_length=STR_FIELD_MAX_LENGTH,
+    )
+    default_project_id: Optional[UUID] = Field(
+        default=None,
+        title="The default project ID for the user.",
     )
 
     @model_validator(mode="after")
@@ -268,8 +268,7 @@ class UserResponseBody(BaseDatedResponseBody):
     )
     full_name: str = Field(
         default="",
-        title="The full name for the account owner. Only relevant for user "
-        "accounts.",
+        title="The display name for the account.",
         max_length=STR_FIELD_MAX_LENGTH,
     )
     email_opted_in: Optional[bool] = Field(
@@ -285,6 +284,14 @@ class UserResponseBody(BaseDatedResponseBody):
     is_admin: bool = Field(
         title="Whether the account is an administrator.",
     )
+    default_project_id: Optional[UUID] = Field(
+        default=None,
+        title="The default project ID for the user.",
+    )
+    avatar_url: Optional[str] = Field(
+        default=None,
+        title="The avatar URL for the account.",
+    )
 
 
 class UserResponseMetadata(BaseResponseMetadata):
@@ -294,12 +301,6 @@ class UserResponseMetadata(BaseResponseMetadata):
         default="",
         title="The email address associated with the account. Only relevant "
         "for user accounts.",
-        max_length=STR_FIELD_MAX_LENGTH,
-    )
-    hub_token: Optional[str] = Field(
-        default=None,
-        title="JWT Token for the connected Hub account. Only relevant for user "
-        "accounts.",
         max_length=STR_FIELD_MAX_LENGTH,
     )
     external_user_id: Optional[UUID] = Field(
@@ -417,15 +418,6 @@ class UserResponse(
         return self.get_metadata().email
 
     @property
-    def hub_token(self) -> Optional[str]:
-        """The `hub_token` property.
-
-        Returns:
-            the value of the property.
-        """
-        return self.get_metadata().hub_token
-
-    @property
     def external_user_id(self) -> Optional[UUID]:
         """The `external_user_id` property.
 
@@ -442,6 +434,24 @@ class UserResponse(
             the value of the property.
         """
         return self.get_metadata().user_metadata
+
+    @property
+    def default_project_id(self) -> Optional[UUID]:
+        """The `default_project_id` property.
+
+        Returns:
+            the value of the property.
+        """
+        return self.get_body().default_project_id
+
+    @property
+    def avatar_url(self) -> Optional[str]:
+        """The `avatar_url` property.
+
+        Returns:
+            the value of the property.
+        """
+        return self.get_body().avatar_url
 
     # Helper methods
     @classmethod

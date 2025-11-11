@@ -14,7 +14,7 @@
 """Utility functions for secrets and secret references."""
 
 import re
-from typing import TYPE_CHECKING, Any, NamedTuple
+from typing import TYPE_CHECKING, Any, List, NamedTuple, Union
 
 from pydantic import Field, PlainSerializer, SecretStr
 from typing_extensions import Annotated
@@ -22,6 +22,8 @@ from typing_extensions import Annotated
 from zenml.logger import get_logger
 
 if TYPE_CHECKING:
+    from uuid import UUID
+
     from pydantic.fields import FieldInfo
 
 _secret_reference_expression = re.compile(r"\{\{\s*\S+?\.\S+\s*\}\}")
@@ -102,7 +104,7 @@ def SecretField(*args: Any, **kwargs: Any) -> Any:
     """
     json_schema_extra = kwargs.get("json_schema_extra", {})
     json_schema_extra.update({PYDANTIC_SENSITIVE_FIELD_MARKER: True})
-    return Field(json_schema_extra=json_schema_extra, *args, **kwargs)  # type: ignore[pydantic-field]
+    return Field(json_schema_extra=json_schema_extra, *args, **kwargs)
 
 
 def ClearTextField(*args: Any, **kwargs: Any) -> Any:
@@ -119,7 +121,7 @@ def ClearTextField(*args: Any, **kwargs: Any) -> Any:
     """
     json_schema_extra = kwargs.get("json_schema_extra", {})
     json_schema_extra.update({PYDANTIC_CLEAR_TEXT_FIELD_MARKER: True})
-    return Field(json_schema_extra=json_schema_extra, *args, **kwargs)  # type: ignore[pydantic-field]
+    return Field(json_schema_extra=json_schema_extra, *args, **kwargs)
 
 
 def is_secret_field(field: "FieldInfo") -> bool:
@@ -146,7 +148,7 @@ def is_secret_field(field: "FieldInfo") -> bool:
             logger.warning(
                 f"The 'json_schema_extra' of the field '{field.title}' is "
                 "not defined as a dict. This might lead to unexpected "
-                "behaviour as we are checking it is a secret text field. "
+                "behavior as we are checking it is a secret text field. "
                 "Returning 'False' as default..."
             )
 
@@ -177,8 +179,26 @@ def is_clear_text_field(field: "FieldInfo") -> bool:
             logger.warning(
                 f"The 'json_schema_extra' of the field '{field.title}' is "
                 "not defined as a dict. This might lead to unexpected "
-                "behaviour as we are checking it is a clear text field. "
+                "behavior as we are checking it is a clear text field. "
                 "Returning 'False' as default..."
             )
 
     return False
+
+
+def resolve_and_verify_secrets(
+    secrets: List[Union[str, "UUID"]],
+) -> List["UUID"]:
+    """Convert a list of secret names or IDs to a list of secret IDs.
+
+    Args:
+        secrets: A list of secret names or IDs.
+
+    Returns:
+        A list of secret IDs.
+    """
+    from zenml.client import Client
+
+    return [
+        Client().get_secret(secret, hydrate=False).id for secret in secrets
+    ]

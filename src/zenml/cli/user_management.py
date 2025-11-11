@@ -62,7 +62,7 @@ def describe_user(user_name_or_id: Optional[str] = None) -> None:
         try:
             user = client.get_user(user_name_or_id)
         except KeyError as err:
-            cli_utils.error(str(err))
+            cli_utils.exception(err)
         else:
             cli_utils.print_pydantic_models(
                 [user],
@@ -79,7 +79,7 @@ def describe_user(user_name_or_id: Optional[str] = None) -> None:
 @user.command("list")
 @list_options(UserFilter)
 @click.pass_context
-def list_users(ctx: click.Context, **kwargs: Any) -> None:
+def list_users(ctx: click.Context, /, **kwargs: Any) -> None:
     """List all users.
 
     Args:
@@ -174,7 +174,7 @@ def create_user(
 
         cli_utils.declare(f"Created user '{new_user.name}'.")
     except EntityExistsError as err:
-        cli_utils.error(str(err))
+        cli_utils.exception(err)
     else:
         if not new_user.active and new_user.activation_token is not None:
             user_info = f"?user={str(new_user.id)}&username={new_user.name}&token={new_user.activation_token}"
@@ -295,7 +295,7 @@ def update_user(
             active=active,
         )
     except (KeyError, IllegalOperationError) as err:
-        cli_utils.error(str(err))
+        cli_utils.exception(err)
 
 
 @user.command(
@@ -361,23 +361,11 @@ def change_user_password(
             updated_password=password,
         )
     except (KeyError, IllegalOperationError, AuthorizationException) as err:
-        cli_utils.error(str(err))
+        cli_utils.exception(err)
 
     cli_utils.declare(
         f"Successfully updated password for active user '{active_user.name}'."
     )
-
-    store = GlobalConfiguration().store_configuration
-    if store.type == StoreType.REST:
-        from zenml.zen_stores.rest_zen_store import RestZenStoreConfiguration
-
-        assert isinstance(store, RestZenStoreConfiguration)
-
-        if store.password is not None:
-            cli_utils.declare(
-                "You may need to log in again with your new password by "
-                "running `zenml connect`."
-            )
 
 
 @user.command(
@@ -412,7 +400,7 @@ def deactivate_user(
             name_id_or_prefix=user_name_or_id,
         )
     except (KeyError, IllegalOperationError) as err:
-        cli_utils.error(str(err))
+        cli_utils.exception(err)
 
     user_info = f"?user={str(user.id)}&username={user.name}&token={user.activation_token}"
     cli_utils.declare(
@@ -437,5 +425,5 @@ def delete_user(user_name_or_id: str) -> None:
     try:
         Client().delete_user(user_name_or_id)
     except (KeyError, IllegalOperationError) as err:
-        cli_utils.error(str(err))
+        cli_utils.exception(err)
     cli_utils.declare(f"Deleted user '{user_name_or_id}'.")

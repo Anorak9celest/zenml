@@ -27,7 +27,11 @@ def test_publishing_a_successful_step_run(mocker):
     )
 
     step_run_id = uuid4()
-    output_artifact_ids = {"output_name": uuid4()}
+    output_artifact_ids = {
+        "output_name": [
+            uuid4(),
+        ]
+    }
 
     publish_utils.publish_successful_step_run(
         step_run_id=step_run_id, output_artifact_ids=output_artifact_ids
@@ -93,7 +97,10 @@ def test_pipeline_run_status_computation(
     """Tests computing a pipeline run status from step statuses."""
     assert (
         publish_utils.get_pipeline_run_status(
-            step_statuses=step_statuses, num_steps=num_steps
+            run_status=ExecutionStatus.RUNNING,
+            step_statuses=step_statuses,
+            num_steps=num_steps,
+            is_dynamic_pipeline=False,
         )
         == expected_run_status
     )
@@ -101,7 +108,7 @@ def test_pipeline_run_status_computation(
 
 def test_publish_pipeline_run_metadata(mocker):
     """Unit test for `publish_pipeline_run_metadata`."""
-    mock_create_run = mocker.patch(
+    mock_get_or_create_run = mocker.patch(
         "zenml.zen_stores.sql_zen_store.SqlZenStore.create_run_metadata",
     )
     pipeline_run_id = uuid4()
@@ -113,12 +120,12 @@ def test_publish_pipeline_run_metadata(mocker):
         pipeline_run_id=pipeline_run_id,
         pipeline_run_metadata=pipeline_run_metadata,
     )
-    assert mock_create_run.call_count == 2  # once per run
+    assert mock_get_or_create_run.call_count == 2  # once per run
 
 
 def test_publish_step_run_metadata(mocker):
     """Unit test for `publish_step_run_metadata`."""
-    mock_create_run = mocker.patch(
+    mock_get_or_create_run = mocker.patch(
         "zenml.zen_stores.sql_zen_store.SqlZenStore.create_run_metadata",
     )
     step_run_id = uuid4()
@@ -130,4 +137,4 @@ def test_publish_step_run_metadata(mocker):
         step_run_id=step_run_id,
         step_run_metadata=step_run_metadata,
     )
-    assert mock_create_run.call_count == 2  # once per run
+    assert mock_get_or_create_run.call_count == 2  # once per run

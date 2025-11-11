@@ -15,10 +15,12 @@
 
 from datetime import datetime, timedelta
 from secrets import token_hex
-from typing import Any, Optional, Tuple
+from typing import Any, Optional, Sequence, Tuple
 from uuid import UUID
 
 from passlib.context import CryptContext
+from sqlalchemy.orm import joinedload
+from sqlalchemy.sql.base import ExecutableOption
 from sqlmodel import Relationship
 
 from zenml.enums import OAuthDeviceStatus
@@ -29,11 +31,14 @@ from zenml.models import (
     OAuthDeviceResponse,
     OAuthDeviceResponseBody,
     OAuthDeviceResponseMetadata,
+    OAuthDeviceResponseResources,
     OAuthDeviceUpdate,
 )
+from zenml.utils.time_utils import utc_now
 from zenml.zen_stores.schemas.base_schemas import BaseSchema
 from zenml.zen_stores.schemas.schema_utils import build_foreign_key_field
 from zenml.zen_stores.schemas.user_schemas import UserSchema
+from zenml.zen_stores.schemas.utils import jl_arg
 
 
 class OAuthDeviceSchema(BaseSchema, table=True):
@@ -67,6 +72,36 @@ class OAuthDeviceSchema(BaseSchema, table=True):
         nullable=True,
     )
     user: Optional["UserSchema"] = Relationship(back_populates="auth_devices")
+
+    @classmethod
+    def get_query_options(
+        cls,
+        include_metadata: bool = False,
+        include_resources: bool = False,
+        **kwargs: Any,
+    ) -> Sequence[ExecutableOption]:
+        """Get the query options for the schema.
+
+        Args:
+            include_metadata: Whether metadata will be included when converting
+                the schema to a model.
+            include_resources: Whether resources will be included when
+                converting the schema to a model.
+            **kwargs: Keyword arguments to allow schema specific logic
+
+        Returns:
+            A list of query options.
+        """
+        options = []
+
+        if include_resources:
+            options.extend(
+                [
+                    joinedload(jl_arg(OAuthDeviceSchema.user)),
+                ]
+            )
+
+        return options
 
     @classmethod
     def _generate_user_code(cls) -> str:
@@ -115,7 +150,7 @@ class OAuthDeviceSchema(BaseSchema, table=True):
         device_code = cls._generate_device_code()
         hashed_user_code = cls._get_hashed_code(user_code)
         hashed_device_code = cls._get_hashed_code(device_code)
-        now = datetime.utcnow()
+        now = utc_now()
         return (
             cls(
                 client_id=request.client_id,
@@ -159,7 +194,7 @@ class OAuthDeviceSchema(BaseSchema, table=True):
         elif device_update.locked is False:
             self.status = OAuthDeviceStatus.ACTIVE.value
 
-        self.updated = datetime.utcnow()
+        self.updated = utc_now()
         return self
 
     def internal_update(
@@ -174,7 +209,7 @@ class OAuthDeviceSchema(BaseSchema, table=True):
             The updated `OAuthDeviceSchema` and the new user code and device
             code, if they were generated.
         """
-        now = datetime.utcnow()
+        now = utc_now()
         user_code: Optional[str] = None
         device_code: Optional[str] = None
 
@@ -229,7 +264,7 @@ class OAuthDeviceSchema(BaseSchema, table=True):
             )
 
         body = OAuthDeviceResponseBody(
-            user=self.user.to_model() if self.user else None,
+            user_id=self.user_id,
             created=self.created,
             updated=self.updated,
             client_id=self.client_id,
@@ -240,29 +275,41 @@ class OAuthDeviceSchema(BaseSchema, table=True):
             ip_address=self.ip_address,
             hostname=self.hostname,
         )
+        resources = None
+        if include_resources:
+            resources = OAuthDeviceResponseResources(
+                user=self.user.to_model() if self.user else None,
+            )
         return OAuthDeviceResponse(
             id=self.id,
             body=body,
             metadata=metadata,
+            resources=resources,
         )
 
     def to_internal_model(
-        self, hydrate: bool = False
+        self,
+        include_metadata: bool = False,
+        include_resources: bool = False,
     ) -> OAuthDeviceInternalResponse:
         """Convert a device schema to an internal device response model.
 
         Args:
-            hydrate: bool to decide whether to return a hydrated version of the
-                model.
+            include_metadata: Whether the metadata will be filled.
+            include_resources: Whether the resources will be filled.
 
         Returns:
             The converted internal device response model.
         """
-        device_model = self.to_model(include_metadata=hydrate)
+        device_model = self.to_model(
+            include_metadata=include_metadata,
+            include_resources=include_resources,
+        )
         return OAuthDeviceInternalResponse(
             id=device_model.id,
             body=device_model.body,
             metadata=device_model.metadata,
+            resources=device_model.resources,
             user_code=self.user_code,
             device_code=self.device_code,
         )

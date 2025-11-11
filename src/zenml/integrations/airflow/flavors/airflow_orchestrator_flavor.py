@@ -119,6 +119,24 @@ class AirflowOrchestratorConfig(
 
     local: bool = True
 
+    @property
+    def is_local(self) -> bool:
+        """Checks if this stack component is running locally.
+
+        Returns:
+            True if this config is for a local component, False otherwise.
+        """
+        return self.local
+
+    @property
+    def is_schedulable(self) -> bool:
+        """Whether the orchestrator is schedulable or not.
+
+        Returns:
+            Whether the orchestrator is schedulable or not.
+        """
+        return True
+
 
 class AirflowOrchestratorFlavor(BaseOrchestratorFlavor):
     """Flavor for the Airflow orchestrator."""

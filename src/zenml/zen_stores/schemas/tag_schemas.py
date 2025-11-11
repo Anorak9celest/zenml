@@ -13,12 +13,13 @@
 #  permissions and limitations under the License.
 """SQLModel implementation of tag tables."""
 
-from datetime import datetime
-from typing import TYPE_CHECKING, Any, List
+from typing import Any, List, Optional, Sequence
 from uuid import UUID
 
-from sqlalchemy import VARCHAR, Column
-from sqlmodel import Field, Relationship
+from sqlalchemy import VARCHAR, Column, UniqueConstraint
+from sqlalchemy.orm import joinedload, noload, object_session
+from sqlalchemy.sql.base import ExecutableOption
+from sqlmodel import Field, Relationship, col, func, select
 
 from zenml.enums import ColorVariants, TaggableResourceTypes
 from zenml.models import (
@@ -28,32 +29,99 @@ from zenml.models import (
     TagResourceResponseBody,
     TagResponse,
     TagResponseBody,
+    TagResponseMetadata,
+    TagResponseResources,
     TagUpdate,
 )
+from zenml.utils.time_utils import utc_now
 from zenml.zen_stores.schemas.base_schemas import BaseSchema, NamedSchema
-from zenml.zen_stores.schemas.schema_utils import build_foreign_key_field
-
-if TYPE_CHECKING:
-    from zenml.zen_stores.schemas.artifact_schemas import (
-        ArtifactSchema,
-        ArtifactVersionSchema,
-    )
-    from zenml.zen_stores.schemas.model_schemas import (
-        ModelSchema,
-        ModelVersionSchema,
-    )
+from zenml.zen_stores.schemas.schema_utils import (
+    build_foreign_key_field,
+    build_index,
+)
+from zenml.zen_stores.schemas.user_schemas import UserSchema
+from zenml.zen_stores.schemas.utils import jl_arg
 
 
 class TagSchema(NamedSchema, table=True):
     """SQL Model for tag."""
 
     __tablename__ = "tag"
+    __table_args__ = (
+        UniqueConstraint(
+            "name",
+            name="unique_tag_name",
+        ),
+    )
+
+    user_id: Optional[UUID] = build_foreign_key_field(
+        source=__tablename__,
+        target=UserSchema.__tablename__,
+        source_column="user_id",
+        target_column="id",
+        ondelete="SET NULL",
+        nullable=True,
+    )
+    user: Optional["UserSchema"] = Relationship(back_populates="tags")
 
     color: str = Field(sa_column=Column(VARCHAR(255), nullable=False))
+    exclusive: bool = Field(default=False)
+
     links: List["TagResourceSchema"] = Relationship(
         back_populates="tag",
-        sa_relationship_kwargs={"cascade": "delete"},
+        sa_relationship_kwargs={"overlaps": "tags", "cascade": "delete"},
     )
+
+    @classmethod
+    def get_query_options(
+        cls,
+        include_metadata: bool = False,
+        include_resources: bool = False,
+        **kwargs: Any,
+    ) -> Sequence[ExecutableOption]:
+        """Get the query options for the schema.
+
+        Args:
+            include_metadata: Whether metadata will be included when converting
+                the schema to a model.
+            include_resources: Whether resources will be included when
+                converting the schema to a model.
+            **kwargs: Keyword arguments to allow schema specific logic
+
+        Returns:
+            A list of query options.
+        """
+        options = []
+
+        if include_resources:
+            options.extend([joinedload(jl_arg(TagSchema.user))])
+
+        return options
+
+    @property
+    def tagged_count(self) -> int:
+        """Fetch the number of resources tagged with this tag.
+
+        Raises:
+            RuntimeError: If no session for the schema exists.
+
+        Returns:
+            The number of resources tagged with this tag.
+        """
+        from zenml.zen_stores.schemas import TagResourceSchema
+
+        if session := object_session(self):
+            count = session.scalar(
+                select(func.count(col(TagResourceSchema.id)))
+                .where(TagResourceSchema.tag_id == self.id)
+                .options(noload("*"))
+            )
+
+            return int(count) if count else 0
+        else:
+            raise RuntimeError(
+                "Missing DB session to fetch tagged count for tag."
+            )
 
     @classmethod
     def from_request(cls, request: TagRequest) -> "TagSchema":
@@ -67,7 +135,9 @@ class TagSchema(NamedSchema, table=True):
         """
         return cls(
             name=request.name,
+            exclusive=request.exclusive,
             color=request.color.value,
+            user_id=request.user,
         )
 
     def to_model(
@@ -87,15 +157,30 @@ class TagSchema(NamedSchema, table=True):
         Returns:
             The created `TagResponse`.
         """
+        metadata = None
+        if include_metadata:
+            metadata = TagResponseMetadata(
+                tagged_count=self.tagged_count,
+            )
+
+        resources = None
+        if include_resources:
+            resources = TagResponseResources(
+                user=self.user.to_model() if self.user else None,
+            )
+
         return TagResponse(
             id=self.id,
             name=self.name,
             body=TagResponseBody(
+                user_id=self.user_id,
                 created=self.created,
                 updated=self.updated,
                 color=ColorVariants(self.color),
-                tagged_count=len(self.links),
+                exclusive=self.exclusive,
             ),
+            metadata=metadata,
+            resources=resources,
         )
 
     def update(self, update: TagUpdate) -> "TagSchema":
@@ -113,7 +198,7 @@ class TagSchema(NamedSchema, table=True):
             else:
                 setattr(self, field, value)
 
-        self.updated = datetime.utcnow()
+        self.updated = utc_now()
         return self
 
 
@@ -121,6 +206,16 @@ class TagResourceSchema(BaseSchema, table=True):
     """SQL Model for tag resource relationship."""
 
     __tablename__ = "tag_resource"
+    __table_args__ = (
+        build_index(
+            table_name=__tablename__,
+            column_names=[
+                "resource_id",
+                "resource_type",
+                "tag_id",
+            ],
+        ),
+    )
 
     tag_id: UUID = build_foreign_key_field(
         source=__tablename__,
@@ -130,37 +225,11 @@ class TagResourceSchema(BaseSchema, table=True):
         ondelete="CASCADE",
         nullable=False,
     )
-    tag: "TagSchema" = Relationship(back_populates="links")
+    tag: "TagSchema" = Relationship(
+        back_populates="links", sa_relationship_kwargs={"overlaps": "tags"}
+    )
     resource_id: UUID
     resource_type: str = Field(sa_column=Column(VARCHAR(255), nullable=False))
-    artifact: List["ArtifactSchema"] = Relationship(
-        back_populates="tags",
-        sa_relationship_kwargs=dict(
-            primaryjoin=f"and_(TagResourceSchema.resource_type=='{TaggableResourceTypes.ARTIFACT.value}', foreign(TagResourceSchema.resource_id)==ArtifactSchema.id)",
-            overlaps="tags,model,artifact_version,model_version",
-        ),
-    )
-    artifact_version: List["ArtifactVersionSchema"] = Relationship(
-        back_populates="tags",
-        sa_relationship_kwargs=dict(
-            primaryjoin=f"and_(TagResourceSchema.resource_type=='{TaggableResourceTypes.ARTIFACT_VERSION.value}', foreign(TagResourceSchema.resource_id)==ArtifactVersionSchema.id)",
-            overlaps="tags,model,artifact,model_version",
-        ),
-    )
-    model: List["ModelSchema"] = Relationship(
-        back_populates="tags",
-        sa_relationship_kwargs=dict(
-            primaryjoin=f"and_(TagResourceSchema.resource_type=='{TaggableResourceTypes.MODEL.value}', foreign(TagResourceSchema.resource_id)==ModelSchema.id)",
-            overlaps="tags,artifact,artifact_version,model_version",
-        ),
-    )
-    model_version: List["ModelVersionSchema"] = Relationship(
-        back_populates="tags",
-        sa_relationship_kwargs=dict(
-            primaryjoin=f"and_(TagResourceSchema.resource_type=='{TaggableResourceTypes.MODEL_VERSION.value}', foreign(TagResourceSchema.resource_id)==ModelVersionSchema.id)",
-            overlaps="tags,model,artifact,artifact_version",
-        ),
-    )
 
     @classmethod
     def from_request(cls, request: TagResourceRequest) -> "TagResourceSchema":

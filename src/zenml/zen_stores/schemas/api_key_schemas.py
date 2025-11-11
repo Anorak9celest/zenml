@@ -15,11 +15,13 @@
 
 from datetime import datetime
 from secrets import token_hex
-from typing import Any, Optional, Tuple
+from typing import Any, Optional, Sequence, Tuple
 from uuid import UUID
 
 from passlib.context import CryptContext
-from sqlalchemy import TEXT, Column
+from sqlalchemy import TEXT, Column, UniqueConstraint
+from sqlalchemy.orm import joinedload
+from sqlalchemy.sql.base import ExecutableOption
 from sqlmodel import Field, Relationship
 
 from zenml.models import (
@@ -32,15 +34,24 @@ from zenml.models import (
     APIKeyRotateRequest,
     APIKeyUpdate,
 )
+from zenml.utils.time_utils import utc_now
 from zenml.zen_stores.schemas.base_schemas import NamedSchema
 from zenml.zen_stores.schemas.schema_utils import build_foreign_key_field
 from zenml.zen_stores.schemas.user_schemas import UserSchema
+from zenml.zen_stores.schemas.utils import jl_arg
 
 
 class APIKeySchema(NamedSchema, table=True):
     """SQL Model for API keys."""
 
     __tablename__ = "api_key"
+    __table_args__ = (
+        UniqueConstraint(
+            "name",
+            "service_account_id",
+            name="unique_api_key_name_in_service_account",
+        ),
+    )
 
     description: str = Field(sa_column=Column(TEXT))
     key: str
@@ -83,6 +94,31 @@ class APIKeySchema(NamedSchema, table=True):
         return context.hash(key)
 
     @classmethod
+    def get_query_options(
+        cls,
+        include_metadata: bool = False,
+        include_resources: bool = False,
+        **kwargs: Any,
+    ) -> Sequence[ExecutableOption]:
+        """Get the query options for the schema.
+
+        Args:
+            include_metadata: Whether metadata will be included when converting
+                the schema to a model.
+            include_resources: Whether resources will be included when
+                converting the schema to a model.
+            **kwargs: Keyword arguments to allow schema specific logic
+
+        Returns:
+            A list of query options.
+        """
+        options = [
+            joinedload(jl_arg(APIKeySchema.service_account), innerjoin=True),
+        ]
+
+        return options
+
+    @classmethod
     def from_request(
         cls,
         service_account_id: UUID,
@@ -100,7 +136,7 @@ class APIKeySchema(NamedSchema, table=True):
         """
         key = cls._generate_jwt_secret_key()
         hashed_key = cls._get_hashed_key(key)
-        now = datetime.utcnow()
+        now = utc_now()
         return (
             cls(
                 name=request.name,
@@ -155,20 +191,25 @@ class APIKeySchema(NamedSchema, table=True):
         )
 
     def to_internal_model(
-        self, hydrate: bool = False
+        self,
+        include_metadata: bool = False,
+        include_resources: bool = False,
     ) -> APIKeyInternalResponse:
         """Convert a `APIKeySchema` to an `APIKeyInternalResponse`.
 
         The internal response model includes the hashed key values.
 
         Args:
-            hydrate: bool to decide whether to return a hydrated version of the
-                model.
+            include_metadata: Whether the metadata will be filled.
+            include_resources: Whether the resources will be filled.
 
         Returns:
             The created APIKeyInternalResponse.
         """
-        model = self.to_model(include_metadata=hydrate)
+        model = self.to_model(
+            include_metadata=include_metadata,
+            include_resources=include_resources,
+        )
         model.get_body().key = self.key
 
         return APIKeyInternalResponse(
@@ -192,7 +233,7 @@ class APIKeySchema(NamedSchema, table=True):
             if hasattr(self, field):
                 setattr(self, field, value)
 
-        self.updated = datetime.utcnow()
+        self.updated = utc_now()
         return self
 
     def internal_update(self, update: APIKeyInternalUpdate) -> "APIKeySchema":
@@ -225,7 +266,7 @@ class APIKeySchema(NamedSchema, table=True):
         Returns:
             The updated `APIKeySchema` and the new un-hashed key.
         """
-        self.updated = datetime.utcnow()
+        self.updated = utc_now()
         self.previous_key = self.key
         self.retain_period = rotate_request.retain_period_minutes
         new_key = self._generate_jwt_secret_key()

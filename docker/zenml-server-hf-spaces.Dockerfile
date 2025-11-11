@@ -3,6 +3,9 @@ FROM zenmldocker/zenml-server:latest
 ENV ZENML_ANALYTICS_OPT_IN=true
 ENV ZENML_SERVER_DEPLOYMENT_TYPE="hf_spaces"
 
+# fixes iframe / CORS issue for HF deployments
+ENV ZENML_SERVER_SECURE_HEADERS_CSP="frame-ancestors *;"
+
 ################################################################################
 #
 # CONFIGURING YOUR ZENML HF SPACES SERVER
@@ -56,6 +59,7 @@ ENV ZENML_SERVER_DEPLOYMENT_TYPE="hf_spaces"
 # ENV ZENML_SECRETS_STORE_VAULT_ADDR=""
 # ENV ZENML_SECRETS_STORE_VAULT_TOKEN=""
 # ENV ZENML_SECRETS_STORE_VAULT_NAMESPACE=""
+# ENV ZENML_SECRETS_STORE_MOUNT_POINT=""
 # ENV ZENML_SECRETS_STORE_MAX_VERSIONS=""
 
 ENTRYPOINT ["uvicorn", "zenml.zen_server.zen_server_api:app", "--log-level", "debug", "--no-server-header"]

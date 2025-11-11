@@ -14,22 +14,77 @@
 """Base orchestrator class."""
 
 from abc import ABC, abstractmethod
-from typing import TYPE_CHECKING, Any, Dict, Optional, Type, cast
+from typing import (
+    TYPE_CHECKING,
+    Any,
+    Callable,
+    Dict,
+    Iterator,
+    List,
+    Optional,
+    Tuple,
+    Type,
+    cast,
+)
+from uuid import UUID
 
 from pydantic import model_validator
 
-from zenml.enums import StackComponentType
+from zenml.constants import (
+    ENV_ZENML_PREVENT_CLIENT_SIDE_CACHING,
+    handle_bool_env_var,
+)
+from zenml.enums import ExecutionMode, ExecutionStatus, StackComponentType
+from zenml.exceptions import (
+    HookExecutionException,
+    IllegalOperationError,
+    RunMonitoringError,
+)
+from zenml.hooks.hook_validators import load_and_run_hook
 from zenml.logger import get_logger
-from zenml.orchestrators.step_launcher import StepLauncher
+from zenml.metadata.metadata_types import MetadataType
+from zenml.orchestrators.publish_utils import (
+    publish_pipeline_run_metadata,
+    publish_pipeline_run_status_update,
+    publish_schedule_metadata,
+)
 from zenml.orchestrators.utils import get_config_environment_vars
 from zenml.stack import Flavor, Stack, StackComponent, StackComponentConfig
+from zenml.steps.step_context import RunContext, get_or_create_run_context
+from zenml.utils.env_utils import temporary_environment
 from zenml.utils.pydantic_utils import before_validator_handler
 
 if TYPE_CHECKING:
     from zenml.config.step_configurations import Step
-    from zenml.models import PipelineDeploymentResponse
+    from zenml.config.step_run_info import StepRunInfo
+    from zenml.models import (
+        PipelineRunResponse,
+        PipelineSnapshotResponse,
+        ScheduleResponse,
+        ScheduleUpdate,
+    )
 
 logger = get_logger(__name__)
+
+
+class SubmissionResult:
+    """Result of submitting a pipeline run."""
+
+    def __init__(
+        self,
+        wait_for_completion: Optional[Callable[[], None]] = None,
+        metadata: Optional[Dict[str, MetadataType]] = None,
+    ):
+        """Initialize a submission result.
+
+        Args:
+            wait_for_completion: A function that waits for the pipeline run to
+                complete. If provided, this will be called after the pipeline
+                run was submitted successfully.
+            metadata: Metadata for the pipeline run or schedule.
+        """
+        self.wait_for_completion = wait_for_completion
+        self.metadata = metadata
 
 
 class BaseOrchestratorConfig(StackComponentConfig):
@@ -54,7 +109,7 @@ class BaseOrchestratorConfig(StackComponentConfig):
                     "The 'custom_docker_base_image_name' field has been "
                     "deprecated. To use a custom base container image with your "
                     "orchestrators, please use the DockerSettings in your "
-                    "pipeline (see https://docs.zenml.io/how-to/customize-docker-builds)."
+                    "pipeline (see https://docs.zenml.io/concepts/containerization)."
                 )
 
         return data
@@ -68,26 +123,38 @@ class BaseOrchestratorConfig(StackComponentConfig):
         """
         return False
 
+    @property
+    def is_schedulable(self) -> bool:
+        """Whether the orchestrator is schedulable or not.
+
+        Returns:
+            Whether the orchestrator is schedulable or not.
+        """
+        return False
+
+    @property
+    def supports_client_side_caching(self) -> bool:
+        """Whether the orchestrator supports client side caching.
+
+        Returns:
+            Whether the orchestrator supports client side caching.
+        """
+        return True
+
+    @property
+    def handles_step_retries(self) -> bool:
+        """Whether the orchestrator handles step retries.
+
+        Returns:
+            Whether the orchestrator handles step retries.
+        """
+        return False
+
 
 class BaseOrchestrator(StackComponent, ABC):
-    """Base class for all orchestrators.
+    """Base class for all orchestrators."""
 
-    In order to implement an orchestrator you will need to subclass from this
-    class.
-
-    How it works:
-    -------------
-    The `run(...)` method is the entrypoint that is executed when the
-    pipeline's run method is called within the user code
-    (`pipeline_instance.run(...)`).
-
-    This method will do some internal preparation and then call the
-    `prepare_or_run_pipeline(...)` method. BaseOrchestrator subclasses must
-    implement this method and either run the pipeline steps directly or deploy
-    the pipeline to some remote infrastructure.
-    """
-
-    _active_deployment: Optional["PipelineDeploymentResponse"] = None
+    _active_snapshot: Optional["PipelineSnapshotResponse"] = None
 
     @property
     def config(self) -> BaseOrchestratorConfig:
@@ -109,93 +176,321 @@ class BaseOrchestrator(StackComponent, ABC):
             The orchestrator run id.
         """
 
-    @abstractmethod
-    def prepare_or_run_pipeline(
+    def submit_pipeline(
         self,
-        deployment: "PipelineDeploymentResponse",
+        snapshot: "PipelineSnapshotResponse",
         stack: "Stack",
-        environment: Dict[str, str],
-    ) -> Any:
-        """The method needs to be implemented by the respective orchestrator.
+        base_environment: Dict[str, str],
+        step_environments: Dict[str, Dict[str, str]],
+        placeholder_run: Optional["PipelineRunResponse"] = None,
+    ) -> Optional[SubmissionResult]:
+        """Submits a pipeline to the orchestrator.
 
-        Depending on the type of orchestrator you'll have to perform slightly
-        different operations.
-
-        Simple Case:
-        ------------
-        The Steps are run directly from within the same environment in which
-        the orchestrator code is executed. In this case you will need to
-        deal with implementation-specific runtime configurations (like the
-        schedule) and then iterate through the steps and finally call
-        `self.run_step(...)` to execute each step.
-
-        Advanced Case:
-        --------------
-        Most orchestrators will not run the steps directly. Instead, they
-        build some intermediate representation of the pipeline that is then
-        used to create and run the pipeline and its steps on the target
-        environment. For such orchestrators this method will have to build
-        this representation and deploy it.
-
-        Regardless of the implementation details, the orchestrator will need
-        to run each step in the target environment. For this the
-        `self.run_step(...)` method should be used.
-
-        The easiest way to make this work is by using an entrypoint
-        configuration to run single steps (`zenml.entrypoints.step_entrypoint_configuration.StepEntrypointConfiguration`)
-        or entire pipelines (`zenml.entrypoints.pipeline_entrypoint_configuration.PipelineEntrypointConfiguration`).
+        This method should only submit the pipeline and not wait for it to
+        complete. If the orchestrator is configured to wait for the pipeline run
+        to complete, a function that waits for the pipeline run to complete can
+        be passed as part of the submission result.
 
         Args:
-            deployment: The pipeline deployment to prepare or run.
+            snapshot: The pipeline snapshot to submit.
+            stack: The stack the pipeline will run on.
+            base_environment: Base environment shared by all steps. This should
+                be set if your orchestrator for example runs one container that
+                is responsible for starting all the steps.
+            step_environments: Environment variables to set when executing
+                specific steps.
+            placeholder_run: An optional placeholder run for the snapshot.
+
+        Returns:
+            Optional submission result.
+        """
+        return None
+
+    def submit_dynamic_pipeline(
+        self,
+        snapshot: "PipelineSnapshotResponse",
+        stack: "Stack",
+        environment: Dict[str, str],
+        placeholder_run: Optional["PipelineRunResponse"] = None,
+    ) -> Optional[SubmissionResult]:
+        """Submits a dynamic pipeline to the orchestrator.
+
+        Args:
+            snapshot: The pipeline snapshot to submit.
+            stack: The stack the pipeline will run on.
+            environment: Environment variables to set in the orchestration
+                environment.
+            placeholder_run: An optional placeholder run.
+
+        Returns:
+            Optional submission result.
+        """
+        return None
+
+    def prepare_or_run_pipeline(
+        self,
+        deployment: "PipelineSnapshotResponse",
+        stack: "Stack",
+        environment: Dict[str, str],
+        placeholder_run: Optional["PipelineRunResponse"] = None,
+    ) -> Optional[Iterator[Dict[str, MetadataType]]]:
+        """DEPRECATED: Prepare or run a pipeline.
+
+        Args:
+            deployment: The deployment to prepare or run.
             stack: The stack the pipeline will run on.
             environment: Environment variables to set in the orchestration
                 environment. These don't need to be set if running locally.
-
-        Returns:
-            The optional return value from this method will be returned by the
-            `pipeline_instance.run()` call when someone is running a pipeline.
+            placeholder_run: An optional placeholder run for the deployment.
         """
 
     def run(
         self,
-        deployment: "PipelineDeploymentResponse",
+        snapshot: "PipelineSnapshotResponse",
         stack: "Stack",
-    ) -> Any:
+        placeholder_run: Optional["PipelineRunResponse"] = None,
+    ) -> None:
         """Runs a pipeline on a stack.
 
         Args:
-            deployment: The pipeline deployment.
+            snapshot: The pipeline snapshot.
             stack: The stack on which to run the pipeline.
+            placeholder_run: An optional placeholder run for the snapshot.
+                This will be deleted in case the pipeline run failed.
 
-        Returns:
-            Orchestrator-specific return value.
+        Raises:
+            RunMonitoringError: If a failure happened while monitoring the
+                pipeline run.
         """
-        self._prepare_run(deployment=deployment)
+        self._prepare_run(snapshot=snapshot)
 
-        environment = get_config_environment_vars(deployment=deployment)
+        pipeline_run_id: Optional[UUID] = None
+        schedule_id: Optional[UUID] = None
+        if snapshot.schedule:
+            schedule_id = snapshot.schedule.id
+        if placeholder_run:
+            pipeline_run_id = placeholder_run.id
+
+        base_environment, secrets = get_config_environment_vars(
+            schedule_id=schedule_id,
+            pipeline_run_id=pipeline_run_id,
+        )
+
+        # TODO: for now, we don't support separate secrets from environment
+        # in the orchestrator environment
+        base_environment.update(secrets)
+
+        prevent_client_side_caching = handle_bool_env_var(
+            ENV_ZENML_PREVENT_CLIENT_SIDE_CACHING, default=False
+        )
+
+        if (
+            placeholder_run
+            and self.config.supports_client_side_caching
+            and not snapshot.schedule
+            and not snapshot.is_dynamic
+            and not prevent_client_side_caching
+        ):
+            from zenml.orchestrators import cache_utils
+
+            run_required = (
+                cache_utils.create_cached_step_runs_and_prune_snapshot(
+                    snapshot=snapshot,
+                    pipeline_run=placeholder_run,
+                    stack=stack,
+                )
+            )
+
+            if not run_required:
+                self._cleanup_run()
+                return
+        else:
+            logger.debug("Skipping client-side caching.")
 
         try:
-            result = self.prepare_or_run_pipeline(
-                deployment=deployment, stack=stack, environment=environment
-            )
+            if (
+                not snapshot.is_dynamic
+                and getattr(self.submit_pipeline, "__func__", None)
+                is BaseOrchestrator.submit_pipeline
+            ):
+                logger.warning(
+                    "The orchestrator '%s' is still using the deprecated "
+                    "`prepare_or_run_pipeline(...)` method which will be "
+                    "removed in the future. Please implement the replacement "
+                    "`submit_pipeline(...)` method for your custom "
+                    "orchestrator.",
+                    self.name,
+                )
+                if metadata_iterator := self.prepare_or_run_pipeline(
+                    deployment=snapshot,
+                    stack=stack,
+                    environment=base_environment,
+                    placeholder_run=placeholder_run,
+                ):
+                    for metadata_dict in metadata_iterator:
+                        try:
+                            if placeholder_run:
+                                publish_pipeline_run_metadata(
+                                    pipeline_run_id=placeholder_run.id,
+                                    pipeline_run_metadata={
+                                        self.id: metadata_dict
+                                    },
+                                )
+                        except Exception as e:
+                            logger.debug(
+                                "Something went went wrong trying to publish the"
+                                f"run metadata: {e}"
+                            )
+            else:
+                if snapshot.is_dynamic:
+                    submission_result = self.submit_dynamic_pipeline(
+                        snapshot=snapshot,
+                        stack=stack,
+                        environment=base_environment,
+                        placeholder_run=placeholder_run,
+                    )
+                else:
+                    step_environments = {}
+                    for (
+                        invocation_id,
+                        step,
+                    ) in snapshot.step_configurations.items():
+                        from zenml.utils.env_utils import get_step_environment
+
+                        step_environment = get_step_environment(
+                            step_config=step.config,
+                            stack=stack,
+                        )
+
+                        combined_environment = base_environment.copy()
+                        combined_environment.update(step_environment)
+                        step_environments[invocation_id] = combined_environment
+
+                    submission_result = self.submit_pipeline(
+                        snapshot=snapshot,
+                        stack=stack,
+                        base_environment=base_environment,
+                        step_environments=step_environments,
+                        placeholder_run=placeholder_run,
+                    )
+                if placeholder_run:
+                    publish_pipeline_run_status_update(
+                        pipeline_run_id=placeholder_run.id,
+                        status=ExecutionStatus.PROVISIONING,
+                    )
+
+                if submission_result:
+                    if submission_result.metadata:
+                        if placeholder_run:
+                            try:
+                                publish_pipeline_run_metadata(
+                                    pipeline_run_id=placeholder_run.id,
+                                    pipeline_run_metadata={
+                                        self.id: submission_result.metadata
+                                    },
+                                )
+                            except Exception as e:
+                                logger.debug(
+                                    "Error publishing run metadata: %s", e
+                                )
+                        elif snapshot.schedule:
+                            try:
+                                publish_schedule_metadata(
+                                    schedule_id=snapshot.schedule.id,
+                                    schedule_metadata={
+                                        self.id: submission_result.metadata
+                                    },
+                                )
+                            except Exception as e:
+                                logger.debug(
+                                    "Error publishing schedule metadata: %s", e
+                                )
+
+                    if submission_result.wait_for_completion:
+                        try:
+                            submission_result.wait_for_completion()
+                        except KeyboardInterrupt as e:
+                            message = (
+                                "Run monitoring interrupted, but "
+                                "the pipeline is still executing."
+                            )
+                            if placeholder_run:
+                                message += (
+                                    " If you want to stop the run, use: `zenml "
+                                    f"pipeline runs stop {placeholder_run.id}`"
+                                )
+                            # TODO: once we don't support Python 3.10 anymore,
+                            # use `exception.add_note` instead.
+                            e.args = (message,)
+                            raise RunMonitoringError(original_exception=e)
+                        except BaseException as e:
+                            raise RunMonitoringError(original_exception=e)
+
         finally:
             self._cleanup_run()
 
-        return result
-
-    def run_step(self, step: "Step") -> None:
+    def run_step(
+        self,
+        step: "Step",
+    ) -> None:
         """Runs the given step.
 
         Args:
             step: The step to run.
         """
-        assert self._active_deployment
-        launcher = StepLauncher(
-            deployment=self._active_deployment,
+        from zenml.execution.step.utils import launch_step
+
+        assert self._active_snapshot
+
+        launch_step(
+            snapshot=self._active_snapshot,
             step=step,
             orchestrator_run_id=self.get_orchestrator_run_id(),
+            retry=not self.config.handles_step_retries,
         )
-        launcher.launch()
+
+    @property
+    def supports_dynamic_pipelines(self) -> bool:
+        """Whether the orchestrator supports dynamic pipelines.
+
+        Returns:
+            Whether the orchestrator supports dynamic pipelines.
+        """
+        return (
+            getattr(self.submit_dynamic_pipeline, "__func__", None)
+            is not BaseOrchestrator.submit_dynamic_pipeline
+        )
+
+    @property
+    def can_launch_dynamic_steps(self) -> bool:
+        """Whether the orchestrator can launch dynamic steps.
+
+        Returns:
+            Whether the orchestrator can launch dynamic steps.
+        """
+        return (
+            getattr(self.launch_dynamic_step, "__func__", None)
+            is not BaseOrchestrator.launch_dynamic_step
+        )
+
+    def launch_dynamic_step(
+        self, step_run_info: "StepRunInfo", environment: Dict[str, str]
+    ) -> None:
+        """Launch a dynamic step.
+
+        Args:
+            step_run_info: The step run information.
+            environment: The environment variables to set in the execution
+                environment.
+
+        Raises:
+            NotImplementedError: If the orchestrator does not implement this
+                method.
+        """
+        raise NotImplementedError(
+            "Launching dynamic steps is not implemented for "
+            f"the {self.__class__.__name__} orchestrator."
+        )
 
     @staticmethod
     def requires_resources_in_orchestration_environment(
@@ -218,17 +513,277 @@ class BaseOrchestrator(StackComponent, ABC):
 
         return not step.config.resource_settings.empty
 
-    def _prepare_run(self, deployment: "PipelineDeploymentResponse") -> None:
+    def _prepare_run(self, snapshot: "PipelineSnapshotResponse") -> None:
         """Prepares a run.
 
         Args:
-            deployment: The deployment to prepare.
+            snapshot: The snapshot to prepare.
         """
-        self._active_deployment = deployment
+        self._validate_execution_mode(snapshot)
+        self._active_snapshot = snapshot
 
     def _cleanup_run(self) -> None:
         """Cleans up the active run."""
-        self._active_deployment = None
+        self._active_snapshot = None
+
+    @property
+    def supported_execution_modes(self) -> List[ExecutionMode]:
+        """Returns the supported execution modes for this flavor.
+
+        Returns:
+            A tuple of supported execution modes.
+        """
+        return [ExecutionMode.CONTINUE_ON_FAILURE]
+
+    @property
+    def run_init_cleanup_at_step_level(self) -> bool:
+        """Whether the orchestrator runs the init and cleanup hooks at step level.
+
+        For orchestrators that run their steps in isolated step environments,
+        the run context cannot be shared between steps. In this case, the init
+        and cleanup hooks need to be run at step level for each individual step.
+
+        For orchestrators that run their steps in a shared environment with a
+        shared memory (e.g. the local orchestrator), the init and cleanup hooks
+        can be run at run level and this property should be overridden to return
+        True.
+
+        Returns:
+            Whether the orchestrator runs the init and cleanup hooks at step
+            level.
+        """
+        return True
+
+    @classmethod
+    def run_init_hook(cls, snapshot: "PipelineSnapshotResponse") -> None:
+        """Runs the init hook.
+
+        Args:
+            snapshot: The snapshot to run the init hook for.
+
+        Raises:
+            HookExecutionException: If the init hook fails.
+        """
+        # The lifetime of the run context starts when the init hook is executed
+        # and ends when the cleanup hook is executed
+        run_context = get_or_create_run_context()
+        init_hook_source = snapshot.pipeline_configuration.init_hook_source
+        init_hook_kwargs = snapshot.pipeline_configuration.init_hook_kwargs
+
+        # We only run the init hook once, if the (thread-local) run context
+        # associated with the current run has not been initialized yet. This
+        # allows us to run the init hook only once per run per execution
+        # environment (process, container, etc.).
+        if not run_context.initialized:
+            if not init_hook_source:
+                run_context.initialize(None)
+                return
+
+            logger.info("Executing the pipeline's init hook...")
+            try:
+                with temporary_environment(
+                    snapshot.pipeline_configuration.environment
+                ):
+                    run_state = load_and_run_hook(
+                        init_hook_source,
+                        hook_parameters=init_hook_kwargs,
+                        raise_on_error=True,
+                    )
+            except Exception as e:
+                raise HookExecutionException(
+                    f"Failed to execute init hook for pipeline "
+                    f"{snapshot.pipeline_configuration.name}"
+                ) from e
+
+            run_context.initialize(run_state)
+
+    @classmethod
+    def run_cleanup_hook(cls, snapshot: "PipelineSnapshotResponse") -> None:
+        """Runs the cleanup hook.
+
+        Args:
+            snapshot: The snapshot to run the cleanup hook for.
+        """
+        # The lifetime of the run context starts when the init hook is executed
+        # and ends when the cleanup hook is executed
+        if not RunContext._exists():
+            return
+
+        if (
+            cleanup_hook_source
+            := snapshot.pipeline_configuration.cleanup_hook_source
+        ):
+            logger.info("Executing the pipeline's cleanup hook...")
+            with temporary_environment(
+                snapshot.pipeline_configuration.environment
+            ):
+                load_and_run_hook(
+                    cleanup_hook_source,
+                    raise_on_error=False,
+                )
+
+        # Destroy the run context, so it's created anew for the next run
+        RunContext._clear()
+
+    def _validate_execution_mode(
+        self, snapshot: "PipelineSnapshotResponse"
+    ) -> None:
+        """Validate that the requested execution mode is supported.
+
+        Args:
+            snapshot: The snapshot to validate.
+
+        Raises:
+            ValueError: If the execution mode is not supported.
+        """
+        execution_mode = snapshot.pipeline_configuration.execution_mode
+
+        if execution_mode not in self.supported_execution_modes:
+            raise ValueError(
+                f"Execution mode {execution_mode} is not supported by the "
+                f"{self.__class__.__name__} orchestrator."
+            )
+
+    def fetch_status(
+        self, run: "PipelineRunResponse", include_steps: bool = False
+    ) -> Tuple[
+        Optional[ExecutionStatus], Optional[Dict[str, ExecutionStatus]]
+    ]:
+        """Refreshes the status of a specific pipeline run.
+
+        Args:
+            run: A pipeline run response to fetch its status.
+            include_steps: If True, also fetch the status of individual steps.
+
+        Raises:
+            NotImplementedError: If any orchestrator inheriting from the base
+                class does not implement this logic.
+        """
+        raise NotImplementedError(
+            "The fetch status functionality is not implemented for the "
+            f"'{self.__class__.__name__}' orchestrator."
+        )
+
+    def stop_run(
+        self, run: "PipelineRunResponse", graceful: bool = False
+    ) -> None:
+        """Stops a specific pipeline run.
+
+        This method should only be called if the orchestrator's
+        supports_cancellation property is True.
+
+        Args:
+            run: A pipeline run response to stop.
+            graceful: If True, allows for graceful shutdown where possible.
+                If False, forces immediate termination. Default is False.
+
+        Raises:
+            NotImplementedError: If any orchestrator inheriting from the base
+                class does not implement this logic.
+            IllegalOperationError: If the run has no orchestrator run id yet.
+        """
+        # Check if the orchestrator supports cancellation
+        if (
+            getattr(self._stop_run, "__func__", None)
+            is BaseOrchestrator._stop_run
+        ):
+            raise NotImplementedError(
+                f"The '{self.__class__.__name__}' orchestrator does not "
+                "support stopping pipeline runs."
+            )
+
+        if not run.orchestrator_run_id:
+            raise IllegalOperationError(
+                "Cannot stop a pipeline run that has no orchestrator run id "
+                "yet."
+            )
+
+        # Update pipeline status to STOPPING before calling concrete implementation
+        publish_pipeline_run_status_update(
+            pipeline_run_id=run.id,
+            status=ExecutionStatus.STOPPING,
+            status_reason="Manual stop requested.",
+        )
+
+        # Now call the concrete implementation
+        self._stop_run(run=run, graceful=graceful)
+
+    def _stop_run(
+        self, run: "PipelineRunResponse", graceful: bool = False
+    ) -> None:
+        """Concrete implementation of pipeline stopping logic.
+
+        This method should be implemented by concrete orchestrator classes
+        instead of stop_run to ensure proper status management.
+
+        Args:
+            run: A pipeline run response to stop (already updated to STOPPING status).
+            graceful: If True, allows for graceful shutdown where possible.
+                If False, forces immediate termination. Default is True.
+
+        Raises:
+            NotImplementedError: If any orchestrator inheriting from the base
+                class does not implement this logic.
+        """
+        raise NotImplementedError(
+            "The stop run functionality is not implemented for the "
+            f"'{self.__class__.__name__}' orchestrator."
+        )
+
+    @property
+    def supports_schedule_updates(self) -> bool:
+        """Whether the orchestrator supports updating schedules.
+
+        Returns:
+            Whether the orchestrator supports updating schedules.
+        """
+        return (
+            getattr(self.update_schedule, "__func__", None)
+            is not BaseOrchestrator.update_schedule
+        )
+
+    @property
+    def supports_schedule_deletion(self) -> bool:
+        """Whether the orchestrator supports deleting schedules.
+
+        Returns:
+            Whether the orchestrator supports deleting schedules.
+        """
+        return (
+            getattr(self.delete_schedule, "__func__", None)
+            is not BaseOrchestrator.delete_schedule
+        )
+
+    def update_schedule(
+        self, schedule: "ScheduleResponse", update: "ScheduleUpdate"
+    ) -> None:
+        """Updates a schedule.
+
+        Args:
+            schedule: The schedule to update.
+            update: The update to apply to the schedule.
+
+        Raises:
+            NotImplementedError: If the functionality is not implemented.
+        """
+        raise NotImplementedError(
+            "Schedule updating is not implemented for the "
+            f"'{self.__class__.__name__}' orchestrator."
+        )
+
+    def delete_schedule(self, schedule: "ScheduleResponse") -> None:
+        """Deletes a schedule.
+
+        Args:
+            schedule: The schedule to delete.
+
+        Raises:
+            NotImplementedError: If the functionality is not implemented.
+        """
+        raise NotImplementedError(
+            "Schedule deletion is not implemented for the "
+            f"'{self.__class__.__name__}' orchestrator."
+        )
 
 
 class BaseOrchestratorFlavor(Flavor):

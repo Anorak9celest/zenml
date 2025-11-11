@@ -26,12 +26,13 @@ import psutil
 from psutil import NoSuchProcess
 from pydantic import Field
 
+from zenml.enums import ServiceState
 from zenml.logger import get_logger
 from zenml.services.local.local_service_endpoint import (
     LocalDaemonServiceEndpoint,
 )
 from zenml.services.service import BaseService, ServiceConfig
-from zenml.services.service_status import ServiceState, ServiceStatus
+from zenml.services.service_status import ServiceStatus
 from zenml.utils.io_utils import create_dir_recursive_if_not_exists
 
 logger = get_logger(__name__)
@@ -413,7 +414,8 @@ class LocalDaemonService(BaseService):
             p = psutil.Process(pid)
         except psutil.Error:
             logger.error(
-                "Could not find process for for service '%s' ...", self
+                "Could not find process for service '%s' ...",
+                self,
             )
             return
         if force:

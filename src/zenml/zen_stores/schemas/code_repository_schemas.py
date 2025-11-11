@@ -14,11 +14,12 @@
 """SQL Model Implementations for code repositories."""
 
 import json
-from datetime import datetime
-from typing import Any, Optional
+from typing import Any, Optional, Sequence
 from uuid import UUID
 
-from sqlalchemy import TEXT, Column
+from sqlalchemy import TEXT, Column, UniqueConstraint
+from sqlalchemy.orm import joinedload
+from sqlalchemy.sql.base import ExecutableOption
 from sqlmodel import Field, Relationship
 
 from zenml.models import (
@@ -30,30 +31,38 @@ from zenml.models import (
     CodeRepositoryResponse,
     CodeRepositoryResponseBody,
     CodeRepositoryResponseMetadata,
+    CodeRepositoryResponseResources,
     CodeRepositoryUpdate,
 )
+from zenml.utils.time_utils import utc_now
 from zenml.zen_stores.schemas.base_schemas import BaseSchema, NamedSchema
+from zenml.zen_stores.schemas.project_schemas import ProjectSchema
 from zenml.zen_stores.schemas.schema_utils import build_foreign_key_field
 from zenml.zen_stores.schemas.user_schemas import UserSchema
-from zenml.zen_stores.schemas.workspace_schemas import WorkspaceSchema
+from zenml.zen_stores.schemas.utils import jl_arg
 
 
 class CodeRepositorySchema(NamedSchema, table=True):
     """SQL Model for code repositories."""
 
     __tablename__ = "code_repository"
+    __table_args__ = (
+        UniqueConstraint(
+            "name",
+            "project_id",
+            name="unique_code_repository_name_in_project",
+        ),
+    )
 
-    workspace_id: UUID = build_foreign_key_field(
+    project_id: UUID = build_foreign_key_field(
         source=__tablename__,
-        target=WorkspaceSchema.__tablename__,
-        source_column="workspace_id",
+        target=ProjectSchema.__tablename__,
+        source_column="project_id",
         target_column="id",
         ondelete="CASCADE",
         nullable=False,
     )
-    workspace: "WorkspaceSchema" = Relationship(
-        back_populates="code_repositories"
-    )
+    project: "ProjectSchema" = Relationship(back_populates="code_repositories")
 
     user_id: Optional[UUID] = build_foreign_key_field(
         source=__tablename__,
@@ -74,6 +83,36 @@ class CodeRepositorySchema(NamedSchema, table=True):
     description: Optional[str] = Field(sa_column=Column(TEXT, nullable=True))
 
     @classmethod
+    def get_query_options(
+        cls,
+        include_metadata: bool = False,
+        include_resources: bool = False,
+        **kwargs: Any,
+    ) -> Sequence[ExecutableOption]:
+        """Get the query options for the schema.
+
+        Args:
+            include_metadata: Whether metadata will be included when converting
+                the schema to a model.
+            include_resources: Whether resources will be included when
+                converting the schema to a model.
+            **kwargs: Keyword arguments to allow schema specific logic
+
+        Returns:
+            A list of query options.
+        """
+        options = []
+
+        if include_resources:
+            options.extend(
+                [
+                    joinedload(jl_arg(CodeRepositorySchema.user)),
+                ]
+            )
+
+        return options
+
+    @classmethod
     def from_request(
         cls, request: "CodeRepositoryRequest"
     ) -> "CodeRepositorySchema":
@@ -87,7 +126,7 @@ class CodeRepositorySchema(NamedSchema, table=True):
         """
         return cls(
             name=request.name,
-            workspace_id=request.workspace,
+            project_id=request.project,
             user_id=request.user,
             config=json.dumps(request.config),
             source=request.source.model_dump_json(),
@@ -113,7 +152,8 @@ class CodeRepositorySchema(NamedSchema, table=True):
             The created CodeRepositoryResponse.
         """
         body = CodeRepositoryResponseBody(
-            user=self.user.to_model() if self.user else None,
+            user_id=self.user_id,
+            project_id=self.project_id,
             source=json.loads(self.source),
             logo_url=self.logo_url,
             created=self.created,
@@ -122,15 +162,22 @@ class CodeRepositorySchema(NamedSchema, table=True):
         metadata = None
         if include_metadata:
             metadata = CodeRepositoryResponseMetadata(
-                workspace=self.workspace.to_model(),
                 config=json.loads(self.config),
                 description=self.description,
             )
+
+        resources = None
+        if include_resources:
+            resources = CodeRepositoryResponseResources(
+                user=self.user.to_model() if self.user else None,
+            )
+
         return CodeRepositoryResponse(
             id=self.id,
             name=self.name,
-            metadata=metadata,
             body=body,
+            metadata=metadata,
+            resources=resources,
         )
 
     def update(self, update: "CodeRepositoryUpdate") -> "CodeRepositorySchema":
@@ -151,7 +198,10 @@ class CodeRepositorySchema(NamedSchema, table=True):
         if update.logo_url:
             self.logo_url = update.logo_url
 
-        self.updated = datetime.utcnow()
+        if update.config:
+            self.config = json.dumps(update.config)
+
+        self.updated = utc_now()
         return self
 
 
@@ -160,15 +210,15 @@ class CodeReferenceSchema(BaseSchema, table=True):
 
     __tablename__ = "code_reference"
 
-    workspace_id: UUID = build_foreign_key_field(
+    project_id: UUID = build_foreign_key_field(
         source=__tablename__,
-        target=WorkspaceSchema.__tablename__,
-        source_column="workspace_id",
+        target=ProjectSchema.__tablename__,
+        source_column="project_id",
         target_column="id",
         ondelete="CASCADE",
         nullable=False,
     )
-    workspace: "WorkspaceSchema" = Relationship()
+    project: "ProjectSchema" = Relationship()
 
     code_repository_id: UUID = build_foreign_key_field(
         source=__tablename__,
@@ -185,19 +235,19 @@ class CodeReferenceSchema(BaseSchema, table=True):
 
     @classmethod
     def from_request(
-        cls, request: "CodeReferenceRequest", workspace_id: UUID
+        cls, request: "CodeReferenceRequest", project_id: UUID
     ) -> "CodeReferenceSchema":
         """Convert a `CodeReferenceRequest` to a `CodeReferenceSchema`.
 
         Args:
             request: The request model to convert.
-            workspace_id: The workspace ID.
+            project_id: The project ID.
 
         Returns:
             The converted schema.
         """
         return cls(
-            workspace_id=workspace_id,
+            project_id=project_id,
             commit=request.commit,
             subdirectory=request.subdirectory,
             code_repository_id=request.code_repository,

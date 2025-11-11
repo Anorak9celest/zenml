@@ -25,23 +25,30 @@ from types import BuiltinFunctionType, FunctionType, ModuleType
 from typing import (
     Any,
     Callable,
+    Dict,
     Iterator,
     Optional,
     Type,
     Union,
-    cast,
 )
+from uuid import UUID
 
 from zenml.config.source import (
     CodeRepositorySource,
     DistributionPackageSource,
+    NotebookSource,
     Source,
     SourceType,
 )
+from zenml.constants import ENV_ZENML_CUSTOM_SOURCE_ROOT
 from zenml.environment import Environment
 from zenml.logger import get_logger
+from zenml.utils import notebook_utils
 
 logger = get_logger(__name__)
+
+ZENML_SOURCE_ATTRIBUTE_NAME = "__zenml_source__"
+
 NoneType = type(None)
 NoneTypeSource = Source(
     module=NoneType.__module__, attribute="NoneType", type=SourceType.BUILTIN
@@ -57,7 +64,14 @@ BuiltinFunctionTypeSource = Source(
     type=SourceType.BUILTIN,
 )
 
-_CUSTOM_SOURCE_ROOT: Optional[str] = None
+
+_CUSTOM_SOURCE_ROOT: Optional[str] = os.getenv(
+    ENV_ZENML_CUSTOM_SOURCE_ROOT, None
+)
+
+_SHARED_TEMPDIR: Optional[str] = None
+_resolved_notebook_sources: Dict[str, str] = {}
+_notebook_modules: Dict[str, UUID] = {}
 
 
 def load(source: Union[Source, str]) -> Any:
@@ -102,12 +116,30 @@ def load(source: Union[Source, str]) -> Any:
                     source.version,
                     source.import_path,
                 )
+    elif source.type == SourceType.NOTEBOOK:
+        if Environment.in_notebook():
+            # If we're in a notebook, we don't need to do anything as the
+            # loading from the __main__ module should work just fine.
+            pass
+        else:
+            notebook_source = NotebookSource.model_validate(dict(source))
+            return _try_to_load_notebook_source(notebook_source)
     elif source.type in {SourceType.USER, SourceType.UNKNOWN}:
         # Unknown source might also refer to a user file, include source
         # root in python path just to be sure
         import_root = get_source_root()
 
-    module = _load_module(module_name=source.module, import_root=import_root)
+    if _should_load_from_main_module(source):
+        # This source points to the __main__ module of the current process.
+        # If we were to load the module here, we would load the same python
+        # file with a different module name, which would rerun all top-level
+        # code. To avoid this, we instead load the source from the __main__
+        # module which is already loaded.
+        module = sys.modules["__main__"]
+    else:
+        module = _load_module(
+            module_name=source.module, import_root=import_root
+        )
 
     if source.attribute:
         obj = getattr(module, source.attribute)
@@ -149,6 +181,9 @@ def resolve(
         return FunctionTypeSource
     elif obj is BuiltinFunctionType:
         return BuiltinFunctionTypeSource
+    elif source := getattr(obj, ZENML_SOURCE_ATTRIBUTE_NAME, None):
+        assert isinstance(source, Source)
+        return source
     elif isinstance(obj, ModuleType):
         module = obj
         attribute_name = None
@@ -190,7 +225,7 @@ def resolve(
             subdir = PurePath(source_root).relative_to(local_repo_context.root)
 
             return CodeRepositorySource(
-                repository_id=local_repo_context.code_repository_id,
+                repository_id=local_repo_context.code_repository.id,
                 commit=local_repo_context.current_commit,
                 subdirectory=subdir.as_posix(),
                 module=module_name,
@@ -213,38 +248,41 @@ def resolve(
         else:
             # Fallback to an unknown source if we can't find the package
             source_type = SourceType.UNKNOWN
+    elif source_type == SourceType.NOTEBOOK:
+        source = NotebookSource(
+            module="__main__",
+            attribute=attribute_name,
+            type=source_type,
+        )
+
+        if module_name in _notebook_modules:
+            source.replacement_module = module_name
+            source.artifact_store_id = _notebook_modules[module_name]
+        elif cell_code := notebook_utils.load_notebook_cell_code(obj):
+            replacement_module = (
+                notebook_utils.compute_cell_replacement_module_name(
+                    cell_code=cell_code
+                )
+            )
+            source.replacement_module = replacement_module
+            _resolved_notebook_sources[source.import_path] = cell_code
+
+        return source
 
     return Source(
         module=module_name, attribute=attribute_name, type=source_type
     )
 
 
-def get_source_root() -> str:
-    """Get the source root.
-
-    The source root will be determined in the following order:
-    - The manually specified custom source root if it was set.
-    - The ZenML repository directory if one exists in the current working
-      directory or any parent directories.
-    - The parent directory of the main module file.
-
-    Returns:
-        The source root.
+def get_implicit_source_root() -> str:
+    """Get the implicit source root (the parent directory of the main module).
 
     Raises:
         RuntimeError: If the main module file can't be found.
+
+    Returns:
+        The implicit source root.
     """
-    if _CUSTOM_SOURCE_ROOT:
-        logger.debug("Using custom source root: %s", _CUSTOM_SOURCE_ROOT)
-        return _CUSTOM_SOURCE_ROOT
-
-    from zenml.client import Client
-
-    repo_root = Client.find_repository()
-    if repo_root:
-        logger.debug("Using repository root as source root: %s", repo_root)
-        return str(repo_root.resolve())
-
     main_module = sys.modules.get("__main__")
     if main_module is None:
         raise RuntimeError(
@@ -258,13 +296,42 @@ def get_source_root() -> str:
             "have an associated file. This could be because you're running in "
             "an interactive Python environment. If you are trying to run from "
             "within a Jupyter notebook, please run `zenml init` from the root "
-            "where your notebook is located and restart your notebook server.   "
+            "where your notebook is located and restart your notebook server."
         )
 
     path = Path(main_module.__file__).resolve().parent
-
-    logger.debug("Using main module parent directory as source root: %s", path)
     return str(path)
+
+
+def get_source_root() -> str:
+    """Get the source root.
+
+    The source root will be determined in the following order:
+    - The manually specified custom source root if it was set.
+    - The ZenML repository directory if one exists in the current working
+      directory or any parent directories.
+    - The parent directory of the main module file.
+
+    Returns:
+        The source root.
+    """
+    if _CUSTOM_SOURCE_ROOT:
+        logger.debug("Using custom source root: %s", _CUSTOM_SOURCE_ROOT)
+        return _CUSTOM_SOURCE_ROOT
+
+    from zenml.client import Client
+
+    repo_root = Client.find_repository()
+    if repo_root:
+        logger.debug("Using repository root as source root: %s", repo_root)
+        return str(repo_root.resolve())
+
+    implicit_source_root = get_implicit_source_root()
+    logger.debug(
+        "Using main module parent directory as source root: %s",
+        implicit_source_root,
+    )
+    return implicit_source_root
 
 
 def set_custom_source_root(source_root: Optional[str]) -> None:
@@ -355,11 +422,14 @@ def get_source_type(module: ModuleType) -> SourceType:
     Returns:
         The source type.
     """
+    if module.__name__ in _notebook_modules:
+        return SourceType.NOTEBOOK
+
     try:
         file_path = inspect.getfile(module)
     except (TypeError, OSError):
         if module.__name__ == "__main__" and Environment.in_notebook():
-            return SourceType.USER
+            return SourceType.NOTEBOOK
 
         return SourceType.BUILTIN
 
@@ -423,7 +493,7 @@ def _warn_about_potential_source_loading_issues(
             source.repository_id,
             get_source_root(),
         )
-    elif local_repo.code_repository_id != source.repository_id:
+    elif local_repo.code_repository.id != source.repository_id:
         logger.warning(
             "Potential issue when loading the source `%s`: The source "
             "references the code repository `%s` but there is a different "
@@ -433,7 +503,7 @@ def _warn_about_potential_source_loading_issues(
             "source was originally stored.",
             source.import_path,
             source.repository_id,
-            local_repo.code_repository_id,
+            local_repo.code_repository.id,
             get_source_root(),
         )
     elif local_repo.current_commit != source.commit:
@@ -526,6 +596,113 @@ def _load_module(
         return importlib.import_module(module_name)
 
 
+def _get_shared_temp_dir() -> str:
+    """Get path to a shared temporary directory.
+
+    Returns:
+        Path to a shared temporary directory.
+    """
+    global _SHARED_TEMPDIR
+
+    if not _SHARED_TEMPDIR:
+        import tempfile
+
+        _SHARED_TEMPDIR = tempfile.mkdtemp()
+
+    return _SHARED_TEMPDIR
+
+
+def _try_to_load_notebook_source(source: NotebookSource) -> Any:
+    """Helper function to load a notebook source outside of a notebook.
+
+    Args:
+        source: The source to load.
+
+    Raises:
+        RuntimeError: If the source can't be loaded.
+        FileNotFoundError: If the file containing the notebook cell code can't
+            be found.
+
+    Returns:
+        The loaded object.
+    """
+    if not source.replacement_module:
+        raise RuntimeError(
+            f"Failed to load {source.import_path}. This object was defined in "
+            "a notebook and you're trying to load it outside of a notebook. "
+            "This is currently only enabled for ZenML steps and materializers. "
+            "To enable this for your custom classes or functions, use the "
+            "`zenml.utils.notebook_utils.enable_notebook_code_extraction` "
+            "decorator."
+        )
+
+    extract_dir = _get_shared_temp_dir()
+    file_name = f"{source.replacement_module}.py"
+    file_path = os.path.join(extract_dir, file_name)
+
+    if not os.path.exists(file_path):
+        from zenml.client import Client
+        from zenml.utils import code_utils
+
+        artifact_store = Client().active_stack.artifact_store
+
+        if (
+            source.artifact_store_id
+            and source.artifact_store_id != artifact_store.id
+        ):
+            raise RuntimeError(
+                "Notebook cell code not stored in active artifact store."
+            )
+
+        logger.info(
+            "Downloading notebook cell content to load `%s`.",
+            source.import_path,
+        )
+
+        try:
+            code_utils.download_notebook_code(
+                artifact_store=artifact_store,
+                file_name=file_name,
+                download_path=file_path,
+            )
+        except FileNotFoundError:
+            if not source.artifact_store_id:
+                raise FileNotFoundError(
+                    "Unable to find notebook code file. This might be because "
+                    "the file is stored in a different artifact store."
+                )
+
+            raise
+        else:
+            _notebook_modules[source.replacement_module] = artifact_store.id
+    try:
+        module = _load_module(
+            module_name=source.replacement_module, import_root=extract_dir
+        )
+    except ImportError:
+        raise RuntimeError(
+            f"Unable to load {source.import_path}. This object was defined in "
+            "a notebook and you're trying to load it outside of a notebook. "
+            "To enable this, ZenML extracts the code of your cell into a "
+            "python file. This means your cell code needs to be "
+            "self-contained:\n"
+            "  * All required imports must be done in this cell, even if the "
+            "same imports already happen in previous notebook cells.\n"
+            "  * The cell can't use any code defined in other notebook cells."
+        )
+
+    if source.attribute:
+        obj = getattr(module, source.attribute)
+    else:
+        obj = module
+
+    # Store the original notebook source so resolving this object works as
+    # expected
+    setattr(obj, ZENML_SOURCE_ATTRIBUTE_NAME, source)
+
+    return obj
+
+
 def _get_package_for_module(module_name: str) -> Optional[str]:
     """Get the package name for a module.
 
@@ -535,10 +712,7 @@ def _get_package_for_module(module_name: str) -> Optional[str]:
     Returns:
         The package name or None if no package was found.
     """
-    if sys.version_info < (3, 10):
-        from importlib_metadata import packages_distributions
-    else:
-        from importlib.metadata import packages_distributions
+    from importlib.metadata import packages_distributions
 
     top_level_module = module_name.split(".", maxsplit=1)[0]
     package_names = packages_distributions().get(top_level_module, [])
@@ -559,12 +733,7 @@ def _get_package_version(package_name: str) -> Optional[str]:
     Returns:
         The package version or None if fetching the version failed.
     """
-    if sys.version_info < (3, 10):
-        from importlib_metadata import PackageNotFoundError, version
-
-        version = cast(Callable[..., str], version)
-    else:
-        from importlib.metadata import PackageNotFoundError, version
+    from importlib.metadata import PackageNotFoundError, version
 
     try:
         return version(distribution_name=package_name)
@@ -623,3 +792,31 @@ def validate_source_class(
         return True
     else:
         return False
+
+
+def get_resolved_notebook_sources() -> Dict[str, str]:
+    """Get all notebook sources that were resolved in this process.
+
+    Returns:
+        Dictionary mapping the import path of notebook sources to the code
+        of their notebook cell.
+    """
+    return _resolved_notebook_sources.copy()
+
+
+def _should_load_from_main_module(source: Source) -> bool:
+    """Check whether the source should be loaded from the main module.
+
+    Args:
+        source: The source to check.
+
+    Returns:
+        If the source should be loaded from the main module instead of the
+        module defined in the source object.
+    """
+    try:
+        resolved_main_module = _resolve_module(sys.modules["__main__"])
+    except RuntimeError:
+        return False
+
+    return resolved_main_module == source.module

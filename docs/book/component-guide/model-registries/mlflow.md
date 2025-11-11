@@ -4,7 +4,7 @@ description: Managing MLFlow logged models and artifacts
 
 # MLflow Model Registry
 
-[MLflow](https://www.mlflow.org/docs/latest/tracking.html) is a popular tool that helps you track experiments, manage models and even deploy them to different environments. ZenML already provides a [MLflow Experiment Tracker](../experiment-trackers/mlflow.md) that you can use to track your experiments, and an [MLflow Model Deployer](../model-deployers/mlflow.md) that you can use to deploy your models locally.
+[MLflow](https://www.mlflow.org/docs/latest/tracking.html) is a popular tool that helps you track experiments, manage models and even deploy them to different environments. ZenML already provides a [MLflow Experiment Tracker](https://docs.zenml.io/stacks/experiment-trackers/mlflow) that you can use to track your experiments, and an [MLflow Model Deployer](https://docs.zenml.io/stacks/model-deployers/mlflow) that you can use to deploy your models locally.
 
 The MLflow model registry uses [the MLflow model registry service](https://mlflow.org/docs/latest/model-registry.html) to manage and track ML models and their artifacts and provides a user interface to browse them:
 
@@ -23,7 +23,7 @@ This is particularly useful in the following scenarios:
 
 ## How do you deploy it?
 
-The MLflow Experiment Tracker flavor is provided by the MLflow ZenML integration, so you need to install it on your local machine to be able to register an MLflow model registry component. Note that the MLFlow model registry requires [MLFlow Experiment Tracker](../experiment-trackers/mlflow.md) to be present in the stack.
+The MLflow Experiment Tracker flavor is provided by the MLflow ZenML integration, so you need to install it on your local machine to be able to register an MLflow model registry component. Note that the MLFlow model registry requires [MLFlow Experiment Tracker](https://docs.zenml.io/stacks/experiment-trackers/mlflow) to be present in the stack.
 
 ```shell
 zenml integration install mlflow -y
@@ -70,7 +70,7 @@ def mlflow_registry_training_pipeline():
 ```
 
 {% hint style="warning" %}
-The `mlflow_register_model_step` expects that the `model` it receives has already been logged to MLflow in a previous step. E.g., for a scikit-learn model, you would need to have used `mlflow.sklearn.autolog()` or `mlflow.sklearn.log_model(model)` in a previous step. See the [MLflow experiment tracker documentation](../experiment-trackers/mlflow.md) for more information on how to log models to MLflow from your ZenML steps.
+The `mlflow_register_model_step` expects that the `model` it receives has already been logged to MLflow in a previous step. E.g., for a scikit-learn model, you would need to have used `mlflow.sklearn.autolog()` or `mlflow.sklearn.log_model(model)` in a previous step. See the [MLflow experiment tracker documentation](https://docs.zenml.io/stacks/experiment-trackers/mlflow) for more information on how to log models to MLflow from your ZenML steps.
 {% endhint %}
 
 #### List of available parameters
@@ -114,7 +114,7 @@ zenml model-registry models register-version Tensorflow-model \
 
 ### Deploy a registered model
 
-After you have registered a model in the MLflow model registry, you can also easily deploy it as a prediction service. Checkout the [MLflow model deployer documentation](../model-deployers/mlflow.md#deploy-from-model-registry) for more information on how to do that.
+After you have registered a model in the MLflow model registry, you can also easily deploy it as a prediction service. Checkout the [MLflow model deployer documentation](https://docs.zenml.io/stacks/model-deployers/mlflow#deploy-from-model-registry) for more information on how to do that.
 
 ### Interact with registered models
 
@@ -140,13 +140,13 @@ $ zenml model-registry models list-versions tensorflow-mnist-model
 ┃          NAME          │ MODEL_VERSION │ VERSION_DESCRIPTION                     │ METADATA                                                                                                                                                                             ┃
 ┠────────────────────────┼───────────────┼─────────────────────────────────────────┼──────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────┨
 ┃ tensorflow-mnist-model │ 3             │ Run #3 of the mlflow_training_pipeline. │ {'zenml_version': '0.34.0', 'zenml_run_name': 'mlflow_training_pipeline-2023_03_01-08_09_23_672599', 'zenml_pipeline_name': 'mlflow_training_pipeline',                       ┃
-┃                        │               │                                         │ 'zenml_pipeline_run_uuid': 'a5d4faae-ef70-48f2-9893-6e65d5e51e98', 'zenml_workspace': '10e060b3-2f7e-463d-9ec8-3a211ef4e1f6', 'epochs': '5', 'optimizer': 'Adam', 'lr': '0.005'}     ┃
+┃                        │               │                                         │ 'zenml_pipeline_run_uuid': 'a5d4faae-ef70-48f2-9893-6e65d5e51e98', 'epochs': '5', 'optimizer': 'Adam', 'lr': '0.005'}     ┃
 ┠────────────────────────┼───────────────┼─────────────────────────────────────────┼──────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────┨
 ┃ tensorflow-mnist-model │ 2             │ Run #2 of the mlflow_training_pipeline. │ {'zenml_version': '0.34.0', 'zenml_run_name': 'mlflow_training_pipeline-2023_03_01-08_09_08_467212', 'zenml_pipeline_name': 'mlflow_training_pipeline',                       ┃
-┃                        │               │                                         │ 'zenml_pipeline_run_uuid': '11858dcf-3e47-4b1a-82c5-6fa25ba4e037', 'zenml_workspace': '10e060b3-2f7e-463d-9ec8-3a211ef4e1f6', 'epochs': '5', 'optimizer': 'Adam', 'lr': '0.003'}     ┃
+┃                        │               │                                         │ 'zenml_pipeline_run_uuid': '11858dcf-3e47-4b1a-82c5-6fa25ba4e037', 'epochs': '5', 'optimizer': 'Adam', 'lr': '0.003'}     ┃
 ┠────────────────────────┼───────────────┼─────────────────────────────────────────┼──────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────┨
 ┃ tensorflow-mnist-model │ 1             │ Run #1 of the mlflow_training_pipeline. │ {'zenml_version': '0.34.0', 'zenml_run_name': 'mlflow_training_pipeline-2023_03_01-08_08_52_398499', 'zenml_pipeline_name': 'mlflow_training_pipeline',                       ┃
-┃                        │               │                                         │ 'zenml_pipeline_run_uuid': '29fb22c1-6e0b-4431-9e04-226226506d16', 'zenml_workspace': '10e060b3-2f7e-463d-9ec8-3a211ef4e1f6', 'epochs': '5', 'optimizer': 'Adam', 'lr': '0.001'}     ┃
+┃                        │               │                                         │ 'zenml_pipeline_run_uuid': '29fb22c1-6e0b-4431-9e04-226226506d16', 'epochs': '5', 'optimizer': 'Adam', 'lr': '0.001'}     ┃
 ┗━━━━━━━━━━━━━━━━━━━━━━━━┷━━━━━━━━━━━━━━━┷━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━┷━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━┛
 ```
 
@@ -169,7 +169,7 @@ $ zenml model-registry models get-version tensorflow-mnist-model -v 1
 ┃ UPDATED_AT             │ 2023-03-01 09:09:06.899000                                                                                                                                                                                                                     ┃
 ┠────────────────────────┼────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────┨
 ┃ METADATA               │ {'zenml_version': '0.34.0', 'zenml_run_name': 'mlflow_training_pipeline-2023_03_01-08_08_52_398499', 'zenml_pipeline_name': 'mlflow_training_pipeline', 'zenml_pipeline_run_uuid': '29fb22c1-6e0b-4431-9e04-226226506d16',              ┃
-┃                        │ 'zenml_workspace': '10e060b3-2f7e-463d-9ec8-3a211ef4e1f6', 'lr': '0.001', 'epochs': '5', 'optimizer': 'Adam'}                                                                                                                                  ┃
+┃                        │ 'lr': '0.001', 'epochs': '5', 'optimizer': 'Adam'}                                                                                                                                  ┃
 ┠────────────────────────┼────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────┨
 ┃ MODEL_SOURCE_URI       │ file:///Users/safoine-zenml/Library/Application Support/zenml/local_stores/0902a511-117d-4152-a098-b2f1124c4493/mlruns/489728212459131640/293a0d2e71e046999f77a79639f6eac2/artifacts/model                                                     ┃
 ┠────────────────────────┼────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────┨
@@ -179,6 +179,6 @@ $ zenml model-registry models get-version tensorflow-mnist-model -v 1
 
 Finally, to delete a registered model or a specific model version, you can use the `zenml model-registry models delete REGISTERED_MODEL_NAME` and `zenml model-registry models delete-version REGISTERED_MODEL_NAME -v VERSION` commands respectively.
 
-Check out the [SDK docs](https://sdkdocs.zenml.io/latest/integration\_code\_docs/integrations-mlflow/#zenml.integrations.mlflow.model\_registry.MLFlowModelRegistry) to see more about the interface and implementation.
+Check out the [SDK docs](https://sdkdocs.zenml.io/latest/integration_code_docs/integrations-mlflow.html#zenml.integrations.mlflow) to see more about the interface and implementation.
 
 <figure><img src="https://static.scarf.sh/a.png?x-pxid=f0b4f458-0a54-4fcd-aa95-d5ee424815bc" alt="ZenML Scarf"><figcaption></figcaption></figure>

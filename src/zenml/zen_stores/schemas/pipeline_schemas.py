@@ -13,63 +13,64 @@
 #  permissions and limitations under the License.
 """SQL Model Implementations for Pipelines and Pipeline Runs."""
 
-import json
-from datetime import datetime
-from typing import TYPE_CHECKING, Any, List, Optional
+from typing import TYPE_CHECKING, Any, List, Optional, Sequence
 from uuid import UUID
 
-from sqlalchemy import TEXT, Column, String
-from sqlalchemy.dialects.mysql import MEDIUMTEXT
-from sqlmodel import Field, Relationship
+from sqlalchemy import TEXT, Column, UniqueConstraint
+from sqlalchemy.orm import joinedload, object_session, selectinload
+from sqlalchemy.sql.base import ExecutableOption
+from sqlmodel import Field, Relationship, desc, select
 
-from zenml.config.pipeline_spec import PipelineSpec
-from zenml.constants import MEDIUMTEXT_MAX_LENGTH
+from zenml.enums import TaggableResourceTypes, VisualizationResourceTypes
 from zenml.models import (
     PipelineRequest,
     PipelineResponse,
     PipelineResponseBody,
     PipelineResponseMetadata,
+    PipelineResponseResources,
     PipelineUpdate,
 )
+from zenml.utils.time_utils import utc_now
 from zenml.zen_stores.schemas.base_schemas import NamedSchema
+from zenml.zen_stores.schemas.project_schemas import ProjectSchema
 from zenml.zen_stores.schemas.schema_utils import build_foreign_key_field
 from zenml.zen_stores.schemas.user_schemas import UserSchema
-from zenml.zen_stores.schemas.workspace_schemas import WorkspaceSchema
+from zenml.zen_stores.schemas.utils import jl_arg
 
 if TYPE_CHECKING:
+    from zenml.zen_stores.schemas.curated_visualization_schemas import (
+        CuratedVisualizationSchema,
+    )
     from zenml.zen_stores.schemas.pipeline_build_schemas import (
         PipelineBuildSchema,
     )
-    from zenml.zen_stores.schemas.pipeline_deployment_schemas import (
-        PipelineDeploymentSchema,
-    )
     from zenml.zen_stores.schemas.pipeline_run_schemas import PipelineRunSchema
+    from zenml.zen_stores.schemas.pipeline_snapshot_schemas import (
+        PipelineSnapshotSchema,
+    )
     from zenml.zen_stores.schemas.schedule_schema import ScheduleSchema
+    from zenml.zen_stores.schemas.tag_schemas import TagSchema
 
 
 class PipelineSchema(NamedSchema, table=True):
     """SQL Model for pipelines."""
 
     __tablename__ = "pipeline"
-
-    # Fields
-    version: str
-    version_hash: str
-    docstring: Optional[str] = Field(sa_column=Column(TEXT, nullable=True))
-    spec: str = Field(
-        sa_column=Column(
-            String(length=MEDIUMTEXT_MAX_LENGTH).with_variant(
-                MEDIUMTEXT, "mysql"
-            ),
-            nullable=False,
-        )
+    __table_args__ = (
+        UniqueConstraint(
+            "name",
+            "project_id",
+            name="unique_pipeline_name_in_project",
+        ),
     )
+    # Fields
+    description: Optional[str] = Field(sa_column=Column(TEXT, nullable=True))
 
     # Foreign keys
-    workspace_id: UUID = build_foreign_key_field(
+    project_id: UUID = build_foreign_key_field(
         source=__tablename__,
-        target=WorkspaceSchema.__tablename__,
-        source_column="workspace_id",
+        target=ProjectSchema.__tablename__,
+        source_column="project_id",
         target_column="id",
         ondelete="CASCADE",
         nullable=False,
@@ -85,18 +86,99 @@ class PipelineSchema(NamedSchema, table=True):
 
     # Relationships
     user: Optional["UserSchema"] = Relationship(back_populates="pipelines")
-    workspace: "WorkspaceSchema" = Relationship(back_populates="pipelines")
+    project: "ProjectSchema" = Relationship(back_populates="pipelines")
 
     schedules: List["ScheduleSchema"] = Relationship(
         back_populates="pipeline",
     )
-    runs: List["PipelineRunSchema"] = Relationship(back_populates="pipeline")
     builds: List["PipelineBuildSchema"] = Relationship(
         back_populates="pipeline"
     )
-    deployments: List["PipelineDeploymentSchema"] = Relationship(
+    snapshots: List["PipelineSnapshotSchema"] = Relationship(
         back_populates="pipeline",
+        sa_relationship_kwargs={"cascade": "delete"},
     )
+    tags: List["TagSchema"] = Relationship(
+        sa_relationship_kwargs=dict(
+            primaryjoin=f"and_(foreign(TagResourceSchema.resource_type)=='{TaggableResourceTypes.PIPELINE.value}', foreign(TagResourceSchema.resource_id)==PipelineSchema.id)",
+            secondary="tag_resource",
+            secondaryjoin="TagSchema.id == foreign(TagResourceSchema.tag_id)",
+            order_by="TagSchema.name",
+            overlaps="tags",
+        ),
+    )
+    visualizations: List["CuratedVisualizationSchema"] = Relationship(
+        sa_relationship_kwargs=dict(
+            primaryjoin=(
+                "and_(CuratedVisualizationSchema.resource_type"
+                f"=='{VisualizationResourceTypes.PIPELINE.value}', "
+                "foreign(CuratedVisualizationSchema.resource_id)==PipelineSchema.id)"
+            ),
+            overlaps="visualizations",
+            cascade="delete",
+            order_by="CuratedVisualizationSchema.display_order",
+        ),
+    )
+
+    @property
+    def latest_run(self) -> Optional["PipelineRunSchema"]:
+        """Fetch the latest run for this pipeline.
+
+        Raises:
+            RuntimeError: If no session for the schema exists.
+
+        Returns:
+            The latest run for this pipeline.
+        """
+        from zenml.zen_stores.schemas import PipelineRunSchema
+
+        if session := object_session(self):
+            return (
+                session.execute(
+                    select(PipelineRunSchema)
+                    .where(PipelineRunSchema.pipeline_id == self.id)
+                    .order_by(desc(PipelineRunSchema.created))
+                    .limit(1)
+                )
+                .scalars()
+                .one_or_none()
+            )
+        else:
+            raise RuntimeError(
+                "Missing DB session to fetch latest run for pipeline."
+            )
+
+    @classmethod
+    def get_query_options(
+        cls,
+        include_metadata: bool = False,
+        include_resources: bool = False,
+        **kwargs: Any,
+    ) -> Sequence[ExecutableOption]:
+        """Get the query options for the schema.
+
+        Args:
+            include_metadata: Whether metadata will be included when converting
+                the schema to a model.
+            include_resources: Whether resources will be included when
+                converting the schema to a model.
+            **kwargs: Keyword arguments to allow schema specific logic
+
+        Returns:
+            A list of query options.
+        """
+        options = []
+
+        if include_resources:
+            options.extend(
+                [
+                    joinedload(jl_arg(PipelineSchema.user)),
+                    # joinedload(jl_arg(PipelineSchema.tags)),
+                    selectinload(jl_arg(PipelineSchema.visualizations)),
+                ]
+            )
+
+        return options
 
     @classmethod
     def from_request(
@@ -113,21 +195,15 @@ class PipelineSchema(NamedSchema, table=True):
         """
         return cls(
             name=pipeline_request.name,
-            version=pipeline_request.version,
-            version_hash=pipeline_request.version_hash,
-            workspace_id=pipeline_request.workspace,
+            description=pipeline_request.description,
+            project_id=pipeline_request.project,
             user_id=pipeline_request.user,
-            docstring=pipeline_request.docstring,
-            spec=json.dumps(
-                pipeline_request.spec.model_dump(mode="json"), sort_keys=True
-            ),
         )
 
     def to_model(
         self,
         include_metadata: bool = False,
         include_resources: bool = False,
-        last_x_runs: int = 3,
         **kwargs: Any,
     ) -> "PipelineResponse":
         """Convert a `PipelineSchema` to a `PipelineResponse`.
@@ -136,25 +212,43 @@ class PipelineSchema(NamedSchema, table=True):
             include_metadata: Whether the metadata will be filled.
             include_resources: Whether the resources will be filled.
             **kwargs: Keyword arguments to allow schema specific logic
-            last_x_runs: How many runs to use for the execution status
 
         Returns:
             The created PipelineResponse.
         """
         body = PipelineResponseBody(
-            user=self.user.to_model() if self.user else None,
-            status=[run.status for run in self.runs[:last_x_runs]],
+            user_id=self.user_id,
+            project_id=self.project_id,
             created=self.created,
             updated=self.updated,
-            version=self.version,
         )
+
         metadata = None
         if include_metadata:
             metadata = PipelineResponseMetadata(
-                workspace=self.workspace.to_model(),
-                version_hash=self.version_hash,
-                spec=PipelineSpec.model_validate_json(self.spec),
-                docstring=self.docstring,
+                description=self.description,
+            )
+
+        resources = None
+        if include_resources:
+            latest_run = self.latest_run
+            latest_run_user = latest_run.user if latest_run else None
+
+            resources = PipelineResponseResources(
+                user=self.user.to_model() if self.user else None,
+                latest_run_user=latest_run_user.to_model()
+                if latest_run_user
+                else None,
+                latest_run_id=latest_run.id if latest_run else None,
+                latest_run_status=latest_run.status if latest_run else None,
+                tags=[tag.to_model() for tag in self.tags],
+                visualizations=[
+                    visualization.to_model(
+                        include_metadata=False,
+                        include_resources=False,
+                    )
+                    for visualization in self.visualizations
+                ],
             )
 
         return PipelineResponse(
@@ -162,6 +256,7 @@ class PipelineSchema(NamedSchema, table=True):
             name=self.name,
             body=body,
             metadata=metadata,
+            resources=resources,
         )
 
     def update(self, pipeline_update: "PipelineUpdate") -> "PipelineSchema":
@@ -173,5 +268,6 @@ class PipelineSchema(NamedSchema, table=True):
         Returns:
             The updated `PipelineSchema`.
         """
-        self.updated = datetime.utcnow()
+        self.description = pipeline_update.description
+        self.updated = utc_now()
         return self

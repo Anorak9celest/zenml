@@ -20,6 +20,7 @@ import yaml
 
 from zenml import get_step_context, pipeline, step
 from zenml.client import Client
+from zenml.enums import ExecutionMode
 from zenml.model.model import Model
 
 
@@ -94,7 +95,9 @@ def test_pipeline_config_from_file_not_overridden_for_extra(
     p = assert_extra_pipeline.with_options(config_path=str(config_path))
     assert p.configuration.extra == {"a": 1}
 
-    with patch("zenml.new.pipelines.pipeline.logger.warning") as warning:
+    with patch(
+        "zenml.pipelines.pipeline_definition.logger.warning"
+    ) as warning:
         p.configure(extra={"a": 2})
         warning.assert_called_once()
 
@@ -124,10 +127,14 @@ def test_pipeline_config_from_file_not_overridden_for_model(
     def assert_model_pipeline():
         assert_model_step()
 
-    p = assert_model_pipeline.with_options(config_path=str(config_path))
+    p = assert_model_pipeline.with_options(
+        config_path=str(config_path), execution_mode=ExecutionMode.FAIL_FAST
+    )
     assert p.configuration.model.name == "bar"
 
-    with patch("zenml.new.pipelines.pipeline.logger.warning") as warning:
+    with patch(
+        "zenml.pipelines.pipeline_definition.logger.warning"
+    ) as warning:
         p.configure(
             model=Model(
                 name="foo",
@@ -160,6 +167,32 @@ def test_pipeline_config_from_file_not_overridden_for_model(
         p()
 
 
+def test_pipeline_config_from_file_appended_by_code(
+    clean_client: "Client", tmp_path
+):
+    """Test that the pipeline can be configured by both
+    YAML file and Python code for non-overlapping configurations.
+
+    Here we set Extra from the YAML and Model from the code.
+    """
+    config_path = tmp_path / "config.yaml"
+    file_config = dict(run_name="run_name_in_file", extra={"a": 1})
+    config_path.write_text(yaml.dump(file_config))
+
+    @pipeline(enable_cache=False)
+    def assert_extra_pipeline():
+        assert_extra_step()
+
+    p = assert_extra_pipeline.with_options(config_path=str(config_path))
+    with patch(
+        "zenml.pipelines.pipeline_definition.logger.warning"
+    ) as warning:
+        p.configure(model=Model(name="foo"))
+        warning.assert_not_called()
+
+    p()
+
+
 def test_pipeline_config_from_file_not_warns_on_new_value(
     clean_client: "Client", tmp_path
 ):
@@ -177,7 +210,9 @@ def test_pipeline_config_from_file_not_warns_on_new_value(
     p = assert_extra_pipeline.with_options(config_path=str(config_path))
     assert p.configuration.extra == {}
 
-    with patch("zenml.new.pipelines.pipeline.logger.warning") as warning:
+    with patch(
+        "zenml.pipelines.pipeline_definition.logger.warning"
+    ) as warning:
         p.configure(extra={"a": 1})
         warning.assert_not_called()
 
@@ -204,7 +239,7 @@ def assert_input_params_with_defaults(
 
 
 def test_pipeline_config_from_file_works_with_pipeline_parameters(
-    clean_workspace, tmp_path
+    clean_project, tmp_path
 ):
     """Test that the pipeline can be configured with parameters
     from a yaml file.
@@ -221,7 +256,9 @@ def test_pipeline_config_from_file_works_with_pipeline_parameters(
     assert p.configuration.parameters == {"foo": "bar"}
 
     # this configuration would be not efficient and overridden by config with warning
-    with patch("zenml.new.pipelines.pipeline.logger.warning") as warning:
+    with patch(
+        "zenml.pipelines.pipeline_definition.logger.warning"
+    ) as warning:
         p.configure(parameters={"foo": 1})
         warning.assert_called_once()
 
@@ -232,7 +269,7 @@ def test_pipeline_config_from_file_works_with_pipeline_parameters(
 
 
 def test_pipeline_config_from_file_fails_with_pipeline_parameters_on_conflict_with_step_parameters(
-    clean_workspace, tmp_path
+    clean_project, tmp_path
 ):
     """Test that the pipeline will fail with error, if configured with parameters
     from a yaml file for the steps and same parameters are passed over in code.
@@ -258,14 +295,14 @@ def test_pipeline_config_from_file_fails_with_pipeline_parameters_on_conflict_wi
 
     with pytest.raises(
         RuntimeError,
-        match="Configured parameter for the step `assert_input_params` "
+        match="Configured parameter for the step 'assert_input_params' "
         "conflict with parameter passed in runtime",
     ):
         p()
 
 
 def test_pipeline_config_from_file_fails_with_pipeline_parameters_on_conflict_with_pipeline_parameters(
-    clean_workspace, tmp_path
+    clean_project, tmp_path
 ):
     """Test that the pipeline will fail with error, if configured with parameters
     from a yaml file for the steps and same parameters are passed over in code.
@@ -293,7 +330,7 @@ def test_pipeline_config_from_file_fails_with_pipeline_parameters_on_conflict_wi
 
 
 def test_pipeline_config_from_file_works_with_pipeline_parameters_on_conflict_with_default_parameters(
-    clean_workspace, tmp_path
+    clean_project, tmp_path
 ):
     """Test that the pipeline will not fail with error.
 
